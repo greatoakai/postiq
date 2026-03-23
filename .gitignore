@@ -1,0 +1,18 @@
+# Credentials - NEVER commit
+.env
+
+# Payment data - contains PHI
+data/
+*.csv
+*.835
+*.pdf
+*.txt
+
+# Logs - may contain PHI
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
