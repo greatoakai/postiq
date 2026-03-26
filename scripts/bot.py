@@ -43,6 +43,9 @@ def read_csv(csv_path):
             raw_amount = row.get("Base Amount", "").strip()
             if not name or not raw_amount:
                 continue
+            # Skip summary/totals rows
+            if name.upper() in ("TOTALS", "TOTAL", "GRAND TOTAL", "SUM"):
+                continue
             amount = raw_amount.replace("$", "").replace(",", "")
             try:
                 amount = f"{float(amount):.2f}"

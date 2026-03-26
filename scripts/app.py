@@ -2,7 +2,6 @@ import csv
 import io
 import subprocess
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -11,7 +10,7 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 LOG_DIR = PROJECT_ROOT / "logs"
-BOT_SCRIPT = PROJECT_ROOT / "scripts" / "bot.py"
+BOT_SCRIPT = PROJECT_ROOT / "scripts" / "bot_v2.py"
 
 st.set_page_config(page_title="PostIQ", page_icon="💳", layout="wide")
 
@@ -46,6 +45,9 @@ if uploaded_file:
         name = row.get("Full Name", "").strip()
         raw_amount = row.get("Base Amount", "").strip()
         if not name or not raw_amount:
+            continue
+        # Skip summary/totals rows
+        if name.upper() in ("TOTALS", "TOTAL", "GRAND TOTAL", "SUM"):
             continue
         amount_str = raw_amount.replace("$", "").replace(",", "")
         try:
