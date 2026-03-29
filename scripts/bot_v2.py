@@ -22,6 +22,9 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 ACTION_TIMEOUT = 30000
 
+# Track whether appointment date filters have been set this session
+_filters_set = False
+
 
 def screenshot(page, name):
     """Save a timestamped screenshot to the logs directory."""
@@ -123,9 +126,16 @@ def search_client(page, name):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(2000)
 
-    # Check results
-    name_links = page.locator(f"a:has-text('{last_name}')").all()
-    matching = [link for link in name_links if first_name.lower() in (link.text_content() or "").lower()]
+    screenshot(page, f"search_{first_search}_{last_search}")
+
+    # Check results — match using all name parts for compound/hyphenated names
+    name_parts = [part.lower() for part in name.replace("-", " ").split()]
+    all_links = page.locator("table a, .client-list a, a[href*='people']").all()
+    matching = []
+    for link in all_links:
+        link_text = (link.text_content() or "").lower()
+        if all(part in link_text for part in name_parts):
+            matching.append(link)
 
     if len(matching) == 0:
         raise Exception(f"Client '{name}' not found in search results")
@@ -145,6 +155,59 @@ def navigate_to_appointments(page):
     page.click("text=Appointments")
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
+
+
+def ensure_date_filters(page):
+    """Ensure the Appointments filter dates are set to the current year.
+
+    Sets From = 01/01/{year} and To = 12/31/{year}. Once verified or set,
+    skips on subsequent calls within the same login session.
+    """
+    global _filters_set
+    if _filters_set:
+        return
+
+    year = datetime.now().year
+    expected_from = f"01/01/{year}"
+    expected_to = f"12/31/{year}"
+
+    from_input = page.locator("input#span_startdate")
+    to_input = page.locator("input#span_enddate")
+
+    current_from = from_input.input_value()
+    current_to = to_input.input_value()
+
+    if current_from == expected_from and current_to == expected_to:
+        print(f"  Filters already set: {expected_from} — {expected_to}")
+        _filters_set = True
+        return
+
+    print(f"  Setting filters: From={expected_from}, To={expected_to}")
+
+    # Masked inputs auto-insert slashes — type digits only
+    from_digits = expected_from.replace("/", "")
+    to_digits = expected_to.replace("/", "")
+
+    if current_from != expected_from:
+        from_input.click(click_count=3)
+        page.keyboard.press("Backspace")
+        page.keyboard.type(from_digits, delay=50)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(500)
+
+    if current_to != expected_to:
+        to_input.click(click_count=3)
+        page.keyboard.press("Backspace")
+        page.keyboard.type(to_digits, delay=50)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(500)
+
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
+    screenshot(page, "filters_set")
+
+    _filters_set = True
+    print(f"  Filters set: {expected_from} — {expected_to}")
 
 
 def click_appointment_by_date(page, date_str, name):
@@ -252,6 +315,7 @@ def post_payment_v2(page, name, date, amount, dry_run=False):
     navigate_to_clients(page)
     search_client(page, name)
     navigate_to_appointments(page)
+    ensure_date_filters(page)
     click_appointment_by_date(page, date, name)
     click_accept_payment(page)
     screenshot(page, f"payment_{name.replace(' ', '_')}_01_form")
