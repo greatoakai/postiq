@@ -39,10 +39,16 @@ def read_csv(csv_path):
     """Read payment CSV and return list of dicts with name, date, and amount."""
     payments = []
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        # Skip title row (e.g., "SUCCESSFUL PAYMENTS") if present
+        first_line = f.readline().strip().strip('"')
+        if "Full Name" not in first_line:
+            pass  # title row — DictReader starts from the real header
+        else:
+            f.seek(0)  # first line was the header — rewind
         reader = csv.DictReader(f)
         for row in reader:
             name = row.get("Full Name", "").strip()
-            date = row.get("Date", "").strip()
+            date = row.get("Transaction Date", "").strip()
             raw_amount = row.get("Base Amount", "").strip()
             if not name or not raw_amount:
                 continue
