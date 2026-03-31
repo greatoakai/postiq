@@ -89,30 +89,13 @@ Please review the other files manually."
     send_email "[PostIQ] ALERT: Multiple unprocessed CSV files" "$alert_msg"
 fi
 
-# Run the bot (dry-run mode for safety — remove --dry-run when ready for live)
+# Run the bot — emails are sent automatically by bot_v2.py
 log "Running bot on: $newest_name"
-BOT_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/bot_v2.py" "$newest" --dry-run 2>&1) || true
+BOT_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/bot_v2.py" "$newest" 2>&1) || true
 echo "$BOT_OUTPUT" >> "$LOGFILE"
 
 # Mark as processed
 echo "$newest_name" >> "$MARKER"
-
-# Find the report file (most recent)
-report=$(ls -t "$LOG_DIR"/*_report_*.txt 2>/dev/null | head -1)
-if [ -n "$report" ]; then
-    report_content=$(cat "$report")
-else
-    report_content="$BOT_OUTPUT"
-fi
-
-# Check for failures in the output
-if echo "$BOT_OUTPUT" | grep -qiE "ERROR|FAILED|TIMEOUT"; then
-    send_email "[PostIQ] Payment Report — ERRORS DETECTED (DRY RUN)" "$report_content"
-    log "Email sent (with errors)."
-else
-    send_email "[PostIQ] Payment Report — Success (DRY RUN)" "$report_content"
-    log "Email sent (success)."
-fi
 
 # Move the processed CSV to the Archive folder in Google Drive
 ARCHIVE="$INBOX/../Square Payment Archive"
