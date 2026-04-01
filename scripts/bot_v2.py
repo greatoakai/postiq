@@ -3,6 +3,7 @@ import csv
 import os
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +24,25 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 ACTION_TIMEOUT = 30000
 
+
+
+def normalize_name(name):
+    """Normalize a name by stripping accents and fixing common encoding issues.
+
+    Handles cases like 'ChloÃ©' (UTF-8 bytes decoded as Latin-1) by
+    re-encoding and decoding, then stripping to ASCII-friendly form.
+    e.g., 'ChloÃ© Ray' → 'Chloe Ray'
+    """
+    # First, try to fix mojibake (UTF-8 bytes misread as Latin-1)
+    try:
+        fixed = name.encode('latin-1').decode('utf-8')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        fixed = name
+
+    # Strip accents: é → e, ñ → n, etc.
+    nfkd = unicodedata.normalize('NFKD', fixed)
+    ascii_name = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return ascii_name
 
 
 def screenshot(page, name):
@@ -51,7 +71,7 @@ def read_csv(csv_path):
             raw_amount = row.get("Base Amount", "").strip()
             if not name or not raw_amount:
                 continue
-            if name.upper() in ("TOTALS", "TOTAL", "GRAND TOTAL", "SUM"):
+            if name.upper().startswith(("TOTAL", "GRAND TOTAL", "SUM")):
                 continue
             amount = raw_amount.replace("$", "").replace(",", "")
             try:
@@ -102,18 +122,50 @@ def navigate_to_clients(page):
     page.wait_for_timeout(1000)
 
 
+def _do_search(page, first_search, last_search):
+    """Fill the search form and submit. Returns visible table rows."""
+    visible_text_inputs = []
+    for inp in page.locator("input[type='text']").all():
+        if inp.is_visible():
+            visible_text_inputs.append(inp)
+
+    if len(visible_text_inputs) < 2:
+        raise Exception(f"Expected at least 2 visible text inputs, found {len(visible_text_inputs)}")
+
+    visible_text_inputs[0].fill(first_search)
+    visible_text_inputs[1].fill(last_search)
+
+    page.locator("button:has-text('Search')").first.click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(2000)
+
+    screenshot(page, f"search_{first_search}_{last_search}")
+    return page.locator("table tr").all()
+
+
+def _match_rows(rows, match_parts):
+    """Find table rows where all match_parts appear in the row text."""
+    matching = []
+    for row in rows:
+        row_text = (row.text_content() or "").lower()
+        if all(part in row_text for part in match_parts):
+            links = row.locator("a")
+            if links.count() > 0:
+                matching.append((row, links.first))
+    return matching
+
+
 def search_client(page, name):
     """Search for a client by first and last name. Returns True if a unique match was clicked.
 
-    Also returns a note string if the CSV name contains a middle name or extra
-    name part that was ignored during matching (so it can be flagged in the report).
+    If the original name doesn't match, automatically retries with a normalized
+    version (accents stripped, encoding fixed). Also returns a note string if
+    the CSV name contains a middle name or extra name part.
     """
     parts = name.split()
     first_name = parts[0]
     last_name = parts[-1]
     middle_parts = parts[1:-1] if len(parts) > 2 else []
-    # Use first 3 letters for search to allow nickname/variation matching
-    # e.g., "Mat" matches both "Matthew" and "Matt"
     first_search = first_name[:3]
     last_search = last_name[:3]
 
@@ -123,46 +175,42 @@ def search_client(page, name):
         note = f"Middle/extra name '{extra}' in CSV — verify in TherapyAppointment"
         print(f"  NOTE: {note}")
 
+    # Build match parts from first/last, expanding hyphens
+    match_parts = []
+    for part in [first_name.lower(), last_name.lower()]:
+        match_parts.extend(part.split("-"))
+
     print(f"  Searching: First={first_search} (from {first_name}), Last={last_search} (from {last_name})")
 
-    visible_text_inputs = []
-    for inp in page.locator("input[type='text']").all():
-        if inp.is_visible():
-            visible_text_inputs.append(inp)
+    rows = _do_search(page, first_search, last_search)
+    matching_rows = _match_rows(rows, match_parts)
 
-    if len(visible_text_inputs) < 2:
-        raise Exception(f"Expected at least 2 visible text inputs, found {len(visible_text_inputs)}")
+    # If no match, try with normalized name (strip accents, fix encoding)
+    if len(matching_rows) == 0:
+        norm_name = normalize_name(name)
+        if norm_name != name:
+            print(f"  No match for '{name}', retrying with normalized: '{norm_name}'")
+            norm_parts = norm_name.split()
+            norm_first = norm_parts[0]
+            norm_last = norm_parts[-1]
+            norm_first_search = norm_first[:3]
+            norm_last_search = norm_last[:3]
 
-    first_input = visible_text_inputs[0]
-    last_input = visible_text_inputs[1]
+            norm_match = []
+            for part in [norm_first.lower(), norm_last.lower()]:
+                norm_match.extend(part.split("-"))
 
-    first_input.fill(first_search)
-    last_input.fill(last_search)
+            # Re-search if the 3-letter prefix changed
+            if norm_first_search != first_search or norm_last_search != last_search:
+                navigate_to_clients(page)
+                rows = _do_search(page, norm_first_search, norm_last_search)
+            matching_rows = _match_rows(rows, norm_match)
 
-    page.locator("button:has-text('Search')").first.click()
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(2000)
-
-    screenshot(page, f"search_{first_search}_{last_search}")
-
-    # Match on first and last name only (middle names are not reliable in TA)
-    match_parts = [first_name.lower(), last_name.lower()]
-    # Also split hyphenated last names so "Nowicki-Gamadia" matches both parts
-    expanded = []
-    for part in match_parts:
-        expanded.extend(part.split("-"))
-    match_parts = expanded
-
-    # TA splits first/last name across separate cells in the same row.
-    # Match against the full row text, then click the link within that row.
-    rows = page.locator("table tr").all()
-    matching_rows = []
-    for row in rows:
-        row_text = (row.text_content() or "").lower()
-        if all(part in row_text for part in match_parts):
-            links = row.locator("a")
-            if links.count() > 0:
-                matching_rows.append((row, links.first))
+            if matching_rows:
+                if note:
+                    note += f"; Name auto-corrected: '{name}' → '{norm_name}'"
+                else:
+                    note = f"Name auto-corrected: '{name}' → '{norm_name}'"
 
     if len(matching_rows) == 0:
         raise Exception(f"Client '{name}' not found in search results")
@@ -393,15 +441,11 @@ def navigate_to_billing(page):
     page.wait_for_timeout(1000)
 
 
-def select_client_v1(page, name):
-    """Select a client via the Search Charges token-input autocomplete."""
-    print(f"  Searching for client: {name}")
-
+def _search_v1_autocomplete(page, first_name, last_name):
+    """Type last name into autocomplete and try to find a match. Returns True if selected."""
     client_input = page.locator("#token-input-user_id_patient")
     client_input.click()
 
-    last_name = name.split()[-1]
-    first_name = name.split()[0]
     page.keyboard.type(last_name, delay=100)
     page.wait_for_timeout(2000)
 
@@ -410,7 +454,6 @@ def select_client_v1(page, name):
                                   "div.token-input-dropdown-facebook li")
     count = dropdown_items.count()
 
-    selected = False
     for i in range(count):
         item = dropdown_items.nth(i)
         item_text = item.text_content() or ""
@@ -420,8 +463,34 @@ def select_client_v1(page, name):
             print(f"  Selected: {item_text.strip()}")
             item.click()
             page.wait_for_timeout(500)
-            selected = True
-            break
+            return True, count
+    return False, count
+
+
+def select_client_v1(page, name):
+    """Select a client via the Search Charges token-input autocomplete.
+
+    Tries the original name first, then a normalized version if no match.
+    """
+    print(f"  Searching for client: {name}")
+    first_name = name.split()[0]
+    last_name = name.split()[-1]
+
+    selected, count = _search_v1_autocomplete(page, first_name, last_name)
+
+    # If no match, try normalized name
+    if not selected:
+        norm_name = normalize_name(name)
+        if norm_name != name:
+            norm_first = norm_name.split()[0]
+            norm_last = norm_name.split()[-1]
+            print(f"  No match for '{name}', retrying with normalized: '{norm_name}'")
+            # Clear the input and try again
+            client_input = page.locator("#token-input-user_id_patient")
+            client_input.click(click_count=3)
+            page.keyboard.press("Backspace")
+            page.wait_for_timeout(500)
+            selected, count = _search_v1_autocomplete(page, norm_first, norm_last)
 
     if not selected:
         raise Exception(f"Client '{name}' not found in autocomplete ({count} results)")
@@ -461,15 +530,16 @@ def post_payment_v1(page, name, amount, dry_run=False):
 
 def post_payment(page, name, date, amount, dry_run=False):
     """
-    Post a payment with fallback logic:
+    Post a payment with retry and fallback logic:
     1. Try V2 (Clients > Appointments > Accept Payment)
-    2. If V2 fails, try V1 (Billing > Take Payment > Search Charges)
-    3. If both fail, mark as FAILED
+    2. If V2 fails (not flagged), retry V2 once with fresh navigation
+    3. If V2 retry fails, try V1 (Billing > Take Payment > Search Charges)
+    4. If all fail, mark as FAILED
     Returns (success: bool, method: str, error: str or None, note: str or None)
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
 
-    # --- Attempt 1: V2 flow (always try first) ---
+    # --- Attempt 1: V2 flow ---
     v2_error = None
     try:
         _ok, note = post_payment_v2(page, name, date, amount, dry_run)
@@ -477,12 +547,22 @@ def post_payment(page, name, date, amount, dry_run=False):
     except Exception as e:
         v2_error = str(e)
         if "FLAG" in v2_error:
-            # Flagged items should NOT fallback — they need manual review
             return False, "FLAGGED", v2_error, None
         print(f"  V2 failed: {v2_error}")
+
+    # --- Attempt 2: Retry V2 with fresh navigation ---
+    print(f"  Retrying V2...")
+    try:
+        _ok, note = post_payment_v2(page, name, date, amount, dry_run)
+        return True, "V2-retry", None, note
+    except Exception as e:
+        v2_retry_error = str(e)
+        if "FLAG" in v2_retry_error:
+            return False, "FLAGGED", v2_retry_error, None
+        print(f"  V2 retry failed: {v2_retry_error}")
         print(f"  Falling back to V1...")
 
-    # --- Attempt 2: V1 fallback ---
+    # --- Attempt 3: V1 fallback ---
     try:
         post_payment_v1(page, name, amount, dry_run)
         return True, "V1", None, None
@@ -492,8 +572,8 @@ def post_payment(page, name, date, amount, dry_run=False):
             return False, "FLAGGED", v1_error, None
         print(f"  V1 also failed: {v1_error}")
 
-    # --- Both failed ---
-    return False, "FAILED", f"V2: {v2_error}; V1: {v1_error}", None
+    # --- All attempts failed ---
+    return False, "FAILED", f"V2: {v2_error}; V2-retry: {v2_retry_error}; V1: {v1_error}", None
 
 
 def _stat_box(value, label, color):

@@ -91,10 +91,43 @@ fi
 
 # Run the bot — emails are sent automatically by bot_v2.py
 log "Running bot on: $newest_name"
-BOT_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/bot_v2.py" "$newest" 2>&1) || true
+BOT_EXIT=0
+BOT_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/bot_v2.py" "$newest" 2>&1) || BOT_EXIT=$?
 echo "$BOT_OUTPUT" >> "$LOGFILE"
 
-# Mark as processed
+# If bot crashed before it could send its own report, alert Travis
+if [ "$BOT_EXIT" -ne 0 ]; then
+    log "ERROR: Bot exited with code $BOT_EXIT"
+    # Grab the last 50 lines of output for context
+    error_tail=$(echo "$BOT_OUTPUT" | tail -50)
+    msmtp -t <<ERRMSG
+To: travis@greatoakcounseling.com
+From: Oakley, Great Oak AI Assistant <travis@greatoakcounseling.com>
+Subject: [PostIQ] SYSTEM ERROR — bot did not complete
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+The PostIQ daily run failed before it could generate a report.
+
+CSV file: $newest_name
+Exit code: $BOT_EXIT
+Time: $(date '+%Y-%m-%d %H:%M:%S')
+
+--- Last 50 lines of output ---
+
+$error_tail
+
+--- End of output ---
+
+Check the full log at: $LOGFILE
+
+Oakley, Great Oak Counseling's AI Assistant
+ERRMSG
+    log "Crash alert emailed to Travis."
+fi
+
+# Mark as processed (even on failure, to avoid retry loops —
+# failed files should be re-run manually after fixing the issue)
 echo "$newest_name" >> "$MARKER"
 
 # Move the processed CSV to the Archive folder in Google Drive
