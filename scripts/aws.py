@@ -4,12 +4,30 @@ import json
 import os
 import tempfile
 
-import boto3
-from botocore.exceptions import ClientError
+# boto3 is only needed when running on AWS (S3_BUCKET is set).
+# Lazy-import to avoid crashing in local dev environments without boto3.
+boto3 = None
+ClientError = None
 
 # Bucket name from environment, or None if running locally
 S3_BUCKET = os.getenv("S3_BUCKET")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+
+def _ensure_boto3():
+    """Import boto3 on first use. Raises clear error if missing."""
+    global boto3, ClientError
+    if boto3 is None:
+        try:
+            import boto3 as _boto3
+            from botocore.exceptions import ClientError as _ClientError
+            boto3 = _boto3
+            ClientError = _ClientError
+        except ImportError:
+            raise ImportError(
+                "boto3 is required for AWS features. "
+                "Install it with: pip install boto3"
+            )
 
 _s3_client = None
 _secrets_client = None
@@ -18,6 +36,7 @@ _secrets_client = None
 def _get_s3():
     global _s3_client
     if _s3_client is None:
+        _ensure_boto3()
         _s3_client = boto3.client("s3", region_name=AWS_REGION)
     return _s3_client
 
@@ -25,6 +44,7 @@ def _get_s3():
 def _get_secrets():
     global _secrets_client
     if _secrets_client is None:
+        _ensure_boto3()
         _secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
     return _secrets_client
 
