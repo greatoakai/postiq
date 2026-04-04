@@ -15,7 +15,7 @@ systemctl start docker
 
 # -- Clone repository --
 cd /opt
-git clone https://github.com/greatoakai/postiq.git
+git clone -b claude/debug-bot-issues-ILtby https://github.com/greatoakai/postiq.git
 cd postiq
 
 # -- Write .env with AWS references --
