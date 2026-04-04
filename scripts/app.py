@@ -12,6 +12,9 @@ DATA_DIR = PROJECT_ROOT / "data"
 LOG_DIR = PROJECT_ROOT / "logs"
 BOT_SCRIPT = PROJECT_ROOT / "scripts" / "bot_v2.py"
 
+DATA_DIR.mkdir(exist_ok=True)
+LOG_DIR.mkdir(exist_ok=True)
+
 st.set_page_config(page_title="PostIQ", page_icon="💳", layout="wide")
 
 st.title("PostIQ — Credit Card Payment Posting")
@@ -31,7 +34,7 @@ if uploaded_file:
         st.stop()
 
     # Validate required columns
-    required = {"Full Name", "Base Amount"}
+    required = {"Full Name", "Base Amount", "Transaction Date"}
     headers = set(rows[0].keys())
     missing = required - headers
     if missing:

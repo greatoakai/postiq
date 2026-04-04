@@ -1,0 +1,5 @@
+playwright
+python-dotenv
+streamlit
+boto3
+psycopg2-binary

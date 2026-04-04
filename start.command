@@ -10,4 +10,4 @@ echo "  From other PCs:   http://$(ipconfig getifaddr en0 2>/dev/null || echo 'Y
 echo ""
 echo "  Press Ctrl+C to stop."
 echo ""
-/Users/travmegsam/Library/Python/3.9/bin/streamlit run scripts/app.py --server.address 0.0.0.0 --server.port 8501
+python3 -m streamlit run scripts/app.py --server.address 0.0.0.0 --server.port 8501

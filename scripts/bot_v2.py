@@ -1,5 +1,6 @@
 import argparse
 import csv
+import io
 import os
 import sys
 from datetime import datetime
@@ -13,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
 DATA_DIR = PROJECT_ROOT / "data"
 LOG_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -39,22 +41,25 @@ def read_csv(csv_path):
     """Read payment CSV and return list of dicts with name, date, and amount."""
     payments = []
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row.get("Full Name", "").strip()
-            date = row.get("Date", "").strip()
-            raw_amount = row.get("Base Amount", "").strip()
-            if not name or not raw_amount:
-                continue
-            if name.upper() in ("TOTALS", "TOTAL", "GRAND TOTAL", "SUM"):
-                continue
-            amount = raw_amount.replace("$", "").replace(",", "")
-            try:
-                amount = f"{float(amount):.2f}"
-            except ValueError:
-                print(f"  WARNING: Skipping row - invalid amount '{raw_amount}' for {name}")
-                continue
-            payments.append({"name": name, "date": date, "amount": amount})
+        lines = f.readlines()
+    # Skip label rows (e.g., "SUCCESSFUL PAYMENTS") that have no commas
+    data_lines = [line for line in lines if "," in line]
+    reader = csv.DictReader(io.StringIO("".join(data_lines)))
+    for row in reader:
+        name = row.get("Full Name", "").strip()
+        date = row.get("Transaction Date", "").strip()
+        raw_amount = row.get("Base Amount", "").strip()
+        if not name or not raw_amount:
+            continue
+        if name.upper() in ("TOTALS", "TOTAL", "GRAND TOTAL", "SUM"):
+            continue
+        amount = raw_amount.replace("$", "").replace(",", "")
+        try:
+            amount = f"{float(amount):.2f}"
+        except ValueError:
+            print(f"  WARNING: Skipping row - invalid amount '{raw_amount}' for {name}")
+            continue
+        payments.append({"name": name, "date": date, "amount": amount})
     return payments
 
 
@@ -83,6 +88,17 @@ def login(page):
     page.wait_for_load_state("networkidle")
     screenshot(page, "02_dashboard")
     print("Login successful.")
+
+
+def recover_to_dashboard(page):
+    """Navigate back to the dashboard to reset browser state between payments."""
+    try:
+        if "dashboard" not in (page.url or ""):
+            page.goto("https://portal.therapyappointment.com/index.cfm/dashboard",
+                      wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_load_state("networkidle")
+    except Exception as e:
+        print(f"  WARNING: Could not recover to dashboard: {e}")
 
 
 # =============================================================================
@@ -417,10 +433,15 @@ def post_payment(page, name, date, amount, dry_run=False):
     # --- Attempt 1: V2 flow (always try first) ---
     v2_error = None
     try:
-        post_payment_v2(page, name, date, amount, dry_run)
+        result = post_payment_v2(page, name, date, amount, dry_run)
+        if not result:
+            raise Exception("V2 submit_payment returned failure")
         return True, "V2", None
     except Exception as e:
         v2_error = str(e)
+        # Reset filters flag since we're leaving the appointments page
+        global _filters_set
+        _filters_set = False
         if "FLAG" in v2_error:
             # Flagged items should NOT fallback — they need manual review
             return False, "FLAGGED", v2_error
@@ -429,7 +450,9 @@ def post_payment(page, name, date, amount, dry_run=False):
 
     # --- Attempt 2: V1 fallback ---
     try:
-        post_payment_v1(page, name, amount, dry_run)
+        result = post_payment_v1(page, name, amount, dry_run)
+        if not result:
+            raise Exception("V1 submit_payment returned failure")
         return True, "V1", None
     except Exception as e:
         v1_error = str(e)
@@ -573,6 +596,8 @@ def run():
                     print(f"  ERROR: {e}")
                     results.append({"name": name, "date": date, "amount": amount,
                                     "status": "FAILED", "method": "", "reason": str(e)})
+                finally:
+                    recover_to_dashboard(page)
 
         except PlaywrightTimeout as e:
             screenshot(page, "error_timeout")
