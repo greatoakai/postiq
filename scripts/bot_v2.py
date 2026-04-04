@@ -236,9 +236,16 @@ def ensure_date_filters(page):
 
 def click_appointment_by_date(page, date_str, name):
     """Find and click an appointment row matching the given date."""
-    print(f"  Looking for appointment on {date_str}...")
+    # Convert date to MM/DD/YYYY format to match TA's display
+    ta_date = date_str
+    if "-" in date_str:
+        # Convert YYYY-MM-DD to MM/DD/YYYY
+        parts = date_str.split("-")
+        if len(parts) == 3:
+            ta_date = f"{parts[1]}/{parts[2]}/{parts[0]}"
+    print(f"  Looking for appointment on {ta_date}...")
 
-    date_links = page.locator(f"a:has-text('{date_str}')").all()
+    date_links = page.locator(f"a:has-text('{ta_date}')").all()
 
     if len(date_links) == 0:
         raise Exception(f"No appointment found on {date_str} for {name}")
