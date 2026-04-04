@@ -1,0 +1,24 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    restart: unless-stopped
+
+  bot:
+    build: .
+    entrypoint: ["python3", "scripts/bot_v2.py"]
+    env_file:
+      - .env
+    environment:
+      - HEADLESS=true
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    profiles:
+      - bot
