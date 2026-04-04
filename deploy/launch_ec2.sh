@@ -15,17 +15,15 @@ INSTANCE_PROFILE="${PROJECT}-ec2-profile"
 INSTANCE_TYPE="t3.medium"
 
 # ----------------------------------------------------------------------
-# IMPORTANT: Replace with your office IP before running.
-# Find it by visiting https://checkip.amazonaws.com from your office.
+# Allowed IPs — add your office IP as SECOND_IP when available.
+# Find it by visiting https://checkip.amazonaws.com from that network.
 # Format: x.x.x.x/32  (the /32 means "this one IP only")
 # ----------------------------------------------------------------------
-OFFICE_IP="REPLACE_WITH_YOUR_OFFICE_IP/32"
+HOME_IP="35.144.22.100/32"
+OFFICE_IP="${HOME_IP}"  # Primary IP for initial setup
 
-if [ "${OFFICE_IP}" = "REPLACE_WITH_YOUR_OFFICE_IP/32" ]; then
-    echo "ERROR: Edit deploy/launch_ec2.sh and set OFFICE_IP to your office IP."
-    echo "       Find it at: https://checkip.amazonaws.com"
-    exit 1
-fi
+# Optional: uncomment and set when you have your office IP
+# SECOND_IP="x.x.x.x/32"
 
 echo ">>> Looking up latest Ubuntu 22.04 AMI..."
 AMI_ID=$(aws ec2 describe-images \
@@ -69,6 +67,17 @@ if [ "${EC2_SG_ID}" = "None" ] || [ -z "${EC2_SG_ID}" ]; then
         --cidr "${OFFICE_IP}" \
         --region "${REGION}"
     echo "  HTTPS restricted to: ${OFFICE_IP}"
+
+    # Add second IP if configured
+    if [ -n "${SECOND_IP:-}" ]; then
+        aws ec2 authorize-security-group-ingress \
+            --group-id "${EC2_SG_ID}" --protocol tcp --port 22 \
+            --cidr "${SECOND_IP}" --region "${REGION}"
+        aws ec2 authorize-security-group-ingress \
+            --group-id "${EC2_SG_ID}" --protocol tcp --port 443 \
+            --cidr "${SECOND_IP}" --region "${REGION}"
+        echo "  Second IP allowed: ${SECOND_IP}"
+    fi
 
     echo "  Created security group: ${EC2_SG_ID}"
 else
