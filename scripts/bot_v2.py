@@ -687,6 +687,13 @@ def run():
 
     generate_report(results, duplicates, dry_run=args.dry_run, source_s3_key=s3_key)
 
+    # Send email report
+    try:
+        from scripts.email_report import send_report
+        send_report(results, duplicates, dry_run=args.dry_run)
+    except Exception as e:
+        print(f"WARNING: Could not send email report: {e}")
+
     # Clean up temp file if downloaded from S3
     if s3_key and csv_path.exists() and str(csv_path).startswith(tempfile.gettempdir()):
         csv_path.unlink()

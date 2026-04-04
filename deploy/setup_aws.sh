@@ -376,6 +376,12 @@ cat > /tmp/postiq-policy.json <<POLICY
         "logs:PutLogEvents"
       ],
       "Resource": "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/postiq/*"
+    },
+    {
+      "Sid": "SESEmailReports",
+      "Effect": "Allow",
+      "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+      "Resource": "*"
     }
   ]
 }
