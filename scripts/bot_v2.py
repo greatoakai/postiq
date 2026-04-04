@@ -12,11 +12,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 from scripts.aws import (
     is_aws_enabled, get_credentials, upload_to_s3, upload_bytes_to_s3,
-    download_from_s3, list_s3_prefix,
-)
-from scripts.db import (
-    is_db_enabled, create_batch, update_batch, insert_payment,
-    get_pending_batch, get_processed_s3_keys,
+    download_from_s3, list_s3_prefix, list_processed_keys,
 )
 
 # Resolve paths relative to project root
@@ -476,12 +472,33 @@ def post_payment(page, name, date, amount, dry_run=False):
     return False, "FAILED", f"V2: {v2_error}; V1: {v1_error}"
 
 
-def generate_report(results, duplicates, dry_run=False):
-    """Generate a summary report."""
+def generate_report(results, duplicates, dry_run=False, source_s3_key=None):
+    """Generate a summary report as both text (human) and JSON (dashboard)."""
+    import json as _json
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "DRYRUN" if dry_run else "POSTED"
-    report_path = LOG_DIR / f"{ts}_report_{mode}.txt"
 
+    total_success = sum(1 for r in results if r["status"] == "OK")
+    total_amount = sum(float(r["amount"]) for r in results if r["status"] == "OK")
+
+    # ── JSON report (machine-readable, used by Streamlit dashboard) ──
+    report_data = {
+        "mode": mode,
+        "generated": datetime.now().isoformat(),
+        "source_s3_key": source_s3_key,
+        "total_payments": len(results),
+        "success_count": total_success,
+        "total_amount": total_amount,
+        "duplicates": sorted(duplicates) if duplicates else [],
+        "payments": results,
+    }
+    json_str = _json.dumps(report_data, indent=2)
+    json_path = LOG_DIR / f"{ts}_report_{mode}.json"
+    json_path.write_text(json_str)
+
+    # ── Text report (human-readable, printed to console) ──
+    txt_path = LOG_DIR / f"{ts}_report_{mode}.txt"
     lines = []
     lines.append(f"PostIQ Payment Report — {mode}")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -498,21 +515,15 @@ def generate_report(results, duplicates, dry_run=False):
     lines.append(f"{'Status':<10} {'Method':<8} {'Name':<25} {'Date':<12} {'Amount':>10}")
     lines.append("-" * 68)
 
-    total_success = 0
-    total_amount = 0.0
     for r in results:
         status = r["status"]
         method = r.get("method", "")
         date = r.get("date", "")
         lines.append(f"{status:<10} {method:<8} {r['name']:<25} {date:<12} ${r['amount']:>9}")
-        if status == "OK":
-            total_success += 1
-            total_amount += float(r["amount"])
 
     lines.append("-" * 68)
     lines.append(f"Total: {total_success}/{len(results)} payments — ${total_amount:.2f}")
 
-    # Flagged entries
     flagged = [r for r in results if r["status"] == "FLAGGED"]
     if flagged:
         lines.append("")
@@ -520,7 +531,6 @@ def generate_report(results, duplicates, dry_run=False):
         for r in flagged:
             lines.append(f"  {r['name']} — {r.get('reason', 'unknown')}")
 
-    # Failed entries
     failed = [r for r in results if r["status"] == "FAILED"]
     if failed:
         lines.append("")
@@ -529,12 +539,14 @@ def generate_report(results, duplicates, dry_run=False):
             lines.append(f"  {r['name']} — {r.get('reason', 'unknown')}")
 
     report_text = "\n".join(lines)
-    report_path.write_text(report_text)
-    print(f"\nReport saved: {report_path.name}")
+    txt_path.write_text(report_text)
+    print(f"\nReport saved: {txt_path.name}")
     print(report_text)
-    # Upload report to S3
-    s3_key = upload_bytes_to_s3(report_text, f"reports/{report_path.name}", "text/plain")
-    return s3_key or str(report_path)
+
+    # Upload both to S3
+    upload_bytes_to_s3(report_text, f"reports/{txt_path.name}", "text/plain")
+    s3_key = upload_bytes_to_s3(json_str, f"reports/{json_path.name}", "application/json")
+    return s3_key or str(json_path)
 
 
 def resolve_csv(args):
@@ -548,23 +560,18 @@ def resolve_csv(args):
             print("ERROR: --scheduled requires S3_BUCKET to be set")
             sys.exit(1)
 
-        # Check for a pending batch in the database first
-        pending = get_pending_batch() if is_db_enabled() else None
-        if pending:
-            s3_key = pending["csv_s3_key"]
-            print(f"Found pending batch: {pending['id']}")
-        else:
-            # Find newest CSV in uploads/ that hasn't been processed
-            all_keys = list_s3_prefix("uploads/")
-            csv_keys = [k for k in all_keys if k.endswith(".csv")]
-            processed = get_processed_s3_keys() if is_db_enabled() else set()
-            unprocessed = [k for k in csv_keys if k not in processed]
+        # Find newest CSV in uploads/ that hasn't been processed yet.
+        # A CSV is "processed" if a matching report exists in reports/.
+        all_keys = list_s3_prefix("uploads/")
+        csv_keys = [k for k in all_keys if k.endswith(".csv")]
+        processed = list_processed_keys()
+        unprocessed = [k for k in csv_keys if k not in processed]
 
-            if not unprocessed:
-                print("No unprocessed CSV files found in S3. Nothing to do.")
-                sys.exit(0)
-            s3_key = unprocessed[0]
-            print(f"Found unprocessed CSV: {s3_key}")
+        if not unprocessed:
+            print("No unprocessed CSV files found in S3. Nothing to do.")
+            sys.exit(0)
+        s3_key = unprocessed[0]
+        print(f"Found unprocessed CSV: {s3_key}")
 
         local_path = download_from_s3(s3_key)
         return Path(local_path), s3_key
@@ -617,14 +624,6 @@ def run():
 
     duplicates = detect_duplicates(payments)
 
-    # Create batch record in database
-    batch_id = None
-    if is_db_enabled():
-        csv_ref = s3_key or str(csv_path)
-        source = "scheduled" if args.scheduled else "upload"
-        batch_id = create_batch(csv_ref, source=source, dry_run=args.dry_run,
-                                total_rows=len(payments))
-
     print(f"Loaded {len(payments)} payments from {csv_path.name}")
     if duplicates:
         print(f"Duplicate names detected: {', '.join(sorted(duplicates))}")
@@ -633,8 +632,6 @@ def run():
     print()
 
     results = []
-    success_count = 0
-    fail_count = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -650,81 +647,45 @@ def run():
                 amount = payment["amount"]
                 print(f"\n[{i}/{len(payments)}]", end="")
 
-                pay_status = None
-                pay_method = None
-                pay_error = None
-                screenshot_ref = None
-
                 try:
                     success, method, error = post_payment(page, name, date, amount, dry_run=args.dry_run)
 
                     if success:
-                        pay_status = "OK"
-                        pay_method = method
-                        success_count += 1
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "OK", "method": method})
                     elif method == "FLAGGED":
-                        pay_status = "FLAGGED"
-                        pay_error = error
-                        fail_count += 1
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FLAGGED", "method": "", "reason": error})
                     else:
-                        pay_status = "FAILED"
-                        pay_error = error
-                        fail_count += 1
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FAILED", "method": "", "reason": error})
 
                 except PlaywrightTimeout:
-                    screenshot_ref = screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
+                    screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
                     print(f"  ERROR: Timed out for {name}")
-                    pay_status = "TIMEOUT"
-                    fail_count += 1
                     results.append({"name": name, "date": date, "amount": amount,
                                     "status": "TIMEOUT", "method": ""})
                 except Exception as e:
-                    screenshot_ref = screenshot(page, f"error_{name.replace(' ', '_')}")
+                    screenshot(page, f"error_{name.replace(' ', '_')}")
                     print(f"  ERROR: {e}")
-                    pay_status = "FAILED"
-                    pay_error = str(e)
-                    fail_count += 1
                     results.append({"name": name, "date": date, "amount": amount,
                                     "status": "FAILED", "method": "", "reason": str(e)})
                 finally:
                     recover_to_dashboard(page)
 
-                # Record payment in database
-                if batch_id and pay_status:
-                    insert_payment(
-                        batch_id, name, date or None, amount, pay_status,
-                        method=pay_method, error_message=pay_error,
-                        screenshot_key=screenshot_ref
-                    )
-
         except PlaywrightTimeout as e:
             screenshot(page, "error_timeout")
             print(f"ERROR: Timed out during setup - {e}")
-            if batch_id:
-                update_batch(batch_id, "failed", success_count, fail_count)
             sys.exit(1)
         except Exception as e:
             screenshot(page, "error_unexpected")
             print(f"ERROR: {e}")
-            if batch_id:
-                update_batch(batch_id, "failed", success_count, fail_count)
             sys.exit(1)
         finally:
             print("\nClosing browser.")
             browser.close()
 
-    report_ref = generate_report(results, duplicates, dry_run=args.dry_run)
-
-    # Update batch record with final status
-    if batch_id:
-        update_batch(batch_id, "completed", success_count, fail_count,
-                     report_s3_key=report_ref)
+    generate_report(results, duplicates, dry_run=args.dry_run, source_s3_key=s3_key)
 
     # Clean up temp file if downloaded from S3
     if s3_key and csv_path.exists() and str(csv_path).startswith(tempfile.gettempdir()):

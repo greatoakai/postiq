@@ -52,14 +52,6 @@ def get_credentials():
     return os.getenv("TA_USERNAME"), os.getenv("TA_PASSWORD")
 
 
-def get_database_url():
-    """Get the database connection string from Secrets Manager or env."""
-    if is_aws_enabled():
-        secret = get_secret("postiq/database")
-        return secret["DATABASE_URL"]
-    return os.getenv("DATABASE_URL")
-
-
 # ─── S3 ─────────────────────────────────────────────────────────────────────
 
 def upload_to_s3(local_path, s3_key):
@@ -103,9 +95,44 @@ def list_s3_prefix(prefix):
     return [o["Key"] for o in objects]
 
 
+def list_processed_keys():
+    """Return the set of CSV S3 keys that already have a report.
+
+    Convention: when a CSV at uploads/foo.csv is processed, the bot writes
+    a JSON report containing the original S3 key. We scan reports/*.json
+    and extract the CSV keys that have been handled.
+    """
+    if not is_aws_enabled():
+        return set()
+    import json as _json
+    processed = set()
+    report_keys = list_s3_prefix("reports/")
+    for key in report_keys:
+        if not key.endswith(".json"):
+            continue
+        try:
+            text = get_s3_text(key)
+            data = _json.loads(text)
+            # The report JSON contains source_s3_key if it came from S3
+            src = data.get("source_s3_key")
+            if src:
+                processed.add(src)
+        except Exception:
+            continue
+    return processed
+
+
 def get_s3_text(s3_key):
     """Read a text file from S3 and return its contents as string."""
     if not is_aws_enabled():
         return None
     response = _get_s3().get_object(Bucket=S3_BUCKET, Key=s3_key)
     return response["Body"].read().decode("utf-8")
+
+
+def get_s3_json(s3_key):
+    """Read a JSON file from S3 and return parsed dict."""
+    text = get_s3_text(s3_key)
+    if text is None:
+        return None
+    return json.loads(text)

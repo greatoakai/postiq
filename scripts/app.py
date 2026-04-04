@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -7,10 +8,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from scripts.aws import is_aws_enabled, upload_bytes_to_s3, get_s3_text
-from scripts.db import (
-    is_db_enabled, create_batch, get_recent_batches, get_batch_payments,
-)
+from scripts.aws import is_aws_enabled, upload_bytes_to_s3, list_s3_prefix, get_s3_json
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -20,24 +18,67 @@ BOT_SCRIPT = PROJECT_ROOT / "scripts" / "bot_v2.py"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
+
+# ─── Report helpers ──────────────────────────────────────────────────────────
+
+def _load_recent_reports(limit=5):
+    """Load recent JSON reports from S3 or local filesystem."""
+    reports = []
+    if is_aws_enabled():
+        keys = list_s3_prefix("reports/")
+        json_keys = [k for k in keys if k.endswith(".json")]
+        for key in json_keys[:limit]:
+            data = get_s3_json(key)
+            if data:
+                reports.append(data)
+    else:
+        json_files = sorted(LOG_DIR.glob("*_report_*.json"), reverse=True)
+        for f in json_files[:limit]:
+            try:
+                reports.append(json.loads(f.read_text()))
+            except Exception:
+                continue
+    return reports
+
+
+def _render_report(report):
+    """Render a JSON report as a Streamlit table."""
+    payments = report.get("payments", [])
+    if not payments:
+        return
+    table = []
+    for p in payments:
+        table.append({
+            "Status": p.get("status", ""),
+            "Method": p.get("method", ""),
+            "Client": p.get("name", ""),
+            "Date": p.get("date", ""),
+            "Amount": f"${float(p.get('amount', 0)):.2f}",
+        })
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    dups = report.get("duplicates", [])
+    if dups:
+        st.warning(f"Duplicates: {', '.join(dups)}")
+
+
+# ─── Page layout ─────────────────────────────────────────────────────────────
+
 st.set_page_config(page_title="PostIQ", page_icon="💳", layout="wide")
 
 st.title("PostIQ — Credit Card Payment Posting")
 st.caption("Upload a CSV to post credit card payments to TherapyAppointment")
 
-# --- CSV Upload ---
 uploaded_file = st.file_uploader("Upload payment CSV", type=["csv"])
 
 if uploaded_file:
-    # Parse and preview the CSV
     raw_content = uploaded_file.getvalue().decode("utf-8-sig")
 
     # Skip label rows (e.g., "SUCCESSFUL PAYMENTS") before parsing
     content_lines = raw_content.splitlines(keepends=True)
     data_lines = [line for line in content_lines if "," in line]
-    content_for_preview = "".join(data_lines)
 
-    reader = csv.DictReader(io.StringIO(content_for_preview))
+    reader = csv.DictReader(io.StringIO("".join(data_lines)))
     rows = list(reader)
 
     if not rows:
@@ -61,7 +102,6 @@ if uploaded_file:
         date = row.get("Transaction Date", "").strip()
         if not name or not raw_amount:
             continue
-        # Skip summary/totals rows
         if name.upper() in ("TOTALS", "TOTAL", "GRAND TOTAL", "SUM"):
             continue
         amount_str = raw_amount.replace("$", "").replace(",", "")
@@ -97,23 +137,13 @@ if uploaded_file:
     if dry_run or post:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Save CSV — to S3 if configured, otherwise local
         if is_aws_enabled():
             s3_key = f"uploads/upload_{ts}.csv"
             upload_bytes_to_s3(raw_content, s3_key, "text/csv")
-            csv_ref = s3_key
-
-            # Create pending batch in database
-            if is_db_enabled():
-                create_batch(s3_key, source="upload", dry_run=dry_run,
-                             total_rows=len(preview))
-
-            # Build bot command with S3 key
             cmd = [sys.executable, str(BOT_SCRIPT), "--s3-key", s3_key]
         else:
             csv_path = DATA_DIR / f"upload_{ts}.csv"
             csv_path.write_text(raw_content)
-            csv_ref = str(csv_path)
             cmd = [sys.executable, str(BOT_SCRIPT), str(csv_path)]
 
         if dry_run:
@@ -124,7 +154,6 @@ if uploaded_file:
         st.divider()
         st.subheader(f"Running — {mode_label}")
 
-        # Run the bot as a subprocess and stream output
         output_area = st.empty()
         output_lines = []
 
@@ -148,70 +177,40 @@ if uploaded_file:
         else:
             st.error(f"Bot exited with code {process.returncode}")
 
-        # Show the report — from database or local file
-        if is_db_enabled():
-            batches = get_recent_batches(limit=1)
-            if batches:
-                batch = batches[0]
-                payments = get_batch_payments(batch["id"])
-                if payments:
-                    st.subheader("Report")
-                    report_data = []
-                    for pay in payments:
-                        report_data.append({
-                            "Status": pay["status"],
-                            "Method": pay["method"] or "",
-                            "Client": pay["client_name"],
-                            "Amount": f"${pay['amount']:.2f}",
-                        })
-                    st.dataframe(report_data, use_container_width=True, hide_index=True)
+        # Show latest report
+        reports = _load_recent_reports(limit=1)
+        if reports:
+            st.subheader("Report")
+            _render_report(reports[0])
         else:
             report_files = sorted(LOG_DIR.glob("*_report_*.txt"), reverse=True)
             if report_files:
-                latest_report = report_files[0]
                 st.subheader("Report")
-                st.code(latest_report.read_text(), language="text")
+                st.code(report_files[0].read_text(), language="text")
 
 else:
     st.info("Upload a CSV file with columns: **Full Name**, **Base Amount**, "
             "**Transaction Date** (Total Charged and 3% Fee columns are optional).")
 
-    # Show recent batches from database, or local reports as fallback
-    if is_db_enabled():
-        batches = get_recent_batches(limit=10)
-        if batches:
-            st.divider()
-            st.subheader("Recent Batches")
-            for batch in batches:
-                label = (f"{batch['created_at'].strftime('%Y-%m-%d %H:%M')} — "
-                         f"{batch['status'].upper()} — "
-                         f"{batch['success_count'] or 0}/{batch['total_rows'] or 0} payments")
-                if batch["dry_run"]:
-                    label += " (DRY RUN)"
-                with st.expander(label):
-                    payments = get_batch_payments(batch["id"])
-                    if payments:
-                        pay_data = []
-                        for pay in payments:
-                            pay_data.append({
-                                "Status": pay["status"],
-                                "Method": pay["method"] or "",
-                                "Client": pay["client_name"],
-                                "Date": str(pay["payment_date"] or ""),
-                                "Amount": f"${pay['amount']:.2f}",
-                                "Error": pay["error_message"] or "",
-                            })
-                        st.dataframe(pay_data, use_container_width=True, hide_index=True)
-                    # Show text report if available
-                    if batch.get("report_s3_key") and is_aws_enabled():
-                        report_text = get_s3_text(batch["report_s3_key"])
-                        if report_text:
-                            st.code(report_text, language="text")
+    # Show recent reports
+    reports = _load_recent_reports(limit=5)
+    if reports:
+        st.divider()
+        st.subheader("Recent Reports")
+        for report in reports:
+            generated = report.get("generated", "unknown")
+            mode = report.get("mode", "")
+            success = report.get("success_count", 0)
+            total_pay = report.get("total_payments", 0)
+            label = f"{generated[:16]} — {mode} — {success}/{total_pay} payments"
+            with st.expander(label):
+                _render_report(report)
     else:
+        # Fallback to local text reports
         report_files = sorted(LOG_DIR.glob("*_report_*.txt"), reverse=True)
         if report_files:
             st.divider()
             st.subheader("Recent Reports")
-            for report in report_files[:5]:
-                with st.expander(report.name):
-                    st.code(report.read_text(), language="text")
+            for report_file in report_files[:5]:
+                with st.expander(report_file.name):
+                    st.code(report_file.read_text(), language="text")
