@@ -3,11 +3,21 @@ import csv
 import io
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+from scripts.aws import (
+    is_aws_enabled, get_credentials, upload_to_s3, upload_bytes_to_s3,
+    download_from_s3, list_s3_prefix,
+)
+from scripts.db import (
+    is_db_enabled, create_batch, update_batch, insert_payment,
+    get_pending_batch, get_processed_s3_keys,
+)
 
 # Resolve paths relative to project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -18,8 +28,8 @@ DATA_DIR.mkdir(exist_ok=True)
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-USERNAME = os.getenv("TA_USERNAME")
-PASSWORD = os.getenv("TA_PASSWORD")
+# Credentials: Secrets Manager on AWS, .env locally
+USERNAME, PASSWORD = get_credentials()
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 ACTION_TIMEOUT = 30000
@@ -29,12 +39,14 @@ _filters_set = False
 
 
 def screenshot(page, name):
-    """Save a timestamped screenshot to the logs directory."""
+    """Save a timestamped screenshot locally and upload to S3 if configured."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = LOG_DIR / f"{ts}_{name}.png"
+    filename = f"{ts}_{name}.png"
+    path = LOG_DIR / filename
     page.screenshot(path=str(path))
     print(f"  Screenshot: {path.name}")
-    return path
+    s3_key = upload_to_s3(path, f"screenshots/{filename}")
+    return s3_key or str(path)
 
 
 def read_csv(csv_path):
@@ -520,16 +532,52 @@ def generate_report(results, duplicates, dry_run=False):
     report_path.write_text(report_text)
     print(f"\nReport saved: {report_path.name}")
     print(report_text)
-    return report_path
+    # Upload report to S3
+    s3_key = upload_bytes_to_s3(report_text, f"reports/{report_path.name}", "text/plain")
+    return s3_key or str(report_path)
 
 
-def run():
-    parser = argparse.ArgumentParser(description="PostIQ — Payment Bot with Fallback")
-    parser.add_argument("csv_file", help="Path to the payment CSV file")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Fill forms but don't submit (cancels instead of saving)")
-    args = parser.parse_args()
+def resolve_csv(args):
+    """Resolve the CSV source: S3 key, scheduled pickup, or local file.
+    Returns (csv_path, s3_key) where csv_path is a local file and s3_key
+    is the S3 key if applicable (None for local files).
+    """
+    # Mode 1: Scheduled — pick up latest unprocessed CSV from S3
+    if args.scheduled:
+        if not is_aws_enabled():
+            print("ERROR: --scheduled requires S3_BUCKET to be set")
+            sys.exit(1)
 
+        # Check for a pending batch in the database first
+        pending = get_pending_batch() if is_db_enabled() else None
+        if pending:
+            s3_key = pending["csv_s3_key"]
+            print(f"Found pending batch: {pending['id']}")
+        else:
+            # Find newest CSV in uploads/ that hasn't been processed
+            all_keys = list_s3_prefix("uploads/")
+            csv_keys = [k for k in all_keys if k.endswith(".csv")]
+            processed = get_processed_s3_keys() if is_db_enabled() else set()
+            unprocessed = [k for k in csv_keys if k not in processed]
+
+            if not unprocessed:
+                print("No unprocessed CSV files found in S3. Nothing to do.")
+                sys.exit(0)
+            s3_key = unprocessed[0]
+            print(f"Found unprocessed CSV: {s3_key}")
+
+        local_path = download_from_s3(s3_key)
+        return Path(local_path), s3_key
+
+    # Mode 2: Explicit S3 key
+    if args.s3_key:
+        local_path = download_from_s3(args.s3_key)
+        if not local_path:
+            print(f"ERROR: Could not download from S3: {args.s3_key}")
+            sys.exit(1)
+        return Path(local_path), args.s3_key
+
+    # Mode 3: Local file path
     csv_path = Path(args.csv_file)
     if not csv_path.exists():
         alt_path = DATA_DIR / csv_path.name
@@ -538,9 +586,28 @@ def run():
         else:
             print(f"ERROR: CSV file not found: {csv_path}")
             sys.exit(1)
+    return csv_path, None
+
+
+def run():
+    parser = argparse.ArgumentParser(description="PostIQ — Payment Bot with Fallback")
+    parser.add_argument("csv_file", nargs="?", default=None,
+                        help="Path to the payment CSV file")
+    parser.add_argument("--s3-key", default=None,
+                        help="S3 key for the CSV file (e.g., uploads/file.csv)")
+    parser.add_argument("--scheduled", action="store_true",
+                        help="Scheduled mode: pick up latest unprocessed CSV from S3")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Fill forms but don't submit (cancels instead of saving)")
+    args = parser.parse_args()
+
+    if not args.csv_file and not args.s3_key and not args.scheduled:
+        parser.error("Provide a csv_file, --s3-key, or --scheduled")
+
+    csv_path, s3_key = resolve_csv(args)
 
     if not USERNAME or not PASSWORD:
-        print("ERROR: TA_USERNAME and TA_PASSWORD must be set in .env")
+        print("ERROR: TA_USERNAME and TA_PASSWORD must be set")
         sys.exit(1)
 
     payments = read_csv(csv_path)
@@ -550,6 +617,14 @@ def run():
 
     duplicates = detect_duplicates(payments)
 
+    # Create batch record in database
+    batch_id = None
+    if is_db_enabled():
+        csv_ref = s3_key or str(csv_path)
+        source = "scheduled" if args.scheduled else "upload"
+        batch_id = create_batch(csv_ref, source=source, dry_run=args.dry_run,
+                                total_rows=len(payments))
+
     print(f"Loaded {len(payments)} payments from {csv_path.name}")
     if duplicates:
         print(f"Duplicate names detected: {', '.join(sorted(duplicates))}")
@@ -558,6 +633,8 @@ def run():
     print()
 
     results = []
+    success_count = 0
+    fail_count = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -573,45 +650,86 @@ def run():
                 amount = payment["amount"]
                 print(f"\n[{i}/{len(payments)}]", end="")
 
+                pay_status = None
+                pay_method = None
+                pay_error = None
+                screenshot_ref = None
+
                 try:
                     success, method, error = post_payment(page, name, date, amount, dry_run=args.dry_run)
 
                     if success:
+                        pay_status = "OK"
+                        pay_method = method
+                        success_count += 1
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "OK", "method": method})
                     elif method == "FLAGGED":
+                        pay_status = "FLAGGED"
+                        pay_error = error
+                        fail_count += 1
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FLAGGED", "method": "", "reason": error})
                     else:
+                        pay_status = "FAILED"
+                        pay_error = error
+                        fail_count += 1
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FAILED", "method": "", "reason": error})
 
                 except PlaywrightTimeout:
-                    screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
+                    screenshot_ref = screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
                     print(f"  ERROR: Timed out for {name}")
+                    pay_status = "TIMEOUT"
+                    fail_count += 1
                     results.append({"name": name, "date": date, "amount": amount,
                                     "status": "TIMEOUT", "method": ""})
                 except Exception as e:
-                    screenshot(page, f"error_{name.replace(' ', '_')}")
+                    screenshot_ref = screenshot(page, f"error_{name.replace(' ', '_')}")
                     print(f"  ERROR: {e}")
+                    pay_status = "FAILED"
+                    pay_error = str(e)
+                    fail_count += 1
                     results.append({"name": name, "date": date, "amount": amount,
                                     "status": "FAILED", "method": "", "reason": str(e)})
                 finally:
                     recover_to_dashboard(page)
 
+                # Record payment in database
+                if batch_id and pay_status:
+                    insert_payment(
+                        batch_id, name, date or None, amount, pay_status,
+                        method=pay_method, error_message=pay_error,
+                        screenshot_key=screenshot_ref
+                    )
+
         except PlaywrightTimeout as e:
             screenshot(page, "error_timeout")
             print(f"ERROR: Timed out during setup - {e}")
+            if batch_id:
+                update_batch(batch_id, "failed", success_count, fail_count)
             sys.exit(1)
         except Exception as e:
             screenshot(page, "error_unexpected")
             print(f"ERROR: {e}")
+            if batch_id:
+                update_batch(batch_id, "failed", success_count, fail_count)
             sys.exit(1)
         finally:
             print("\nClosing browser.")
             browser.close()
 
-    generate_report(results, duplicates, dry_run=args.dry_run)
+    report_ref = generate_report(results, duplicates, dry_run=args.dry_run)
+
+    # Update batch record with final status
+    if batch_id:
+        update_batch(batch_id, "completed", success_count, fail_count,
+                     report_s3_key=report_ref)
+
+    # Clean up temp file if downloaded from S3
+    if s3_key and csv_path.exists() and str(csv_path).startswith(tempfile.gettempdir()):
+        csv_path.unlink()
+        print(f"Cleaned up temp file: {csv_path}")
 
 
 if __name__ == "__main__":
