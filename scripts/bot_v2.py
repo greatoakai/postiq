@@ -366,12 +366,12 @@ def click_appointment_by_date(page, date_str, name):
     page.wait_for_timeout(1000)
 
 
-def dismiss_other_charges_modal(page, name, click_show_all):
+def handle_other_charges_modal(page, name, has_matched_date):
     """Handle the 'show other charges' modal if it appears.
 
     Args:
-        click_show_all: If True, click 'No, show all open charges' (V1 flow).
-                        If False, dismiss/close the modal (V2 flow with matched date).
+        has_matched_date: If True (V2), click 'Yes, accept payment for this appointment'.
+                          If False (V1), click 'No, show all open charges'.
     Returns True if the modal was present (client has outstanding balances).
     """
     modal = page.locator("#show-other-charges-modal")
@@ -379,16 +379,19 @@ def dismiss_other_charges_modal(page, name, click_show_all):
         if modal.is_visible(timeout=2000):
             print(f"  Outstanding balances detected for {name}")
             _outstanding_balances.add(name)
-            if click_show_all:
+            if has_matched_date:
+                # V2: accept payment for the matched appointment
+                yes_btn = modal.locator("text=Yes, accept payment for this appointment")
+                if yes_btn.count() > 0:
+                    print("  Clicking 'Yes, accept payment for this appointment'...")
+                    yes_btn.first.click()
+                else:
+                    # Fallback: try any primary/accept button in the modal
+                    modal.locator("button.btn-primary, button:has-text('Yes')").first.click()
+            else:
+                # V1: show all open charges
                 print("  Clicking 'No, show all open charges'...")
                 page.locator("#show-other-charges-modal-submit").click()
-            else:
-                # Close/dismiss the modal — click the X or press Escape
-                close_btn = modal.locator("button.close, [data-dismiss='modal']")
-                if close_btn.count() > 0:
-                    close_btn.first.click()
-                else:
-                    page.keyboard.press("Escape")
             page.wait_for_load_state("networkidle")
             page.wait_for_timeout(1000)
             return True
@@ -412,8 +415,8 @@ def click_accept_payment(page, name):
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
 
-    # Handle "show other charges" modal — V2 has a matched date, don't show all
-    dismiss_other_charges_modal(page, name, click_show_all=False)
+    # Handle "show other charges" modal — V2 has a matched date, accept for this appointment
+    handle_other_charges_modal(page, name, has_matched_date=True)
 
 
 def fill_payment_form(page, amount):
@@ -566,7 +569,7 @@ def post_payment_v1(page, name, amount, dry_run=False):
     select_client_v1(page, name)
 
     # Handle "show other charges" modal — V1 has no matched date, show all
-    dismiss_other_charges_modal(page, name, click_show_all=True)
+    handle_other_charges_modal(page, name, has_matched_date=False)
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_01_form")
 
     # Fill payment form
