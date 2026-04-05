@@ -10,7 +10,7 @@ RECIPIENTS = [
 SENDER = "travis@greatoakcounseling.com"
 
 
-def send_report(results, duplicates, dry_run=False):
+def send_report(results, duplicates, outstanding_balances=None, dry_run=False):
     """Build and send the PostIQ Payment Report email via SES."""
     from scripts.aws import _ensure_boto3, boto3
 
@@ -23,7 +23,7 @@ def send_report(results, duplicates, dry_run=False):
     var_posted = [r for r in results if r["status"] == "OK" and r.get("method", "").endswith("-VAR")]
     flagged = [r for r in results if r["status"] == "FLAGGED"]
     failed = [r for r in results if r["status"] in ("FAILED", "TIMEOUT")]
-    outstanding = sorted(set(duplicates)) if duplicates else []
+    outstanding = sorted(outstanding_balances) if outstanding_balances else []
 
     all_ok = posted + fallback + var_posted
     total_amount = sum(float(r["amount"]) for r in all_ok)
@@ -202,8 +202,8 @@ def _build_html(report_date, posted, fallback, var_posted, flagged, failed,
             Outstanding Balances -- Follow Up Needed
         </h2>
         <p style="color:#555;font-size:14px;margin-bottom:10px;">
-            These clients had additional charges from older sessions. Today's payment was posted to
-            the correct appointment, but the remaining balance needs attention.
+            These clients have additional open charges beyond the most recent session.
+            Today's payment was posted, but the remaining balance needs attention.
         </p>
         <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
             <tr style="background:#d84315;">

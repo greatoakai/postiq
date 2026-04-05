@@ -135,6 +135,9 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 ACTION_TIMEOUT = 30000
 
+# Track clients that have outstanding balances (other open charges modal)
+_outstanding_balances = set()
+
 # Track whether appointment date filters have been set this session
 _filters_set = False
 
@@ -363,7 +366,38 @@ def click_appointment_by_date(page, date_str, name):
     page.wait_for_timeout(1000)
 
 
-def click_accept_payment(page):
+def dismiss_other_charges_modal(page, name, click_show_all):
+    """Handle the 'show other charges' modal if it appears.
+
+    Args:
+        click_show_all: If True, click 'No, show all open charges' (V1 flow).
+                        If False, dismiss/close the modal (V2 flow with matched date).
+    Returns True if the modal was present (client has outstanding balances).
+    """
+    modal = page.locator("#show-other-charges-modal")
+    try:
+        if modal.is_visible(timeout=2000):
+            print(f"  Outstanding balances detected for {name}")
+            _outstanding_balances.add(name)
+            if click_show_all:
+                print("  Clicking 'No, show all open charges'...")
+                page.locator("#show-other-charges-modal-submit").click()
+            else:
+                # Close/dismiss the modal — click the X or press Escape
+                close_btn = modal.locator("button.close, [data-dismiss='modal']")
+                if close_btn.count() > 0:
+                    close_btn.first.click()
+                else:
+                    page.keyboard.press("Escape")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1000)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def click_accept_payment(page, name):
     """Click the Accept Payment button on the appointment summary."""
     print("  Clicking Accept Payment...")
     page.click("text=Accept Payment")
@@ -377,6 +411,9 @@ def click_accept_payment(page):
         yes_btn.click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
+
+    # Handle "show other charges" modal — V2 has a matched date, don't show all
+    dismiss_other_charges_modal(page, name, click_show_all=False)
 
 
 def fill_payment_form(page, amount):
@@ -453,7 +490,7 @@ def post_payment_v2(page, name, date, amount, dry_run=False):
     navigate_to_appointments(page)
     ensure_date_filters(page)
     click_appointment_by_date(page, date, name)
-    click_accept_payment(page)
+    click_accept_payment(page, name)
     screenshot(page, f"payment_{name.replace(' ', '_')}_01_form")
 
     fill_payment_form(page, amount)
@@ -527,6 +564,9 @@ def post_payment_v1(page, name, amount, dry_run=False):
 
     # Select client and search
     select_client_v1(page, name)
+
+    # Handle "show other charges" modal — V1 has no matched date, show all
+    dismiss_other_charges_modal(page, name, click_show_all=True)
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_01_form")
 
     # Fill payment form
@@ -610,9 +650,10 @@ def post_payment(page, name, date, amount, dry_run=False):
     return False, "FAILED", f"V2: {v2_error}; V1: {v1_error}"
 
 
-def generate_report(results, duplicates, dry_run=False, source_s3_key=None):
+def generate_report(results, duplicates, outstanding_balances=None, dry_run=False, source_s3_key=None):
     """Generate a summary report as both text (human) and JSON (dashboard)."""
     import json as _json
+    outstanding_balances = outstanding_balances or set()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "DRYRUN" if dry_run else "POSTED"
@@ -629,6 +670,7 @@ def generate_report(results, duplicates, dry_run=False, source_s3_key=None):
         "success_count": total_success,
         "total_amount": total_amount,
         "duplicates": sorted(duplicates) if duplicates else [],
+        "outstanding_balances": sorted(outstanding_balances) if outstanding_balances else [],
         "payments": results,
     }
     json_str = _json.dumps(report_data, indent=2)
@@ -683,6 +725,13 @@ def generate_report(results, duplicates, dry_run=False, source_s3_key=None):
         lines.append("FAILED — COULD NOT POST:")
         for r in failed:
             lines.append(f"  {r['name']} — {r.get('reason', 'unknown')}")
+
+    if outstanding_balances:
+        lines.append("")
+        lines.append("OUTSTANDING BALANCES — FOLLOW UP NEEDED:")
+        lines.append("  These clients have additional open charges beyond the most recent session.")
+        for name in sorted(outstanding_balances):
+            lines.append(f"  {name}")
 
     report_text = "\n".join(lines)
     txt_path.write_text(report_text)
@@ -835,12 +884,13 @@ def run():
             print("\nClosing browser.")
             browser.close()
 
-    generate_report(results, duplicates, dry_run=args.dry_run, source_s3_key=s3_key)
+    outstanding = _outstanding_balances.copy()
+    generate_report(results, duplicates, outstanding, dry_run=args.dry_run, source_s3_key=s3_key)
 
     # Send email report
     try:
         from scripts.email_report import send_report
-        send_report(results, duplicates, dry_run=args.dry_run)
+        send_report(results, duplicates, outstanding, dry_run=args.dry_run)
     except Exception as e:
         print(f"WARNING: Could not send email report: {e}")
 
