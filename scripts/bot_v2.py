@@ -1,6 +1,7 @@
 import argparse
 import csv
 import io
+import json
 import os
 import sys
 import tempfile
@@ -23,6 +24,17 @@ LOG_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
 
 load_dotenv(PROJECT_ROOT / ".env")
+
+# Name aliases: map Square names to TherapyAppointment names
+ALIASES_FILE = Path(__file__).resolve().parent / "name_aliases.json"
+NAME_ALIASES = {}
+if ALIASES_FILE.exists():
+    NAME_ALIASES = json.loads(ALIASES_FILE.read_text())
+
+
+def resolve_name(name):
+    """Return the TA name for a given Square name, using aliases if defined."""
+    return NAME_ALIASES.get(name, name)
 
 # Credentials: Secrets Manager on AWS, .env locally
 USERNAME, PASSWORD = get_credentials()
@@ -649,33 +661,37 @@ def run():
             login(page)
 
             for i, payment in enumerate(payments, 1):
-                name = payment["name"]
+                csv_name = payment["name"]
+                name = resolve_name(csv_name)
+                if name != csv_name:
+                    print(f"\n[{i}/{len(payments)}] (alias: {csv_name} -> {name})", end="")
+                else:
+                    print(f"\n[{i}/{len(payments)}]", end="")
                 date = payment["date"]
                 amount = payment["amount"]
-                print(f"\n[{i}/{len(payments)}]", end="")
 
                 try:
                     success, method, error = post_payment(page, name, date, amount, dry_run=args.dry_run)
 
                     if success:
-                        results.append({"name": name, "date": date, "amount": amount,
+                        results.append({"name": csv_name, "date": date, "amount": amount,
                                         "status": "OK", "method": method})
                     elif method == "FLAGGED":
-                        results.append({"name": name, "date": date, "amount": amount,
+                        results.append({"name": csv_name, "date": date, "amount": amount,
                                         "status": "FLAGGED", "method": "", "reason": error})
                     else:
-                        results.append({"name": name, "date": date, "amount": amount,
+                        results.append({"name": csv_name, "date": date, "amount": amount,
                                         "status": "FAILED", "method": "", "reason": error})
 
                 except PlaywrightTimeout:
                     screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
                     print(f"  ERROR: Timed out for {name}")
-                    results.append({"name": name, "date": date, "amount": amount,
+                    results.append({"name": csv_name, "date": date, "amount": amount,
                                     "status": "TIMEOUT", "method": ""})
                 except Exception as e:
                     screenshot(page, f"error_{name.replace(' ', '_')}")
                     print(f"  ERROR: {e}")
-                    results.append({"name": name, "date": date, "amount": amount,
+                    results.append({"name": csv_name, "date": date, "amount": amount,
                                     "status": "FAILED", "method": "", "reason": str(e)})
                 finally:
                     recover_to_dashboard(page)
