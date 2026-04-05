@@ -31,6 +31,99 @@ NAME_ALIASES = {}
 if ALIASES_FILE.exists():
     NAME_ALIASES = json.loads(ALIASES_FILE.read_text())
 
+# Common nickname -> formal name mappings (and reverse)
+NICKNAMES = {
+    "barbara": ["barb", "barbi", "babs"],
+    "joshua": ["josh"],
+    "raelyn": ["rae"],
+    "mercedes": ["cede", "mercy", "sadie"],
+    "robert": ["rob", "bob", "bobby", "robbie"],
+    "william": ["will", "bill", "billy", "liam"],
+    "james": ["jim", "jimmy", "jamie"],
+    "richard": ["rick", "rich", "dick"],
+    "michael": ["mike", "mikey"],
+    "elizabeth": ["liz", "beth", "lizzy", "eliza"],
+    "jennifer": ["jen", "jenny"],
+    "katherine": ["kate", "kathy", "katie", "kat"],
+    "catherine": ["cathy", "cat", "kate"],
+    "stephanie": ["steph"],
+    "patricia": ["pat", "patty", "trish"],
+    "margaret": ["maggie", "meg", "peggy", "marge"],
+    "alexander": ["alex"],
+    "alexandra": ["alex", "lexi"],
+    "benjamin": ["ben"],
+    "christopher": ["chris"],
+    "christine": ["chris", "christy", "tina"],
+    "christina": ["chris", "christy", "tina"],
+    "daniel": ["dan", "danny"],
+    "david": ["dave", "davey"],
+    "deborah": ["deb", "debbie"],
+    "donald": ["don", "donny"],
+    "dorothy": ["dot", "dottie"],
+    "edward": ["ed", "eddie", "ted"],
+    "evelyn": ["eve", "evie"],
+    "frederick": ["fred", "freddy"],
+    "gregory": ["greg"],
+    "jonathan": ["jon", "john"],
+    "joseph": ["joe", "joey"],
+    "judith": ["judy", "judi"],
+    "lawrence": ["larry"],
+    "leonard": ["leo", "lenny"],
+    "madeline": ["maddy", "maddie"],
+    "matthew": ["matt"],
+    "nathaniel": ["nate", "nathan"],
+    "nicholas": ["nick", "nicky"],
+    "pamela": ["pam"],
+    "rebecca": ["becca", "becky"],
+    "rebekah": ["becca", "becky"],
+    "samuel": ["sam", "sammy"],
+    "susan": ["sue", "susie"],
+    "theodore": ["ted", "teddy", "theo"],
+    "thomas": ["tom", "tommy"],
+    "timothy": ["tim", "timmy"],
+    "victoria": ["vicky", "tori"],
+    "zachary": ["zach", "zack"],
+}
+
+# Build reverse lookup: nickname -> list of formal names
+_NICK_REVERSE = {}
+for formal, nicks in NICKNAMES.items():
+    for nick in nicks:
+        _NICK_REVERSE.setdefault(nick, []).append(formal)
+
+
+def get_name_variations(name):
+    """Generate name variations to try if the exact name fails.
+    Returns list of (variation_name, variation_type) tuples."""
+    parts = name.split()
+    if len(parts) < 2:
+        return []
+
+    first = parts[0]
+    last = parts[-1]
+    first_lower = first.lower()
+    variations = []
+
+    # 1. Check explicit aliases first
+    if name in NAME_ALIASES:
+        variations.append((NAME_ALIASES[name], "alias"))
+
+    # 2. Try common nicknames of the first name
+    if first_lower in NICKNAMES:
+        for nick in NICKNAMES[first_lower]:
+            var_name = nick.capitalize() + " " + last
+            variations.append((var_name, "nickname"))
+
+    # 3. Try formal names if the given name is a nickname
+    if first_lower in _NICK_REVERSE:
+        for formal in _NICK_REVERSE[first_lower]:
+            var_name = formal.capitalize() + " " + last
+            variations.append((var_name, "formal name"))
+
+    # 4. Try first 3 letters as prefix match (handled in search already)
+
+    return variations
+
 
 def resolve_name(name):
     """Return the TA name for a given Square name, using aliases if defined."""
@@ -487,7 +580,33 @@ def post_payment(page, name, date, amount, dry_run=False):
             return False, "FLAGGED", v1_error
         print(f"  V1 also failed: {v1_error}")
 
-    # --- Both failed ---
+    # --- Attempt 3: Try name variations (nicknames, aliases) ---
+    variations = get_name_variations(name)
+    for var_name, var_type in variations:
+        if var_name.lower() == name.lower():
+            continue
+        print(f"  Trying {var_type}: {var_name}...")
+        recover_to_dashboard(page)
+
+        # Try V2 with variation
+        try:
+            _filters_set = False
+            result = post_payment_v2(page, var_name, date, amount, dry_run)
+            if result:
+                return True, "V2-VAR", f"Posted as '{var_name}' ({var_type} of '{name}')"
+        except Exception:
+            _filters_set = False
+
+        # Try V1 with variation
+        recover_to_dashboard(page)
+        try:
+            result = post_payment_v1(page, var_name, amount, dry_run)
+            if result:
+                return True, "V1-VAR", f"Posted as '{var_name}' ({var_type} of '{name}')"
+        except Exception:
+            pass
+
+    # --- All attempts failed ---
     return False, "FAILED", f"V2: {v2_error}; V1: {v1_error}"
 
 
@@ -542,6 +661,14 @@ def generate_report(results, duplicates, dry_run=False, source_s3_key=None):
 
     lines.append("-" * 68)
     lines.append(f"Total: {total_success}/{len(results)} payments — ${total_amount:.2f}")
+
+    # Name variations that were used
+    var_posted = [r for r in results if r.get("method", "").endswith("-VAR")]
+    if var_posted:
+        lines.append("")
+        lines.append("POSTED VIA NAME VARIATION — VERIFY ALLOCATION:")
+        for r in var_posted:
+            lines.append(f"  {r['name']} — {r.get('reason', '')}")
 
     flagged = [r for r in results if r["status"] == "FLAGGED"]
     if flagged:

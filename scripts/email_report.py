@@ -20,11 +20,12 @@ def send_report(results, duplicates, dry_run=False):
     # Categorize results
     posted = [r for r in results if r["status"] == "OK" and r.get("method") == "V2"]
     fallback = [r for r in results if r["status"] == "OK" and r.get("method") == "V1"]
+    var_posted = [r for r in results if r["status"] == "OK" and r.get("method", "").endswith("-VAR")]
     flagged = [r for r in results if r["status"] == "FLAGGED"]
     failed = [r for r in results if r["status"] in ("FAILED", "TIMEOUT")]
     outstanding = sorted(set(duplicates)) if duplicates else []
 
-    all_ok = posted + fallback
+    all_ok = posted + fallback + var_posted
     total_amount = sum(float(r["amount"]) for r in all_ok)
     report_date = datetime.now().strftime("%A, %B %d, %Y")
     short_date = datetime.now().strftime("%m/%d/%Y")
@@ -40,6 +41,7 @@ def send_report(results, duplicates, dry_run=False):
         report_date=report_date,
         posted=posted,
         fallback=fallback,
+        var_posted=var_posted,
         flagged=flagged,
         failed=failed,
         outstanding=outstanding,
@@ -62,8 +64,8 @@ def send_report(results, duplicates, dry_run=False):
         print("  (Ensure SES sender/recipients are verified)")
 
 
-def _build_html(report_date, posted, fallback, flagged, failed, outstanding,
-                total_amount, dry_run):
+def _build_html(report_date, posted, fallback, var_posted, flagged, failed,
+                outstanding, total_amount, dry_run):
     """Build the HTML email matching the PostIQ report design."""
     posted_count = len(posted) + len(fallback)
     failed_count = len(failed)
@@ -72,8 +74,10 @@ def _build_html(report_date, posted, fallback, flagged, failed, outstanding,
 
     mode_label = " (DRY RUN)" if dry_run else ""
 
+    var_count = len(var_posted)
+
     # --- Completed Payments table rows ---
-    all_ok = sorted(posted + fallback, key=lambda r: r["name"])
+    all_ok = sorted(posted + fallback + var_posted, key=lambda r: r["name"])
     completed_rows = ""
     for i, r in enumerate(all_ok):
         bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
@@ -155,6 +159,39 @@ def _build_html(report_date, posted, fallback, flagged, failed, outstanding,
                 <th style="padding:10px 12px;text-align:left;color:white;font-weight:600;">Expected Appt Date</th>
             </tr>
             {fallback_rows}
+        </table>
+        '''
+
+    # --- Name Variation table rows ---
+    var_rows = ""
+    for i, r in enumerate(var_posted):
+        bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+        reason = r.get("reason", "")
+        var_rows += (
+            f'<tr style="background:{bg};">'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):.2f}</td>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;">{reason}</td>'
+            f'</tr>\n'
+        )
+
+    var_section = ""
+    if var_posted:
+        var_section = f'''
+        <h2 style="color:#1565c0;font-size:18px;margin:30px 0 5px 0;padding-bottom:5px;border-bottom:2px solid #1565c0;">
+            Posted via Name Variation -- Verify Allocation
+        </h2>
+        <p style="color:#555;font-size:14px;margin-bottom:10px;">
+            These payments were posted using a nickname or alias. Please verify the correct client
+            was matched in TherapyAppointment.
+        </p>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
+            <tr style="background:#1565c0;">
+                <th style="padding:10px 12px;text-align:left;color:white;font-weight:600;">Client</th>
+                <th style="padding:10px 12px;text-align:right;color:white;font-weight:600;">Amount</th>
+                <th style="padding:10px 12px;text-align:left;color:white;font-weight:600;">Name Used</th>
+            </tr>
+            {var_rows}
         </table>
         '''
 
@@ -240,6 +277,7 @@ def _build_html(report_date, posted, fallback, flagged, failed, outstanding,
 
             {failed_section}
             {fallback_section}
+            {var_section}
             {outstanding_section}
 
             <!-- Sign-off -->
