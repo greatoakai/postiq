@@ -5,7 +5,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ARCHIVE="$PROJECT_ROOT/drive-inbox/../Square Payment Archive"
+ARCHIVE="$PROJECT_ROOT/Square Payment Archive"
 LOG_DIR="$PROJECT_ROOT/logs"
 LOGFILE="$LOG_DIR/cleanup.log"
 

@@ -1,12 +1,18 @@
 # Credentials - NEVER commit
 .env
 
+# State markers
+.last_processed
+
 # Payment data - contains PHI
 data/
+drive-inbox/
+Square Payment Archive/
 *.csv
 *.835
 *.pdf
 *.txt
+!requirements.txt
 
 # Logs - may contain PHI
 logs/

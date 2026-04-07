@@ -33,6 +33,13 @@ EOF
 
 log "=== PostIQ Daily Run ==="
 
+# ── Step 0: Sync from S3 ──
+# The Square Daily Report bot uploads new CSVs to S3 each morning at 6:00 AM.
+# This step downloads them into the local inbox and deletes them from S3.
+log "Syncing new CSVs from S3..."
+SYNC_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/sync_inbox.py" 2>&1) || true
+echo "$SYNC_OUTPUT" >> "$LOGFILE"
+
 # Find CSV files matching the Daily.Square.Log pattern
 shopt -s nullglob
 csv_files=("$INBOX"/*_Daily.Square.Log.csv)
@@ -130,8 +137,9 @@ fi
 # failed files should be re-run manually after fixing the issue)
 echo "$newest_name" >> "$MARKER"
 
-# Move the processed CSV to the Archive folder in Google Drive
-ARCHIVE="$INBOX/../Square Payment Archive"
+# Move the processed CSV to the local archive folder
+ARCHIVE="$PROJECT_ROOT/Square Payment Archive"
+mkdir -p "$ARCHIVE"
 log "Archiving processed CSV: $newest_name"
 mv "$newest" "$ARCHIVE/$newest_name"
 log "Archived: $newest_name → Square Payment Archive/"
