@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
 DATA_DIR = PROJECT_ROOT / "data"
 LOG_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -24,6 +25,144 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 ACTION_TIMEOUT = 30000
 
+
+# ─────────────────────────────────────────────
+# NAME MATCHING — nicknames + explicit aliases
+# ─────────────────────────────────────────────
+# Square sometimes stores a client's preferred/nickname while TA stores their
+# legal/formal name (or vice versa). When the exact name doesn't match, the bot
+# tries variations from this dictionary before giving up.
+#
+# To add a missing nickname mapping, just add it here. To override a specific
+# client's name with a one-off mapping, use scripts/name_aliases.json instead.
+
+NICKNAMES = {
+    "alexander": ["alex"],
+    "alexandra": ["alex", "lexi"],
+    "barbara": ["barb", "barbi", "babs"],
+    "benjamin": ["ben"],
+    "catherine": ["cathy", "cat", "kate"],
+    "christine": ["chris", "christy", "tina"],
+    "christina": ["chris", "christy", "tina"],
+    "christopher": ["chris"],
+    "daniel": ["dan", "danny"],
+    "david": ["dave", "davey"],
+    "deborah": ["deb", "debbie"],
+    "donald": ["don", "donny"],
+    "dorothy": ["dot", "dottie"],
+    "edward": ["ed", "eddie", "ted"],
+    "elizabeth": ["liz", "beth", "lizzy", "eliza"],
+    "evelyn": ["eve", "evie"],
+    "frederick": ["fred", "freddy"],
+    "gregory": ["greg"],
+    "james": ["jim", "jimmy", "jamie"],
+    "jennifer": ["jen", "jenny"],
+    "jonathan": ["jon", "john"],
+    "joseph": ["joe", "joey"],
+    "joshua": ["josh"],
+    "judith": ["judy", "judi"],
+    "katherine": ["kate", "kathy", "katie", "kat"],
+    "lawrence": ["larry"],
+    "leonard": ["leo", "lenny"],
+    "madeline": ["maddy", "maddie"],
+    "margaret": ["maggie", "meg", "peggy", "marge"],
+    "matthew": ["matt"],
+    "mercedes": ["cede", "mercy", "sadie"],
+    "michael": ["mike", "mikey"],
+    "nathaniel": ["nate", "nathan"],
+    "nicholas": ["nick", "nicky"],
+    "pamela": ["pam"],
+    "patricia": ["pat", "patty", "trish"],
+    "raelyn": ["rae"],
+    "rebecca": ["becca", "becky"],
+    "rebekah": ["becca", "becky"],
+    "richard": ["rick", "rich", "dick"],
+    "robert": ["rob", "bob", "bobby", "robbie"],
+    "samuel": ["sam", "sammy"],
+    "stephanie": ["steph"],
+    "susan": ["sue", "susie"],
+    "theodore": ["ted", "teddy", "theo"],
+    "thomas": ["tom", "tommy"],
+    "timothy": ["tim", "timmy"],
+    "victoria": ["vicky", "tori"],
+    "william": ["will", "bill", "billy", "liam"],
+    "zachary": ["zach", "zack"],
+}
+
+# Reverse lookup: nickname → list of formal names
+# (e.g., "ted" → ["edward", "theodore"])
+_NICK_REVERSE = {}
+for _formal, _nicks in NICKNAMES.items():
+    for _nick in _nicks:
+        _NICK_REVERSE.setdefault(_nick, []).append(_formal)
+
+
+# ─────────────────────────────────────────────
+# Explicit name aliases (one-off overrides)
+# ─────────────────────────────────────────────
+# scripts/name_aliases.json maps specific Square names to specific TA names.
+# Use this for clients whose nicknames aren't in the NICKNAMES dictionary
+# (e.g., legal name changes, uncommon nicknames, or typos in either system).
+#
+# Format: { "Square Full Name": "TA Full Name", ... }
+# Keys starting with "_" (e.g., "_comment") are ignored.
+
+_ALIASES_FILE = Path(__file__).resolve().parent / "name_aliases.json"
+NAME_ALIASES = {}
+if _ALIASES_FILE.exists():
+    try:
+        import json
+        _raw = json.loads(_ALIASES_FILE.read_text())
+        # Drop comment keys
+        NAME_ALIASES = {k: v for k, v in _raw.items() if not k.startswith("_")}
+        if NAME_ALIASES:
+            print(f"Loaded {len(NAME_ALIASES)} name alias(es) from name_aliases.json")
+    except Exception as e:
+        print(f"WARNING: Could not load name_aliases.json: {e}")
+
+
+def resolve_name(name):
+    """Return the TA-side name for a given Square name.
+
+    If the name is in NAME_ALIASES, return the override.
+    Otherwise return the original name unchanged.
+    """
+    return NAME_ALIASES.get(name, name)
+
+
+def get_name_variations(name):
+    """Generate alternate names to try if the exact name doesn't match.
+
+    Returns a list of (variation_name, variation_type) tuples in priority order.
+    Used by search_client() and select_client_v1() when the original name fails.
+
+    Examples:
+        get_name_variations("Bob Smith")
+            → [("Robert Smith", "formal name")]
+        get_name_variations("Robert Smith")
+            → [("Rob Smith", "nickname"), ("Bob Smith", "nickname"), ...]
+    """
+    parts = name.split()
+    if len(parts) < 2:
+        return []
+
+    first = parts[0]
+    last = parts[-1]
+    first_lower = first.lower()
+    variations = []
+
+    # 1. Try common nicknames of the first name (e.g., Robert → Bob, Rob, Robbie)
+    if first_lower in NICKNAMES:
+        for nick in NICKNAMES[first_lower]:
+            variations.append((nick.capitalize() + " " + last, "nickname"))
+
+    # 2. Try formal names if the given first name is itself a nickname
+    #    (e.g., Bob → Robert; Ted → Edward, Theodore)
+    if first_lower in _NICK_REVERSE:
+        for formal in _NICK_REVERSE[first_lower]:
+            variations.append((formal.capitalize() + " " + last, "formal name"))
+
+    return variations
 
 
 def normalize_name(name):
@@ -109,6 +248,143 @@ def login(page):
     screenshot(page, "02_dashboard")
     print("Login successful.")
 
+    # Permanently disable the Beacon (HelpScout) chat widget for this session.
+    # Even when "closed" via JS API, the iframe stays in the DOM and intercepts
+    # pointer events. We hide the entire container with CSS so it can never
+    # block clicks. Re-injected on every recover_to_dashboard() in case TA
+    # reloads the widget.
+    suppress_beacon_widget(page)
+    dismiss_popups(page)
+
+
+def suppress_beacon_widget(page):
+    """Inject CSS to hide the HelpScout Beacon widget entirely.
+
+    The Beacon iframe overlays the page and intercepts clicks even when the
+    visible popup has been dismissed. The bot never needs the chat widget,
+    so we hide it permanently for the duration of the session by injecting
+    a <style> tag that forces display:none on the container.
+
+    Idempotent — safe to call multiple times. Re-call after any page reload
+    that might re-inject Beacon (e.g., recover_to_dashboard navigation).
+    """
+    try:
+        page.add_style_tag(content="""
+            #beacon-container,
+            #beacon-container *,
+            iframe[title*="Help Scout"],
+            iframe[title*="Beacon"],
+            div[class*="BeaconContainer"] {
+                display: none !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+            }
+        """)
+    except Exception as e:
+        # Don't fail the run if style injection fails — fall back to dismiss_popups
+        print(f"  WARNING: Could not suppress Beacon widget: {e}")
+
+
+def dismiss_popups(page):
+    """Close any overlay/chat widgets that intercept clicks.
+
+    TherapyAppointment uses a Beacon (HelpScout) widget that occasionally
+    pops up with announcements. The widget overlays the page and blocks
+    clicks elsewhere with "subtree intercepts pointer events" errors.
+
+    The Beacon close button is hidden until the user hovers over the popup,
+    so a normal click_if_visible check won't see it. This function uses
+    multiple strategies in order:
+      1. Beacon's JavaScript API (cleanest if available)
+      2. Force-click the hidden close button via JS
+      3. Force-click via Playwright with force=True
+
+    Safe to call repeatedly — does nothing if no popup is present.
+    """
+    # Strategy 1: Use Beacon's JS API to close the widget directly.
+    try:
+        result = page.evaluate("""
+            () => {
+                if (typeof window.Beacon === 'function') {
+                    try { window.Beacon('close'); return 'closed-via-api'; }
+                    catch (e) { return 'api-error: ' + e.message; }
+                }
+                return null;
+            }
+        """)
+        if result == "closed-via-api":
+            print("  Dismissed Beacon popup via JS API")
+            page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    # Strategy 2: Force-click any known close button via JS, regardless of CSS visibility.
+    try:
+        clicked = page.evaluate("""
+            () => {
+                const selectors = [
+                    '[data-cy="beacon-close-button"]',
+                    '[data-cy="beacon-message-close-button"]',
+                    'button.BeaconCloseButton',
+                    'button[aria-label="Close message"]',
+                    'button[aria-label="Close"]'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { el.click(); return sel; }
+                }
+                return null;
+            }
+        """)
+        if clicked:
+            print(f"  Dismissed popup via force JS click ({clicked})")
+            page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    # Strategy 3: Playwright force-click as last resort.
+    selectors = [
+        '[data-cy="beacon-close-button"]',
+        '[data-cy="beacon-message-close-button"]',
+        'button.BeaconCloseButton',
+        'button[aria-label="Close message"]',
+        'button[aria-label="Close"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                loc.click(force=True, timeout=1000)
+                print(f"  Dismissed popup via force click ({sel})")
+                page.wait_for_timeout(300)
+                break
+        except Exception:
+            pass
+
+
+def recover_to_dashboard(page):
+    """Navigate back to the dashboard to reset browser state between payments.
+
+    Called after a failed payment so the next client starts from a clean slate
+    instead of inheriting whatever modal/page state the previous failure left behind.
+    Also re-suppresses the Beacon widget (it can come back after navigation).
+    Failure to recover is logged but does not raise — the next payment attempt will
+    fall back through its own retry/fallback logic.
+    """
+    try:
+        if "dashboard" not in (page.url or ""):
+            print("  Recovering to dashboard...")
+            page.goto(
+                "https://portal.therapyappointment.com/index.cfm/dashboard",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            page.wait_for_load_state("networkidle")
+        suppress_beacon_widget(page)
+        dismiss_popups(page)
+    except Exception as e:
+        print(f"  WARNING: Could not recover to dashboard: {e}")
+
 
 # =============================================================================
 # V2 FLOW: Clients > Search > Appointments > Accept Payment
@@ -117,6 +393,7 @@ def login(page):
 def navigate_to_clients(page):
     """Click Clients in the sidebar."""
     print("  Navigating to Clients...")
+    dismiss_popups(page)  # Beacon widget can intercept the sidebar click
     page.click("text=Clients")
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
@@ -155,19 +432,42 @@ def _match_rows(rows, match_parts):
     return matching
 
 
+def _try_search(page, search_name):
+    """Run one search attempt with the given name. Returns (matching_rows, match_parts).
+
+    Helper used by search_client() to try multiple variations without duplicating
+    the parsing/matching logic.
+    """
+    parts = search_name.split()
+    first = parts[0]
+    last = parts[-1]
+    first_search = first[:3]
+    last_search = last[:3]
+
+    match_parts = []
+    for part in [first.lower(), last.lower()]:
+        match_parts.extend(part.split("-"))
+
+    print(f"  Searching: First={first_search} (from {first}), Last={last_search} (from {last})")
+    navigate_to_clients(page)
+    rows = _do_search(page, first_search, last_search)
+    return _match_rows(rows, match_parts)
+
+
 def search_client(page, name):
     """Search for a client by first and last name. Returns True if a unique match was clicked.
 
-    If the original name doesn't match, automatically retries with a normalized
-    version (accents stripped, encoding fixed). Also returns a note string if
-    the CSV name contains a middle name or extra name part.
+    Resolution order (stops at first unique match):
+        1. Explicit alias from name_aliases.json (resolve_name)
+        2. Original name as-is
+        3. Normalized name (strip accents / fix encoding)
+        4. Nickname variations (Bob ↔ Robert, Liz ↔ Elizabeth, etc.)
+
+    Also returns a note string if the CSV name contains a middle name or
+    extra name part, or if the bot had to use an alternate name to find the client.
     """
     parts = name.split()
-    first_name = parts[0]
-    last_name = parts[-1]
     middle_parts = parts[1:-1] if len(parts) > 2 else []
-    first_search = first_name[:3]
-    last_search = last_name[:3]
 
     note = None
     if middle_parts:
@@ -175,42 +475,52 @@ def search_client(page, name):
         note = f"Middle/extra name '{extra}' in CSV — verify in TherapyAppointment"
         print(f"  NOTE: {note}")
 
-    # Build match parts from first/last, expanding hyphens
-    match_parts = []
-    for part in [first_name.lower(), last_name.lower()]:
-        match_parts.extend(part.split("-"))
+    # Step 1: Apply explicit alias if one exists.
+    resolved = resolve_name(name)
+    if resolved != name:
+        print(f"  Alias applied: '{name}' → '{resolved}'")
+        if note:
+            note += f"; Name resolved via alias: '{name}' → '{resolved}'"
+        else:
+            note = f"Name resolved via alias: '{name}' → '{resolved}'"
 
-    print(f"  Searching: First={first_search} (from {first_name}), Last={last_search} (from {last_name})")
+    matched_name = None  # tracks which variation actually matched
 
-    rows = _do_search(page, first_search, last_search)
-    matching_rows = _match_rows(rows, match_parts)
+    # Step 2: Try the resolved name as-is.
+    matching_rows = _try_search(page, resolved)
+    if len(matching_rows) == 1:
+        matched_name = resolved
 
-    # If no match, try with normalized name (strip accents, fix encoding)
-    if len(matching_rows) == 0:
-        norm_name = normalize_name(name)
-        if norm_name != name:
-            print(f"  No match for '{name}', retrying with normalized: '{norm_name}'")
-            norm_parts = norm_name.split()
-            norm_first = norm_parts[0]
-            norm_last = norm_parts[-1]
-            norm_first_search = norm_first[:3]
-            norm_last_search = norm_last[:3]
-
-            norm_match = []
-            for part in [norm_first.lower(), norm_last.lower()]:
-                norm_match.extend(part.split("-"))
-
-            # Re-search if the 3-letter prefix changed
-            if norm_first_search != first_search or norm_last_search != last_search:
-                navigate_to_clients(page)
-                rows = _do_search(page, norm_first_search, norm_last_search)
-            matching_rows = _match_rows(rows, norm_match)
-
-            if matching_rows:
+    # Step 3: If still no match, try the normalized version (encoding fix).
+    if len(matching_rows) != 1:
+        norm = normalize_name(resolved)
+        if norm != resolved:
+            print(f"  No match for '{resolved}', trying normalized: '{norm}'")
+            matching_rows = _try_search(page, norm)
+            if len(matching_rows) == 1:
+                matched_name = norm
                 if note:
-                    note += f"; Name auto-corrected: '{name}' → '{norm_name}'"
+                    note += f"; Name normalized: '{resolved}' → '{norm}'"
                 else:
-                    note = f"Name auto-corrected: '{name}' → '{norm_name}'"
+                    note = f"Name normalized: '{resolved}' → '{norm}'"
+
+    # Step 4: If still no match, try nickname variations.
+    if len(matching_rows) != 1:
+        variations = get_name_variations(resolved)
+        for var_name, var_type in variations:
+            print(f"  No match yet, trying {var_type}: '{var_name}'")
+            var_matches = _try_search(page, var_name)
+            if len(var_matches) == 1:
+                matching_rows = var_matches
+                matched_name = var_name
+                if note:
+                    note += f"; Matched via {var_type}: '{name}' → '{var_name}'"
+                else:
+                    note = f"Matched via {var_type}: '{name}' → '{var_name}'"
+                break
+            elif len(var_matches) > 1:
+                # Multiple matches on a variation — flag rather than guess.
+                raise Exception(f"FLAG: Multiple matches for variation '{var_name}' of '{name}' — needs manual review")
 
     if len(matching_rows) == 0:
         raise Exception(f"Client '{name}' not found in search results")
@@ -406,11 +716,12 @@ def submit_payment(page, name, dry_run=False):
 def post_payment_v2(page, name, date, amount, dry_run=False):
     """V2 flow: Clients > Appointments > Accept Payment.
 
-    Returns (success: bool, note: str or None).
+    Returns (success: bool, note: str or None). Raises on hard failure
+    so the caller can fall back to V1.
     """
     print(f"  [V2] Clients > Appointments > Accept Payment")
 
-    navigate_to_clients(page)
+    # search_client() handles its own navigation to the Clients page
     _ok, name_note = search_client(page, name)
     navigate_to_appointments(page)
     ensure_date_filters(page)
@@ -425,7 +736,11 @@ def post_payment_v2(page, name, date, amount, dry_run=False):
     fill_payment_form(page, amount)
     screenshot(page, f"payment_{name.replace(' ', '_')}_02_filled")
 
-    submit_payment(page, name, dry_run)
+    # submit_payment may return False if Save Payment didn't take.
+    # Treat that as a hard failure so the caller can fall back.
+    if not submit_payment(page, name, dry_run):
+        raise Exception("V2 submit_payment returned failure")
+
     return True, note
 
 
@@ -436,6 +751,7 @@ def post_payment_v2(page, name, date, amount, dry_run=False):
 def navigate_to_billing(page):
     """Navigate to the Billing dashboard."""
     print("  Navigating to Billing...")
+    dismiss_popups(page)  # Beacon widget can intercept the sidebar click
     page.click("text=Billing")
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
@@ -470,27 +786,47 @@ def _search_v1_autocomplete(page, first_name, last_name):
 def select_client_v1(page, name):
     """Select a client via the Search Charges token-input autocomplete.
 
-    Tries the original name first, then a normalized version if no match.
+    Resolution order (stops at first match):
+        1. Explicit alias from name_aliases.json (resolve_name)
+        2. Original name as-is
+        3. Normalized name (strip accents / fix encoding)
+        4. Nickname variations (Bob ↔ Robert, etc.)
     """
     print(f"  Searching for client: {name}")
-    first_name = name.split()[0]
-    last_name = name.split()[-1]
 
-    selected, count = _search_v1_autocomplete(page, first_name, last_name)
+    # Step 1: Apply explicit alias if one exists.
+    resolved = resolve_name(name)
+    if resolved != name:
+        print(f"  Alias applied: '{name}' → '{resolved}'")
 
-    # If no match, try normalized name
+    def _try_select(try_name):
+        """Try one variation. Returns (selected, count). Clears the input first."""
+        client_input = page.locator("#token-input-user_id_patient")
+        client_input.click(click_count=3)
+        page.keyboard.press("Backspace")
+        page.wait_for_timeout(500)
+        first = try_name.split()[0]
+        last = try_name.split()[-1]
+        return _search_v1_autocomplete(page, first, last)
+
+    # Step 2: Try the resolved name as-is.
+    selected, count = _try_select(resolved)
+
+    # Step 3: If no match, try normalized name.
     if not selected:
-        norm_name = normalize_name(name)
-        if norm_name != name:
-            norm_first = norm_name.split()[0]
-            norm_last = norm_name.split()[-1]
-            print(f"  No match for '{name}', retrying with normalized: '{norm_name}'")
-            # Clear the input and try again
-            client_input = page.locator("#token-input-user_id_patient")
-            client_input.click(click_count=3)
-            page.keyboard.press("Backspace")
-            page.wait_for_timeout(500)
-            selected, count = _search_v1_autocomplete(page, norm_first, norm_last)
+        norm = normalize_name(resolved)
+        if norm != resolved:
+            print(f"  No match for '{resolved}', trying normalized: '{norm}'")
+            selected, count = _try_select(norm)
+
+    # Step 4: If still no match, try nickname variations.
+    if not selected:
+        variations = get_name_variations(resolved)
+        for var_name, var_type in variations:
+            print(f"  No match yet, trying {var_type}: '{var_name}'")
+            selected, count = _try_select(var_name)
+            if selected:
+                break
 
     if not selected:
         raise Exception(f"Client '{name}' not found in autocomplete ({count} results)")
@@ -542,7 +878,9 @@ def post_payment(page, name, date, amount, dry_run=False):
     # --- Attempt 1: V2 flow ---
     v2_error = None
     try:
-        _ok, note = post_payment_v2(page, name, date, amount, dry_run)
+        ok, note = post_payment_v2(page, name, date, amount, dry_run)
+        if not ok:
+            raise Exception("V2 returned ok=False")
         return True, "V2", None, note
     except Exception as e:
         v2_error = str(e)
@@ -553,7 +891,9 @@ def post_payment(page, name, date, amount, dry_run=False):
     # --- Attempt 2: Retry V2 with fresh navigation ---
     print(f"  Retrying V2...")
     try:
-        _ok, note = post_payment_v2(page, name, date, amount, dry_run)
+        ok, note = post_payment_v2(page, name, date, amount, dry_run)
+        if not ok:
+            raise Exception("V2-retry returned ok=False")
         return True, "V2-retry", None, note
     except Exception as e:
         v2_retry_error = str(e)
@@ -564,7 +904,9 @@ def post_payment(page, name, date, amount, dry_run=False):
 
     # --- Attempt 3: V1 fallback ---
     try:
-        post_payment_v1(page, name, amount, dry_run)
+        v1_result = post_payment_v1(page, name, amount, dry_run)
+        if not v1_result:
+            raise Exception("V1 submit_payment returned failure")
         return True, "V1", None, None
     except Exception as e:
         v1_error = str(e)
@@ -787,75 +1129,266 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     return report_path, html
 
 
-def generate_tech_report(results, csv_date):
-    """Generate an HTML tech report for Travis — only when there are technical issues.
+def _classify_issue(reason):
+    """Categorize a failure reason string into an actionable group + suggested fix."""
+    r = (reason or "").lower()
 
-    Returns (path, html) or (None, None) if no issues to report.
+    if "timeout" in r and ("click" in r or "intercepts pointer events" in r):
+        return ("Click blocked by overlay",
+                "A popup (often the Beacon chat widget) was covering the page. "
+                "The dismiss_popups() helper should catch this — if it persists, "
+                "add the new selector to dismiss_popups().")
+    if "no appointment found" in r:
+        return ("Appointment not found on date",
+                "Client exists in TA but has no appointment matching the Square "
+                "transaction date. Check for: timezone mismatch, no-show status, "
+                "canceled status, or missing TA appointment record.")
+    if "not found in search results" in r or "not found in autocomplete" in r:
+        return ("Client name mismatch",
+                "Square name doesn't match TA. Add an entry to "
+                "scripts/name_aliases.json mapping the Square name to the TA name.")
+    if "multiple appointments" in r:
+        return ("Multiple appointments same date",
+                "Client has 2+ appointments on the same date. Bot can't pick safely "
+                "without amount-matching logic.")
+    if "multiple matches" in r:
+        return ("Multiple client matches",
+                "More than one TA client matches the search. May need a more "
+                "specific search or an alias entry.")
+    if "list index out of range" in r:
+        return ("Form input not found",
+                "fill_payment_form() couldn't find the expected text input. "
+                "TA may have changed the form layout.")
+    if "submit_payment returned failure" in r:
+        return ("Save Payment click failed",
+                "submit_payment returned False without raising. Could be a stuck "
+                "modal or a UI change blocking the Save Payment button.")
+    return ("Other", "")
+
+
+def generate_tech_report(results, csv_date):
+    """Generate a comprehensive HTML tech report for Travis.
+
+    Categorizes ALL non-perfect outcomes (failures, flagged, V1 fallbacks,
+    encoding issues, name notes, popup blocks) into actionable groups so they
+    can be reviewed and fixed. Sent only to Travis, never to Hannah.
+
+    Returns (path, html) or (None, None) if there is genuinely nothing to report.
     """
+    # Categorize results
     failed = [r for r in results if r["status"] in ("FAILED", "TIMEOUT")]
+    flagged = [r for r in results if r["status"] == "FLAGGED"]
+    v1_fallbacks = [r for r in results if r.get("method") == "V1"]
+    v2_retries = [r for r in results if r.get("method") == "V2-retry"]
+    name_notes = [r for r in results if r.get("note") and "Middle/extra name" in (r.get("note") or "")]
+    auto_corrected = [r for r in results
+                      if r.get("note") and ("auto-corrected" in (r.get("note") or "")
+                                            or "Matched via" in (r.get("note") or "")
+                                            or "normalized" in (r.get("note") or ""))]
+    aliased = [r for r in results
+               if r.get("note") and "Name resolved via alias" in (r.get("note") or "")]
 
     encoding_issues = []
     for r in results:
         if any(ord(c) > 127 for c in r["name"]):
             encoding_issues.append(r)
 
-    if not failed and not encoding_issues:
+    # Group failed/flagged by category for actionable summary
+    issues_by_category = {}
+    for r in failed + flagged:
+        category, suggestion = _classify_issue(r.get("reason", ""))
+        issues_by_category.setdefault(category, {"clients": [], "suggestion": suggestion})
+        issues_by_category[category]["clients"].append(r)
+
+    # If absolutely nothing to report, skip the email
+    has_anything = (failed or flagged or v1_fallbacks or v2_retries or
+                    name_notes or auto_corrected or aliased or encoding_issues)
+    if not has_anything:
         return None, None
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = LOG_DIR / f"{ts}_tech_report.html"
 
+    total_issues = len(failed) + len(flagged)
+
     h = []
     h.append(f'''<!DOCTYPE html><html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;">
-<table width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;margin:0 auto;background:#fff;">
+<body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;color:#333;">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;margin:0 auto;background:#fff;">
+
+  <!-- Header -->
   <tr><td style="background:#333;padding:24px 32px;">
     <div style="font-size:22px;font-weight:700;color:#fff;">PostIQ Tech Report</div>
-    <div style="font-size:13px;color:#aaa;margin-top:4px;">{csv_date}</div>
+    <div style="font-size:13px;color:#aaa;margin-top:4px;">{csv_date} — for Travis only</div>
+  </td></tr>
+
+  <!-- Summary stat row -->
+  <tr><td style="padding:20px 0;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      {_stat_box(total_issues, "Hard Issues", "#c62828" if total_issues else "#999")}
+      {_stat_box(len(v1_fallbacks), "V1 Fallbacks", "#7b1fa2" if v1_fallbacks else "#999")}
+      {_stat_box(len(v2_retries), "V2 Retries", "#e65100" if v2_retries else "#999")}
+      {_stat_box(len(auto_corrected) + len(aliased), "Name Fixes", "#1565c0" if (auto_corrected or aliased) else "#999")}
+    </tr></table>
   </td></tr>''')
 
-    if failed:
-        h.append('''<tr><td style="padding:24px 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#c62828;border-bottom:2px solid #c62828;padding-bottom:6px;">Failures</div>
+    # ─── Section 1: Hard issues by category ───
+    if issues_by_category:
+        h.append('''<tr><td style="padding:0 32px 8px;">
+          <div style="font-size:16px;font-weight:700;color:#c62828;border-bottom:2px solid #c62828;padding-bottom:6px;">
+            Issues to Fix</div>
+        </td></tr>''')
+
+        for category, data in issues_by_category.items():
+            h.append(f'''<tr><td style="padding:16px 32px 8px;font-size:14px;">
+              <strong style="color:#c62828;">{category}</strong> ({len(data["clients"])} client{"s" if len(data["clients"]) != 1 else ""})
+            </td></tr>''')
+
+            if data["suggestion"]:
+                h.append(f'''<tr><td style="padding:0 32px 8px;font-size:12px;color:#666;font-style:italic;">
+                  Suggested fix: {data["suggestion"]}
+                </td></tr>''')
+
+            h.append('''<tr><td style="padding:0 32px 16px;">
+              <table width="100%" cellpadding="8" cellspacing="0" style="font-size:12px;border-collapse:collapse;border:1px solid #ddd;">
+                <tr style="background:#fff5f5;">
+                  <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client</th>
+                  <th style="text-align:right;padding:8px;border-bottom:1px solid #ddd;">Amount</th>
+                  <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Date</th>
+                  <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Raw Error</th>
+                </tr>''')
+            for r in data["clients"]:
+                reason = (r.get("reason") or "")[:200]
+                h.append(f'''<tr>
+                  <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
+                  <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
+                  <td style="padding:8px;border-bottom:1px solid #eee;">{r.get("date", "")}</td>
+                  <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:10px;color:#666;">{reason}</td>
+                </tr>''')
+            h.append('</table></td></tr>')
+
+    # ─── Section 2: V1 fallbacks ───
+    if v1_fallbacks:
+        h.append(f'''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:14px;font-weight:700;color:#7b1fa2;border-bottom:1px solid #7b1fa2;padding-bottom:4px;">
+            V1 Fallbacks ({len(v1_fallbacks)})
+          </div>
+          <div style="font-size:12px;color:#666;margin-top:6px;">
+            These succeeded via the V1 fallback path — they did NOT match an appointment date and need manual verification.
+            Frequent V1 fallbacks suggest the appointment-date matching logic needs attention.
+          </div>
         </td></tr>
-        <tr><td style="padding:0 32px 24px;">
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#c62828;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:left;padding:10px 12px;">Status</th>
-              <th style="text-align:left;padding:10px 12px;">Detail</th>
+        <tr><td style="padding:0 32px 16px;">
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:12px;border-collapse:collapse;border:1px solid #ddd;">
+            <tr style="background:#f5f0ff;">
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client</th>
+              <th style="text-align:right;padding:8px;border-bottom:1px solid #ddd;">Amount</th>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Expected Date</th>
             </tr>''')
-        for i, r in enumerate(failed):
-            bg = "#fff5f5" if i % 2 else "#fff"
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["status"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:12px;">{r.get("reason", "unknown")}</td>
+        for r in v1_fallbacks:
+            h.append(f'''<tr>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{r.get("date", "")}</td>
             </tr>''')
         h.append('</table></td></tr>')
 
+    # ─── Section 3: V2 retries (succeeded after first failure) ───
+    if v2_retries:
+        h.append(f'''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:14px;font-weight:700;color:#e65100;border-bottom:1px solid #e65100;padding-bottom:4px;">
+            V2 Retries ({len(v2_retries)})
+          </div>
+          <div style="font-size:12px;color:#666;margin-top:6px;">
+            These succeeded on the second attempt. First attempt failed for transient reasons (likely a popup or timing).
+          </div>
+        </td></tr>
+        <tr><td style="padding:0 32px 16px;">
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:12px;border-collapse:collapse;border:1px solid #ddd;">
+            <tr style="background:#fff8f0;">
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client</th>
+            </tr>''')
+        for r in v2_retries:
+            h.append(f'''<tr><td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td></tr>''')
+        h.append('</table></td></tr>')
+
+    # ─── Section 4: Auto-corrections (name normalized, nickname matched, etc.) ───
+    if auto_corrected or aliased:
+        h.append(f'''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:14px;font-weight:700;color:#1565c0;border-bottom:1px solid #1565c0;padding-bottom:4px;">
+            Name Auto-Corrections ({len(auto_corrected) + len(aliased)})
+          </div>
+          <div style="font-size:12px;color:#666;margin-top:6px;">
+            The bot had to use an alternate name to find these clients. Consider updating Square or TA so the names match.
+          </div>
+        </td></tr>
+        <tr><td style="padding:0 32px 16px;">
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:12px;border-collapse:collapse;border:1px solid #ddd;">
+            <tr style="background:#f0f4ff;">
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client</th>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Note</th>
+            </tr>''')
+        for r in (auto_corrected + aliased):
+            h.append(f'''<tr>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;font-size:11px;color:#666;">{r.get("note", "")}</td>
+            </tr>''')
+        h.append('</table></td></tr>')
+
+    # ─── Section 5: Encoding issues ───
     if encoding_issues:
-        h.append('''<tr><td style="padding:24px 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#e65100;border-bottom:2px solid #e65100;padding-bottom:6px;">Encoding Issues</div>
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:14px;font-weight:700;color:#e65100;border-bottom:1px solid #e65100;padding-bottom:4px;">
+            Encoding Issues
+          </div>
+          <div style="font-size:12px;color:#666;margin-top:6px;">
+            Likely cause: Square CSV export using wrong encoding. The new Square Daily Report bot
+            should produce clean UTF-8 — if these still appear, check the source CSV pipeline.
+          </div>
         </td></tr>
-        <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;">Likely cause: Square CSV export using wrong encoding (UTF-8 vs Latin-1).
-          Consider adding normalization to read_csv if this recurs.</p>
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#e65100;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:left;padding:10px 12px;">Hex</th>
+        <tr><td style="padding:0 32px 16px;">
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:12px;border-collapse:collapse;border:1px solid #ddd;">
+            <tr style="background:#fff8f0;">
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client (raw)</th>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Hex</th>
             </tr>''')
-        for i, r in enumerate(encoding_issues):
-            bg = "#fff8f0" if i % 2 else "#fff"
+        for r in encoding_issues:
             hex_repr = " ".join(f"{ord(c):02x}" for c in r["name"])
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px;">{hex_repr}</td>
+            h.append(f'''<tr>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:10px;">{hex_repr}</td>
             </tr>''')
         h.append('</table></td></tr>')
 
-    h.append('''<tr><td style="background:#333;padding:12px 32px;font-size:11px;color:#aaa;text-align:center;">
+    # ─── Section 6: Name notes (middle name issues) ───
+    if name_notes:
+        h.append(f'''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:14px;font-weight:700;color:#666;border-bottom:1px solid #ccc;padding-bottom:4px;">
+            Middle Name Notes ({len(name_notes)})
+          </div>
+          <div style="font-size:12px;color:#666;margin-top:6px;">
+            Square has middle/extra names that aren't in TA. Bot matched on first/last only — may want to clean up Square or TA.
+          </div>
+        </td></tr>
+        <tr><td style="padding:0 32px 16px;">
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:12px;border-collapse:collapse;border:1px solid #ddd;">
+            <tr style="background:#f5f5f5;">
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client</th>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Note</th>
+            </tr>''')
+        for r in name_notes:
+            h.append(f'''<tr>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;font-size:11px;color:#666;">{r.get("note", "")}</td>
+            </tr>''')
+        h.append('</table></td></tr>')
+
+    # ─── Footer ───
+    h.append(f'''<tr><td style="padding:24px 32px;font-size:12px;color:#666;border-top:1px solid #ddd;">
+      Full screenshots and run log are in <code>~/Developer/postiq/logs/</code> on the Mac mini.<br>
+      Generated {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}.
+    </td></tr>
+    <tr><td style="background:#333;padding:12px 32px;font-size:11px;color:#aaa;text-align:center;">
       PostIQ Tech Report — Great Oak Counseling
     </td></tr>
 </table></body></html>''')
@@ -992,20 +1525,26 @@ def run():
                     elif method == "FLAGGED":
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FLAGGED", "method": "", "reason": error, "note": note})
+                        # Failed/flagged payments may leave the browser mid-flow.
+                        # Reset to a known clean state before the next client.
+                        recover_to_dashboard(page)
                     else:
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FAILED", "method": "", "reason": error, "note": note})
+                        recover_to_dashboard(page)
 
                 except PlaywrightTimeout:
                     screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
                     print(f"  ERROR: Timed out for {name}")
                     results.append({"name": name, "date": date, "amount": amount,
                                     "status": "TIMEOUT", "method": ""})
+                    recover_to_dashboard(page)
                 except Exception as e:
                     screenshot(page, f"error_{name.replace(' ', '_')}")
                     print(f"  ERROR: {e}")
                     results.append({"name": name, "date": date, "amount": amount,
                                     "status": "FAILED", "method": "", "reason": str(e)})
+                    recover_to_dashboard(page)
 
         except PlaywrightTimeout as e:
             screenshot(page, "error_timeout")
