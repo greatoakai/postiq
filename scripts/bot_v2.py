@@ -432,8 +432,33 @@ def _match_rows(rows, match_parts):
     return matching
 
 
+def _try_inactive_clients(page):
+    """If the search returned 'We didn't find any results', click the
+    'Inactive Clients' button to re-search including inactive clients.
+
+    Returns the new table rows if the button was found and clicked,
+    or None if the button isn't present (meaning the search did return results,
+    or TA didn't offer the inactive fallback).
+    """
+    try:
+        inactive_btn = page.locator("button:has-text('Inactive Clients')")
+        if inactive_btn.is_visible(timeout=1000):
+            print("  No active results — clicking 'Inactive Clients' to expand search...")
+            inactive_btn.click()
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(2000)
+            screenshot(page, "search_inactive")
+            return page.locator("table tr").all()
+    except Exception:
+        pass
+    return None
+
+
 def _try_search(page, search_name):
-    """Run one search attempt with the given name. Returns (matching_rows, match_parts).
+    """Run one search attempt with the given name. Returns matching_rows list.
+
+    If the initial search returns no results and TA offers an 'Inactive Clients'
+    fallback button, clicks it and re-checks for matches.
 
     Helper used by search_client() to try multiple variations without duplicating
     the parsing/matching logic.
@@ -451,7 +476,15 @@ def _try_search(page, search_name):
     print(f"  Searching: First={first_search} (from {first}), Last={last_search} (from {last})")
     navigate_to_clients(page)
     rows = _do_search(page, first_search, last_search)
-    return _match_rows(rows, match_parts)
+    matching = _match_rows(rows, match_parts)
+
+    # If no results among active clients, try including inactive clients
+    if len(matching) == 0:
+        inactive_rows = _try_inactive_clients(page)
+        if inactive_rows is not None:
+            matching = _match_rows(inactive_rows, match_parts)
+
+    return matching
 
 
 def search_client(page, name):
@@ -714,6 +747,8 @@ def click_accept_payment(page, name):
     charges modal appeared), or None if clean.
     """
     print("  Clicking Accept Payment...")
+    suppress_beacon_widget(page)
+    dismiss_popups(page)
     page.click("text=Accept Payment")
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(2000)
