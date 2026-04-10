@@ -597,29 +597,114 @@ def ensure_date_filters(page):
 def click_appointment_by_date(page, date_str, name):
     """Find and click an appointment row matching the given date.
 
-    Converts CSV date (YYYY-MM-DD) to TA display format (MM/DD/YYYY)
-    before searching.
+    Converts CSV date (YYYY-MM-DD or MM/DD/YYYY) to TA display format
+    (MM/DD/YYYY) before searching.
+
+    Resolution order:
+      1. Exact date match on the transaction date
+      2. If no exact match, scan all visible appointment links for dates
+         within 7 days prior. Pick the closest date to the original.
+      3. If multiple appointments on the same closest date, flag for review.
+
+    Returns a note string if a nearby (non-exact) date was used, or None
+    if the exact date matched.
     """
+    import re
+
     # Convert YYYY-MM-DD → MM/DD/YYYY to match TA's display format
     try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-        ta_date = dt.strftime("%m/%d/%Y")
+        target_dt = datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
-        ta_date = date_str  # fallback to original if format is unexpected
+        try:
+            target_dt = datetime.strptime(date_str, "%m/%d/%Y")
+        except ValueError:
+            target_dt = None
+
+    ta_date = target_dt.strftime("%m/%d/%Y") if target_dt else date_str
 
     print(f"  Looking for appointment on {ta_date}...")
 
+    # --- Step 1: Try exact date match ---
     date_links = page.locator(f"a:has-text('{ta_date}')").all()
 
-    if len(date_links) == 0:
-        raise Exception(f"No appointment found on {ta_date} for {name}")
-    elif len(date_links) > 1:
-        raise Exception(f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review")
+    if len(date_links) == 1:
+        print(f"  Found appointment: {date_links[0].text_content().strip()}")
+        date_links[0].click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)
+        return None  # exact match, no note needed
 
-    print(f"  Found appointment: {date_links[0].text_content().strip()}")
-    date_links[0].click()
+    if len(date_links) > 1:
+        raise Exception(
+            f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review"
+        )
+
+    # --- Step 2: No exact match — scan for nearby dates (up to 7 days prior) ---
+    if target_dt is None:
+        raise Exception(f"No appointment found on {ta_date} for {name}")
+
+    print(f"  No exact match on {ta_date} — searching within 7 days prior...")
+
+    # Find all date links on the Appointments page
+    # TA shows dates in format: MM/DD/YYYY (HH:MM AM/PM - HH:MM AM/PM)
+    date_pattern = re.compile(r"(\d{2}/\d{2}/\d{4})")
+    all_links = page.locator("a").all()
+
+    # Parse each link's text for a date and measure distance from target
+    candidates = []
+    for link in all_links:
+        try:
+            text = (link.text_content() or "").strip()
+            match = date_pattern.search(text)
+            if not match:
+                continue
+            link_date_str = match.group(1)
+            link_dt = datetime.strptime(link_date_str, "%m/%d/%Y")
+
+            # Only consider dates within 7 days BEFORE the target (not after)
+            days_diff = (target_dt - link_dt).days
+            if 0 < days_diff <= 7:
+                candidates.append({
+                    "link": link,
+                    "date_str": link_date_str,
+                    "date": link_dt,
+                    "days_diff": days_diff,
+                    "text": text,
+                })
+        except Exception:
+            continue
+
+    if not candidates:
+        raise Exception(f"No appointment found on {ta_date} for {name}")
+
+    # Sort by proximity (closest first)
+    candidates.sort(key=lambda c: c["days_diff"])
+
+    # Check if the closest date has multiple appointments
+    closest_date = candidates[0]["date_str"]
+    same_date = [c for c in candidates if c["date_str"] == closest_date]
+
+    if len(same_date) > 1:
+        raise Exception(
+            f"FLAG: Multiple appointments near {ta_date} on {closest_date} "
+            f"for {name} — needs manual review"
+        )
+
+    # Click the closest appointment
+    chosen = candidates[0]
+    print(
+        f"  Nearest appointment found: {chosen['text'][:60]} "
+        f"({chosen['days_diff']} day(s) before Square date)"
+    )
+    chosen["link"].click()
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
+
+    note = (
+        f"Date mismatch: Square={ta_date}, TA={chosen['date_str']} "
+        f"({chosen['days_diff']}d prior) — please verify correct appointment"
+    )
+    return note
 
 
 def click_accept_payment(page, name):
@@ -725,12 +810,12 @@ def post_payment_v2(page, name, date, amount, dry_run=False):
     _ok, name_note = search_client(page, name)
     navigate_to_appointments(page)
     ensure_date_filters(page)
-    click_appointment_by_date(page, date, name)
+    date_note = click_appointment_by_date(page, date, name)
     balance_note = click_accept_payment(page, name)
     screenshot(page, f"payment_{name.replace(' ', '_')}_01_form")
 
-    # Combine notes (middle name + outstanding balance)
-    notes = [n for n in (name_note, balance_note) if n]
+    # Combine notes (middle name + date mismatch + outstanding balance)
+    notes = [n for n in (name_note, date_note, balance_note) if n]
     note = "; ".join(notes) if notes else None
 
     fill_payment_form(page, amount)
@@ -938,6 +1023,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     timed_out = [r for r in results if r["status"] == "TIMEOUT"]
     manual = failed + flagged + timed_out
     v1_clients = [r for r in succeeded if r.get("method") == "V1"]
+    date_mismatch = [r for r in results if r.get("note") and "Date mismatch" in r["note"]]
     balance_clients = [r for r in results if r.get("note") and "outstanding balance" in r["note"]]
     name_noted = [r for r in results if r.get("note") and "Middle/extra name" in r["note"]]
 
@@ -968,6 +1054,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
       {_stat_box(len(succeeded), "Posted", "#2e7d32")}
       {_stat_box(len(manual), "Need Manual Posting", "#c62828" if manual else "#999")}
       {_stat_box(len(v1_clients), "Verify Allocation", "#7b1fa2" if v1_clients else "#999")}
+      {_stat_box(len(date_mismatch), "Date Mismatch", "#d84315" if date_mismatch else "#999")}
       {_stat_box(len(balance_clients), "Outstanding Balances", "#e65100" if balance_clients else "#999")}
     </tr></table>
   </td></tr>''')
@@ -1065,6 +1152,44 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{appt_date}</td>
+            </tr>''')
+        h.append('</table></td></tr>')
+
+    # --- Date mismatch — posted to a nearby appointment ---
+    if date_mismatch:
+        h.append('''<tr><td style="padding:0 32px 8px;">
+          <div style="font-size:15px;font-weight:700;color:#d84315;border-bottom:2px solid #d84315;padding-bottom:6px;">
+            Date Mismatch — Please Confirm Correct Appointment</div>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;font-size:13px;">
+          <p style="color:#666;margin:8px 0;">These payments were posted, but the Square transaction date
+          did not match any appointment in TherapyAppointment. The bot posted to the <strong>closest
+          appointment within 7 days</strong>. Please verify each one is allocated to the correct session.</p>
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
+            <tr style="background:#d84315;color:#fff;">
+              <th style="text-align:left;padding:10px 12px;">Client</th>
+              <th style="text-align:right;padding:10px 12px;">Amount</th>
+              <th style="text-align:left;padding:10px 12px;">Square Date</th>
+              <th style="text-align:left;padding:10px 12px;">Posted To</th>
+            </tr>''')
+        for i, r in enumerate(date_mismatch):
+            bg = "#fff3e0" if i % 2 else "#fff"
+            note = r.get("note", "")
+            # Extract the TA date from the note: "Date mismatch: Square=MM/DD/YYYY, TA=MM/DD/YYYY ..."
+            ta_posted = ""
+            if "TA=" in note:
+                ta_posted = note.split("TA=")[1].split(" ")[0]
+            square_date = r.get("date", "")
+            try:
+                dt = datetime.strptime(square_date, "%Y-%m-%d")
+                square_date = dt.strftime("%m/%d/%Y")
+            except ValueError:
+                pass
+            h.append(f'''<tr style="background:{bg};">
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{square_date}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{ta_posted}</td>
             </tr>''')
         h.append('</table></td></tr>')
 
