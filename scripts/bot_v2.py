@@ -636,7 +636,7 @@ def click_appointment_by_date(page, date_str, name):
     Resolution order:
       1. Exact date match on the transaction date
       2. If no exact match, scan all visible appointment links for dates
-         within 7 days prior. Pick the closest date to the original.
+         within 30 days prior. Pick the closest date to the original.
       3. If multiple appointments on the same closest date, flag for review.
 
     Returns a note string if a nearby (non-exact) date was used, or None
@@ -672,11 +672,11 @@ def click_appointment_by_date(page, date_str, name):
             f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review"
         )
 
-    # --- Step 2: No exact match — scan for nearby dates (up to 7 days prior) ---
+    # --- Step 2: No exact match — scan for nearby dates (up to 30 days prior) ---
     if target_dt is None:
         raise Exception(f"No appointment found on {ta_date} for {name}")
 
-    print(f"  No exact match on {ta_date} — searching within 7 days prior...")
+    print(f"  No exact match on {ta_date} — searching within 30 days prior...")
 
     # Find all date links on the Appointments page
     # TA shows dates in format: MM/DD/YYYY (HH:MM AM/PM - HH:MM AM/PM)
@@ -696,7 +696,7 @@ def click_appointment_by_date(page, date_str, name):
 
             # Only consider dates within 7 days BEFORE the target (not after)
             days_diff = (target_dt - link_dt).days
-            if 0 < days_diff <= 7:
+            if 0 < days_diff <= 30:
                 candidates.append({
                     "link": link,
                     "date_str": link_date_str,
@@ -1199,7 +1199,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
         <tr><td style="padding:0 32px 24px;font-size:13px;">
           <p style="color:#666;margin:8px 0;">These payments were posted, but the Square transaction date
           did not match any appointment in TherapyAppointment. The bot posted to the <strong>closest
-          appointment within 7 days</strong>. Please verify each one is allocated to the correct session.</p>
+          appointment within 30 days</strong>. Please verify each one is allocated to the correct session.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#d84315;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
