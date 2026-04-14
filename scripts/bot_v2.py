@@ -130,6 +130,39 @@ def resolve_name(name):
     return NAME_ALIASES.get(name, name)
 
 
+# Common name suffixes that should not be treated as the last name
+_NAME_SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "v", "esq", "esq."}
+
+
+def split_first_last(name):
+    """Split a full name into (first_name, last_name), ignoring suffixes.
+
+    Strips common suffixes like Jr, Sr, II, III so they aren't mistaken for
+    the last name.
+
+    Examples:
+        "Jeffrey Paul Keck Jr"    → ("Jeffrey", "Keck")
+        "Christopher Holland Jr"  → ("Christopher", "Holland")
+        "Landon Michael Thorne"   → ("Landon", "Thorne")
+        "Jane Doe"                → ("Jane", "Doe")
+    """
+    parts = name.split()
+    if len(parts) < 2:
+        return (name, "")
+
+    first = parts[0]
+
+    # Walk backwards from the end, skipping suffixes
+    last = parts[-1]
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i].lower().rstrip(".") in _NAME_SUFFIXES:
+            continue
+        last = parts[i]
+        break
+
+    return (first, last)
+
+
 def get_name_variations(name):
     """Generate alternate names to try if the exact name doesn't match.
 
@@ -142,12 +175,10 @@ def get_name_variations(name):
         get_name_variations("Robert Smith")
             → [("Rob Smith", "nickname"), ("Bob Smith", "nickname"), ...]
     """
-    parts = name.split()
-    if len(parts) < 2:
+    first, last = split_first_last(name)
+    if not first or not last:
         return []
 
-    first = parts[0]
-    last = parts[-1]
     first_lower = first.lower()
     variations = []
 
@@ -463,9 +494,7 @@ def _try_search(page, search_name):
     Helper used by search_client() to try multiple variations without duplicating
     the parsing/matching logic.
     """
-    parts = search_name.split()
-    first = parts[0]
-    last = parts[-1]
+    first, last = split_first_last(search_name)
     first_search = first[:3]
     last_search = last[:3]
 
@@ -499,8 +528,10 @@ def search_client(page, name):
     Also returns a note string if the CSV name contains a middle name or
     extra name part, or if the bot had to use an alternate name to find the client.
     """
+    first, last = split_first_last(name)
     parts = name.split()
-    middle_parts = parts[1:-1] if len(parts) > 2 else []
+    # Middle parts: everything between first and last, excluding suffixes
+    middle_parts = [p for p in parts[1:] if p != last and p.lower().rstrip(".") not in _NAME_SUFFIXES]
 
     note = None
     if middle_parts:
@@ -939,8 +970,7 @@ def select_client_v1(page, name):
         client_input.click(click_count=3)
         page.keyboard.press("Backspace")
         page.wait_for_timeout(500)
-        first = try_name.split()[0]
-        last = try_name.split()[-1]
+        first, last = split_first_last(try_name)
         return _search_v1_autocomplete(page, first, last)
 
     # Step 2: Try the resolved name as-is.
