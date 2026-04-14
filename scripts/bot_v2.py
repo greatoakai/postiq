@@ -749,7 +749,21 @@ def click_accept_payment(page, name):
     print("  Clicking Accept Payment...")
     suppress_beacon_widget(page)
     dismiss_popups(page)
-    page.click("text=Accept Payment")
+    # Use JS click as primary — Playwright's normal click fails ~10% of the time
+    # because TA has overlays (Beacon iframe, notification banners, etc.) that
+    # intercept pointer events even after suppression. JS click bypasses all of that.
+    try:
+        page.evaluate("""
+            () => {
+                const links = [...document.querySelectorAll('a, button')];
+                const btn = links.find(el => el.textContent.trim().includes('Accept Payment'));
+                if (btn) { btn.click(); return true; }
+                return false;
+            }
+        """)
+    except Exception:
+        # Fallback to Playwright click if JS fails
+        page.click("text=Accept Payment")
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(2000)
 
