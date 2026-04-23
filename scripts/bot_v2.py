@@ -667,7 +667,7 @@ def click_appointment_by_date(page, date_str, name):
     Resolution order:
       1. Exact date match on the transaction date
       2. If no exact match, scan all visible appointment links for dates
-         within 30 days prior. Pick the closest date to the original.
+         within 60 days prior. Pick the closest date to the original.
       3. If multiple appointments on the same closest date, flag for review.
 
     Returns a note string if a nearby (non-exact) date was used, or None
@@ -699,15 +699,36 @@ def click_appointment_by_date(page, date_str, name):
         return None  # exact match, no note needed
 
     if len(date_links) > 1:
+        # Multiple rows on the same date — filter to only "Active" appointments
+        # (rescheduled slots stay as rows with "Rescheduled to..." status)
+        active_links = []
+        for link in date_links:
+            try:
+                row = link.locator("xpath=ancestor::tr")
+                row_text = (row.text_content() or "").strip()
+                # Check that the row contains "Active" as a status,
+                # but NOT "Rescheduled" or "Cancelled"
+                if "\tActive" in row_text or row_text.endswith("Active"):
+                    active_links.append(link)
+            except Exception:
+                continue
+
+        if len(active_links) == 1:
+            print(f"  Multiple rows on {ta_date}, picking Active appointment")
+            active_links[0].click()
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1000)
+            return None  # resolved via Active status
+
         raise Exception(
             f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review"
         )
 
-    # --- Step 2: No exact match — scan for nearby dates (up to 30 days prior) ---
+    # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---
     if target_dt is None:
         raise Exception(f"No appointment found on {ta_date} for {name}")
 
-    print(f"  No exact match on {ta_date} — searching within 30 days prior...")
+    print(f"  No exact match on {ta_date} — searching within 60 days prior...")
 
     # Find all date links on the Appointments page
     # TA shows dates in format: MM/DD/YYYY (HH:MM AM/PM - HH:MM AM/PM)
@@ -725,9 +746,9 @@ def click_appointment_by_date(page, date_str, name):
             link_date_str = match.group(1)
             link_dt = datetime.strptime(link_date_str, "%m/%d/%Y")
 
-            # Only consider dates within 7 days BEFORE the target (not after)
+            # Only consider dates within 60 days BEFORE the target (not after)
             days_diff = (target_dt - link_dt).days
-            if 0 < days_diff <= 30:
+            if 0 < days_diff <= 60:
                 candidates.append({
                     "link": link,
                     "date_str": link_date_str,
@@ -749,13 +770,27 @@ def click_appointment_by_date(page, date_str, name):
     same_date = [c for c in candidates if c["date_str"] == closest_date]
 
     if len(same_date) > 1:
-        raise Exception(
-            f"FLAG: Multiple appointments near {ta_date} on {closest_date} "
-            f"for {name} — needs manual review"
-        )
+        # Filter to only Active appointments (exclude Rescheduled/Cancelled)
+        active_candidates = []
+        for c in same_date:
+            try:
+                row = c["link"].locator("xpath=ancestor::tr")
+                row_text = (row.text_content() or "").strip()
+                if "\tActive" in row_text or row_text.endswith("Active"):
+                    active_candidates.append(c)
+            except Exception:
+                continue
 
-    # Click the closest appointment
-    chosen = candidates[0]
+        if len(active_candidates) == 1:
+            same_date = active_candidates
+        else:
+            raise Exception(
+                f"FLAG: Multiple appointments near {ta_date} on {closest_date} "
+                f"for {name} — needs manual review"
+            )
+
+    # Click the closest appointment (use same_date which may be active-filtered)
+    chosen = same_date[0]
     print(
         f"  Nearest appointment found: {chosen['text'][:60]} "
         f"({chosen['days_diff']} day(s) before Square date)"
@@ -1243,7 +1278,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
         <tr><td style="padding:0 32px 24px;font-size:13px;">
           <p style="color:#666;margin:8px 0;">These payments were posted, but the Square transaction date
           did not match any appointment in TherapyAppointment. The bot posted to the <strong>closest
-          appointment within 30 days</strong>. Please verify each one is allocated to the correct session.</p>
+          appointment within 60 days</strong>. Please verify each one is allocated to the correct session.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#d84315;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
