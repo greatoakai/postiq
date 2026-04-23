@@ -1,0 +1,3 @@
+{
+  "_comment": "Explicit Square-name → TA-name overrides. Add entries here for clients whose names don't match between Square and TherapyAppointment and aren't covered by the NICKNAMES dictionary in bot_v2.py. Format: 'Square Name': 'TA Name'. Both should be the full name including last name."
+}
