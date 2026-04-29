@@ -1036,6 +1036,65 @@ def select_client_v1(page, name):
     page.wait_for_timeout(3000)
 
 
+def scrape_allocation_date(page):
+    """Scrape the appointment date from the V1 Payment Distribution table.
+
+    After select_client_v1() searches for charges, the Payment Distribution
+    table shows outstanding appointments. The first row that is NOT an
+    'Unapplied Payment' contains the appointment date the payment will be
+    allocated to.
+
+    Returns the date string (MM/DD/YYYY) or None if not found.
+    """
+    import re
+    date_pattern = re.compile(r'(\d{2}/\d{2}/\d{4})')
+    try:
+        rows = page.locator("table tr").all()
+        for row in rows:
+            cells = row.locator("td").all()
+            if len(cells) < 3:
+                continue
+            first_cell = (cells[0].text_content() or "").strip()
+            second_cell = (cells[1].text_content() or "").strip()
+            if "Unapplied" in second_cell:
+                continue
+            match = date_pattern.match(first_cell)
+            if match:
+                return match.group(1)
+    except Exception as e:
+        print(f"  WARNING: Could not scrape allocation date: {e}")
+    return None
+
+
+def scrape_confirmation_date(page):
+    """Scrape Date of Svc from the payment confirmation page.
+
+    After Save Payment, TA shows a confirmation with a Distribution table
+    listing which appointment(s) the payment was allocated to. This is the
+    definitive source — it shows where TA actually put the money.
+
+    Returns the date string (MM/DD/YYYY) or None if not found.
+    """
+    import re
+    date_pattern = re.compile(r'(\d{2}/\d{2}/\d{4})')
+    try:
+        rows = page.locator("table tr").all()
+        for row in rows:
+            text = (row.text_content() or "").strip()
+            if "TOTAL" in text or "Date of Svc" in text:
+                continue
+            cells = row.locator("td").all()
+            if len(cells) < 2:
+                continue
+            first_cell = (cells[0].text_content() or "").strip()
+            match = date_pattern.match(first_cell)
+            if match:
+                return match.group(1)
+    except Exception as e:
+        print(f"  WARNING: Could not scrape confirmation date: {e}")
+    return None
+
+
 def post_payment_v1(page, name, amount, dry_run=False):
     """V1 fallback: Billing > Take Payment > Search Charges."""
     print(f"  [V1 FALLBACK] Billing > Take Payment > Search Charges")
@@ -1052,11 +1111,27 @@ def post_payment_v1(page, name, amount, dry_run=False):
     select_client_v1(page, name)
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_01_form")
 
+    # Scrape the allocation date from the Payment Distribution table
+    # before submitting — this is the appointment TA will allocate to
+    posted_date = scrape_allocation_date(page)
+    if posted_date:
+        print(f"  Allocation target: appointment on {posted_date}")
+
     # Fill payment form
     fill_payment_form(page, amount)
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_02_filled")
 
-    return submit_payment(page, name, dry_run)
+    if not submit_payment(page, name, dry_run):
+        raise Exception("V1 submit_payment returned failure")
+
+    # After save, scrape the confirmation page for the definitive Date of Svc
+    if not dry_run:
+        confirmation_date = scrape_confirmation_date(page)
+        if confirmation_date:
+            posted_date = confirmation_date
+            print(f"  Confirmed: payment posted to {posted_date}")
+
+    return True, posted_date
 
 
 # =============================================================================
@@ -1070,7 +1145,9 @@ def post_payment(page, name, date, amount, dry_run=False):
     2. If V2 fails (not flagged), retry V2 once with fresh navigation
     3. If V2 retry fails, try V1 (Billing > Take Payment > Search Charges)
     4. If all fail, mark as FAILED
-    Returns (success: bool, method: str, error: str or None, note: str or None)
+    Returns (success, method, error, note, posted_date, v2_error)
+    - posted_date: the appointment date TA allocated the V1 payment to (V1 only)
+    - v2_error: why V2 failed, so the report can show it (V1 only)
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
 
@@ -1080,11 +1157,11 @@ def post_payment(page, name, date, amount, dry_run=False):
         ok, note = post_payment_v2(page, name, date, amount, dry_run)
         if not ok:
             raise Exception("V2 returned ok=False")
-        return True, "V2", None, note
+        return True, "V2", None, note, None, None
     except Exception as e:
         v2_error = str(e)
         if "FLAG" in v2_error:
-            return False, "FLAGGED", v2_error, None
+            return False, "FLAGGED", v2_error, None, None, None
         print(f"  V2 failed: {v2_error}")
 
     # --- Attempt 2: Retry V2 with fresh navigation ---
@@ -1093,28 +1170,31 @@ def post_payment(page, name, date, amount, dry_run=False):
         ok, note = post_payment_v2(page, name, date, amount, dry_run)
         if not ok:
             raise Exception("V2-retry returned ok=False")
-        return True, "V2-retry", None, note
+        return True, "V2-retry", None, note, None, None
     except Exception as e:
         v2_retry_error = str(e)
         if "FLAG" in v2_retry_error:
-            return False, "FLAGGED", v2_retry_error, None
+            return False, "FLAGGED", v2_retry_error, None, None, None
         print(f"  V2 retry failed: {v2_retry_error}")
         print(f"  Falling back to V1...")
 
+    # Combine V2 errors for reporting
+    combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
+
     # --- Attempt 3: V1 fallback ---
     try:
-        v1_result = post_payment_v1(page, name, amount, dry_run)
-        if not v1_result:
+        v1_ok, posted_date = post_payment_v1(page, name, amount, dry_run)
+        if not v1_ok:
             raise Exception("V1 submit_payment returned failure")
-        return True, "V1", None, None
+        return True, "V1", None, None, posted_date, combined_v2_error
     except Exception as e:
         v1_error = str(e)
         if "FLAG" in v1_error:
-            return False, "FLAGGED", v1_error, None
+            return False, "FLAGGED", v1_error, None, None, None
         print(f"  V1 also failed: {v1_error}")
 
     # --- All attempts failed ---
-    return False, "FAILED", f"V2: {v2_error}; V2-retry: {v2_retry_error}; V1: {v1_error}", None
+    return False, "FAILED", f"{combined_v2_error}; V1: {v1_error}", None, None, None
 
 
 def _stat_box(value, label, color):
@@ -1156,9 +1236,14 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
 <body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;">
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;margin:0 auto;background:#fff;">
 
+  <!-- Logo -->
+  <tr><td style="padding:24px 32px;text-align:center;">
+    <img src="https://greatoakcounseling.com/wp-content/uploads/2025/02/great-oak-logo-horizontal.png" alt="Great Oak Counseling" width="200" style="display:inline-block;" />
+  </td></tr>
+
   <!-- Header -->
   <tr><td style="background:#346756;padding:24px 32px;">
-    <div style="font-size:22px;font-weight:700;color:#fff;">PostIQ Payment Report</div>
+    <div style="font-size:22px;font-weight:700;color:#fff;">Oakley's PostIQ Payment Report</div>
     <div style="font-size:13px;color:#a8d4c0;margin-top:4px;">{"DRY RUN — " if dry_run else ""}Square Payments — {display_date}</div>
   </td></tr>
 
@@ -1167,7 +1252,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
       {_stat_box(len(succeeded), "Posted", "#2e7d32")}
       {_stat_box(len(manual), "Need Manual Posting", "#c62828" if manual else "#999")}
-      {_stat_box(len(v1_clients), "Verify Allocation", "#7b1fa2" if v1_clients else "#999")}
+      {_stat_box(len(v1_clients), "Alternate Date", "#e67e22" if v1_clients else "#999")}
       {_stat_box(len(date_mismatch), "Date Mismatch", "#d84315" if date_mismatch else "#999")}
       {_stat_box(len(balance_clients), "Outstanding Balances", "#e65100" if balance_clients else "#999")}
     </tr></table>
@@ -1238,34 +1323,37 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
             </tr>''')
         h.append('</table></td></tr>')
 
-    # --- V1 fallback — verify allocation ---
+    # --- V1 fallback — alternate date postings ---
     if v1_clients:
         h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#7b1fa2;border-bottom:2px solid #7b1fa2;padding-bottom:6px;">
-            Verify Allocation — Payments Posted via Fallback</div>
+          <div style="font-size:15px;font-weight:700;color:#e67e22;border-bottom:2px solid #e67e22;padding-bottom:6px;">
+            Alternate Date Postings</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These payments were posted to the correct client but could <strong>not</strong>
-          be matched to a specific appointment date. Please verify in TherapyAppointment that each payment
-          is allocated to the correct clinician and appointment.</p>
+          <p style="color:#666;margin:8px 0;">These payments were posted successfully. The Square transaction date
+          did not match an appointment on the same day — this is normal when a client's payment comes in
+          a few days after their appointment. The actual appointment date each payment was posted to is shown below.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#7b1fa2;color:#fff;">
+            <tr style="background:#e67e22;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
               <th style="text-align:right;padding:10px 12px;">Amount</th>
               <th style="text-align:left;padding:10px 12px;">Expected Appt Date</th>
+              <th style="text-align:left;padding:10px 12px;">Actual Posted Date</th>
             </tr>''')
         for i, r in enumerate(v1_clients):
-            bg = "#f5f0ff" if i % 2 else "#fff"
+            bg = "#fef5eb" if i % 2 else "#fff"
             appt_date = r.get("date", "")
             try:
                 dt = datetime.strptime(appt_date, "%Y-%m-%d")
                 appt_date = dt.strftime("%m/%d/%Y")
             except ValueError:
                 pass
+            posted_date = r.get("posted_date", "") or ""
             h.append(f'''<tr style="background:{bg};">
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{appt_date}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{posted_date}</td>
             </tr>''')
         h.append('</table></td></tr>')
 
@@ -1523,12 +1611,21 @@ def generate_tech_report(results, csv_date):
               <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client</th>
               <th style="text-align:right;padding:8px;border-bottom:1px solid #ddd;">Amount</th>
               <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Expected Date</th>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Posted Date</th>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">V2 Failure</th>
             </tr>''')
         for r in v1_fallbacks:
+            posted_date = r.get("posted_date", "") or ""
+            v2_err = r.get("v2_error", "") or ""
+            # Shorten V2 error for readability
+            if len(v2_err) > 120:
+                v2_err = v2_err[:120] + "…"
             h.append(f'''<tr>
               <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;">{r.get("date", "")}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{posted_date}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:10px;color:#666;">{v2_err}</td>
             </tr>''')
         h.append('</table></td></tr>')
 
@@ -1675,8 +1772,8 @@ def send_reports(results, duplicates, csv_date, dry_run=False):
     staff_path, staff_body = generate_report(results, duplicates, csv_date, dry_run)
 
     has_errors = any(r["status"] in ("FAILED", "FLAGGED", "TIMEOUT") for r in results)
-    subject_tag = "ERRORS DETECTED" if has_errors else "Success"
-    staff_subject = f"PostIQ Payment Report — {mode} — {subject_tag}"
+    subject_tag = " — ERRORS DETECTED" if has_errors else ""
+    staff_subject = f"Oakley's PostIQ Report — {mode}{subject_tag}"
 
     send_email(
         to="hannah@greatoakcounseling.com",
@@ -1756,11 +1853,12 @@ def run():
                 print(f"\n[{i}/{len(payments)}]", end="")
 
                 try:
-                    success, method, error, note = post_payment(page, name, date, amount, dry_run=args.dry_run)
+                    success, method, error, note, posted_date, v2_error = post_payment(page, name, date, amount, dry_run=args.dry_run)
 
                     if success:
                         results.append({"name": name, "date": date, "amount": amount,
-                                        "status": "OK", "method": method, "note": note})
+                                        "status": "OK", "method": method, "note": note,
+                                        "posted_date": posted_date, "v2_error": v2_error})
                     elif method == "FLAGGED":
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FLAGGED", "method": "", "reason": error, "note": note})
