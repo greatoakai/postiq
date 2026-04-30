@@ -1131,7 +1131,7 @@ def post_payment_v1(page, name, amount, dry_run=False):
             posted_date = confirmation_date
             print(f"  Confirmed: payment posted to {posted_date}")
 
-    return True, posted_date
+    return True, "Posted ✓"
 
 
 # =============================================================================
@@ -1330,15 +1330,15 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
             Alternate Date Postings</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These payments were posted successfully. The Square transaction date
-          did not match an appointment on the same day — this is normal when a client's payment comes in
-          a few days after their appointment. The actual appointment date each payment was posted to is shown below.</p>
+          <p style="color:#666;margin:8px 0;">These payments were posted successfully via an alternate method because
+          the Square transaction date did not match an appointment on the same day. Please verify in TherapyAppointment
+          that each payment is allocated to the correct appointment.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#e67e22;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
               <th style="text-align:right;padding:10px 12px;">Amount</th>
               <th style="text-align:left;padding:10px 12px;">Expected Appt Date</th>
-              <th style="text-align:left;padding:10px 12px;">Actual Posted Date</th>
+              <th style="text-align:left;padding:10px 12px;">Status</th>
             </tr>''')
         for i, r in enumerate(v1_clients):
             bg = "#fef5eb" if i % 2 else "#fff"
@@ -1611,7 +1611,7 @@ def generate_tech_report(results, csv_date):
               <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Client</th>
               <th style="text-align:right;padding:8px;border-bottom:1px solid #ddd;">Amount</th>
               <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Expected Date</th>
-              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Posted Date</th>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">Status</th>
               <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">V2 Failure</th>
             </tr>''')
         for r in v1_fallbacks:
