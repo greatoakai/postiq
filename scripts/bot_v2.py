@@ -332,6 +332,38 @@ def dismiss_popups(page):
 
     Safe to call repeatedly — does nothing if no popup is present.
     """
+    # Strategy 0: Close any leftover Bootstrap modal blocking clicks.
+    # Generic safety net for unknown modals. We click the [data-dismiss=modal]
+    # button (the × in the corner) — semantically equivalent to "close without
+    # taking action", which is the correct default for an unrecognized modal.
+    #
+    # IMPORTANT: explicitly skip #show-other-charges-modal. For that modal,
+    # the X is semantically equivalent to "No, show all open charges" — the
+    # wrong branch. click_accept_payment() owns dismissing that one by clicking
+    # "Yes". If we see it here, Fix #1 leaked — log it loudly so we notice.
+    try:
+        result = page.evaluate("""
+            () => {
+                const modals = document.querySelectorAll('div.modal.in[role="dialog"]');
+                for (const m of modals) {
+                    if (m.offsetParent === null) continue;  // not visible
+                    if (m.id === 'show-other-charges-modal') {
+                        return 'skipped:show-other-charges-modal';
+                    }
+                    const x = m.querySelector('[data-dismiss="modal"], button.close');
+                    if (x) { x.click(); return 'dismissed:' + (m.id || 'unnamed'); }
+                }
+                return null;
+            }
+        """)
+        if result and result.startswith("skipped:"):
+            print(f"  WARNING: show-other-charges-modal leaked past click_accept_payment() — Fix #1 may have regressed")
+        elif result and result.startswith("dismissed:"):
+            print(f"  Dismissed Bootstrap modal ({result.split(':', 1)[1]})")
+            page.wait_for_timeout(300)
+    except Exception:
+        pass
+
     # Strategy 1: Use Beacon's JS API to close the widget directly.
     try:
         result = page.evaluate("""
@@ -393,28 +425,79 @@ def dismiss_popups(page):
             pass
 
 
+class UnrecoverableStateError(RuntimeError):
+    """Raised when the browser can't be returned to a known-good dashboard state.
+
+    Halts the batch run rather than letting a corrupted page silently fail every
+    subsequent payment (see 2026-05-11 cascade: 72 payments lost to a stuck modal
+    after recover_to_dashboard() swallowed the failure).
+    """
+
+
 def recover_to_dashboard(page):
-    """Navigate back to the dashboard to reset browser state between payments.
+    """Navigate back to the dashboard and verify we actually got there.
 
     Called after a failed payment so the next client starts from a clean slate
     instead of inheriting whatever modal/page state the previous failure left behind.
-    Also re-suppresses the Beacon widget (it can come back after navigation).
-    Failure to recover is logged but does not raise — the next payment attempt will
-    fall back through its own retry/fallback logic.
+
+    Verification ladder — escalates until dashboard is confirmed reachable:
+      1. goto(/dashboard) + assert sidebar (text=Clients) renders
+      2. If sidebar missing: dismiss popups + re-assert
+      3. If still missing: re-login + re-assert
+      4. If still missing: raise UnrecoverableStateError to halt the batch
+
+    Rationale: silently warning and pressing on caused the 2026-05-11 cascade
+    where 72 consecutive payments failed against the same stuck modal. Better
+    to halt loudly at payment N+1 than to mass-fail 72 in a row.
     """
+    def _sidebar_visible() -> bool:
+        try:
+            page.wait_for_selector("text=Clients", timeout=10000)
+            return True
+        except PlaywrightTimeout:
+            return False
+
+    print("  Recovering to dashboard...")
     try:
-        if "dashboard" not in (page.url or ""):
-            print("  Recovering to dashboard...")
-            page.goto(
-                "https://portal.therapyappointment.com/index.cfm/dashboard",
-                wait_until="domcontentloaded",
-                timeout=15000,
-            )
-            page.wait_for_load_state("networkidle")
-        suppress_beacon_widget(page)
-        dismiss_popups(page)
+        page.goto(
+            "https://portal.therapyappointment.com/index.cfm/dashboard",
+            wait_until="domcontentloaded",
+            timeout=15000,
+        )
+        page.wait_for_load_state("networkidle")
     except Exception as e:
-        print(f"  WARNING: Could not recover to dashboard: {e}")
+        print(f"  WARNING: dashboard goto failed: {e}")
+
+    suppress_beacon_widget(page)
+    dismiss_popups(page)
+
+    if _sidebar_visible():
+        return
+
+    # Sidebar didn't render — popups may still be blocking. Try again after a
+    # second dismiss pass (Strategy 0 in dismiss_popups now handles generic
+    # Bootstrap modals).
+    print("  Sidebar not visible after recovery — retrying popup dismissal...")
+    dismiss_popups(page)
+    if _sidebar_visible():
+        return
+
+    # Still no sidebar — assume logged out or session expired. Try re-login.
+    print("  Sidebar still not visible — attempting re-login...")
+    try:
+        login(page)
+    except Exception as e:
+        raise UnrecoverableStateError(
+            f"Recovery failed: re-login raised {type(e).__name__}: {e}"
+        )
+
+    if _sidebar_visible():
+        return
+
+    raise UnrecoverableStateError(
+        "Recovery failed: dashboard sidebar still not visible after re-login. "
+        "Halting batch to avoid cascading failures."
+    )
 
 
 # =============================================================================
@@ -835,12 +918,18 @@ def click_accept_payment(page, name):
 
     # Handle modal: "Additional charges exist for this client"
     # This means the client has an outstanding balance from older sessions.
+    # Key off the modal's stable id (#show-other-charges-modal) rather than a
+    # button class — TA has shipped the affirmative button with different
+    # classes (.btn-action vs .btn-primary vs .btn) across releases. Scoping
+    # the locator inside the modal also prevents matching the same text if it
+    # ever appears elsewhere on the page.
     balance_note = None
-    yes_btn = page.locator("button.btn-action:has-text('Yes, accept payment for this appointment')")
-    if yes_btn.is_visible(timeout=3000):
+    modal = page.locator("#show-other-charges-modal.modal.in")
+    if modal.is_visible(timeout=3000):
         print(f"  NOTE: {name} has additional charges / outstanding balance")
         balance_note = "Client has outstanding balance — additional charges exist"
         print("  Clicking: Yes, accept payment for this appointment")
+        yes_btn = modal.locator("button:has-text('Yes, accept payment for this appointment')")
         yes_btn.click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
@@ -1870,6 +1959,11 @@ def run():
                                         "status": "FAILED", "method": "", "reason": error, "note": note})
                         recover_to_dashboard(page)
 
+                except UnrecoverableStateError:
+                    # Recovery layer has decided the browser is wedged. Let this
+                    # propagate to the outer handler so the batch halts loudly
+                    # instead of mass-failing every remaining payment.
+                    raise
                 except PlaywrightTimeout:
                     screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
                     print(f"  ERROR: Timed out for {name}")
