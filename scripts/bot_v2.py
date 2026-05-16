@@ -1311,6 +1311,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     name_noted = [r for r in results if r.get("note") and "Middle/extra name" in r["note"]]
 
     total_amount = sum(float(r["amount"]) for r in succeeded)
+    has_actions = bool(manual or v1_clients or date_mismatch or balance_clients or name_noted or duplicates)
 
     # Pretty date for header
     try:
@@ -1347,48 +1348,43 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     </tr></table>
   </td></tr>''')
 
-    # --- Duplicates warning ---
+    # --- "Action required" banner introduces the action sections ---
+    if has_actions:
+        h.append('''<tr><td style="padding:8px 32px 4px;">
+          <div style="background:#fdecea;border-left:6px solid #c62828;padding:14px 18px;font-size:14px;color:#5a1a1a;">
+            <div style="font-size:16px;font-weight:700;color:#c62828;margin-bottom:4px;">Action required</div>
+            The sections below need staff attention. Completed payments summary is at the bottom.
+          </div>
+        </td></tr>''')
+
+    # ============================================================
+    # ACTION-REQUIRED SECTIONS (ordered by urgency)
+    # ============================================================
+
+    # --- 1. Duplicate names (verify each payment landed on the right account) ---
     if duplicates:
-        h.append('''<tr><td style="padding:0 32px 16px;">
-          <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:12px 16px;font-size:14px;">
-            <strong>Duplicate Names — Staff Review Required</strong><br>''')
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#b8860b;border-bottom:3px solid #ffc107;padding-bottom:6px;">
+            Duplicate names &mdash; verify correct client</div>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;font-size:13px;">
+          <p style="color:#666;margin:8px 0;">Two or more Square transactions share the same client name, so the bot
+          can&rsquo;t tell which person in TherapyAppointment each payment belongs to. Please confirm in TA that
+          each payment was posted to the correct client&rsquo;s account.</p>
+          <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:12px 16px;">''')
         for name in sorted(duplicates):
             count = sum(1 for r in results if r["name"] == name)
             h.append(f'{name} ({count} entries)<br>')
         h.append('</div></td></tr>')
 
-    # --- Successful payments table ---
-    if succeeded:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#346756;border-bottom:2px solid #346756;padding-bottom:6px;margin-bottom:0;">
-            Completed Payments</div>
-        </td></tr>
-        <tr><td style="padding:0 32px 24px;">
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#346756;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:right;padding:10px 12px;">Amount</th>
-            </tr>''')
-        for i, r in enumerate(succeeded):
-            bg = "#f9f9f9" if i % 2 else "#fff"
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
-            </tr>''')
-        h.append(f'''<tr style="background:#346756;color:#fff;font-weight:700;">
-              <td style="padding:10px 12px;">Total</td>
-              <td style="padding:10px 12px;text-align:right;">${total_amount:,.2f}</td>
-            </tr>
-          </table>
-        </td></tr>''')
-
-    # --- Manual posting needed ---
+    # --- 2. Manual posting needed (must do — bot did not post) ---
     if manual:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#c62828;border-bottom:2px solid #c62828;padding-bottom:6px;">
-            Action Required — Manual Posting Needed</div>
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#c62828;border-bottom:3px solid #c62828;padding-bottom:6px;">
+            Manual posting needed</div>
         </td></tr>
-        <tr><td style="padding:0 32px 24px;">
+        <tr><td style="padding:0 32px 24px;font-size:13px;">
+          <p style="color:#666;margin:8px 0;">The bot was unable to post these payments. Please post them manually in TherapyAppointment.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#c62828;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
@@ -1398,7 +1394,6 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
         for i, r in enumerate(manual):
             bg = "#fff5f5" if i % 2 else "#fff"
             reason = r.get("reason", r["status"])
-            # Shorten long reasons for readability
             if "Multiple appointments" in reason:
                 short_reason = "Multiple appointments on same date"
             elif "not found in search" in reason:
@@ -1412,22 +1407,49 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
             </tr>''')
         h.append('</table></td></tr>')
 
-    # --- V1 fallback — alternate date postings ---
-    if v1_clients:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#e67e22;border-bottom:2px solid #e67e22;padding-bottom:6px;">
-            Alternate Date Postings</div>
+    # --- 2. Outstanding balances (follow up — bot posted today, older charges remain) ---
+    if balance_clients:
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#e65100;border-bottom:3px solid #e65100;padding-bottom:6px;">
+            Outstanding balances &mdash; follow up needed</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These payments were posted successfully via an alternate method because
+          <p style="color:#666;margin:8px 0;">Today's payment was posted, but additional charges exist for these clients.
+          Look up each client in TherapyAppointment to see the remaining balance and follow up.</p>
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
+            <tr style="background:#e65100;color:#fff;">
+              <th style="text-align:left;padding:10px 12px;">Client</th>
+              <th style="text-align:right;padding:10px 12px;">Amount due</th>
+            </tr>''')
+        for i, r in enumerate(balance_clients):
+            bg = "#fff8f0" if i % 2 else "#fff"
+            # The bot doesn't currently scrape the dollar amount from the
+            # additional-charges modal — placeholder until that's wired up.
+            amount_due = r.get("balance_amount") or "—"
+            if isinstance(amount_due, (int, float)):
+                amount_due = f"${float(amount_due):,.2f}"
+            h.append(f'''<tr style="background:{bg};">
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#999;">{amount_due}</td>
+            </tr>''')
+        h.append('</table></td></tr>')
+
+    # --- 3. Alternate date postings (verify allocation in TA) ---
+    if v1_clients:
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#e67e22;border-bottom:3px solid #e67e22;padding-bottom:6px;">
+            Alternate date postings</div>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;font-size:13px;">
+          <p style="color:#666;margin:8px 0;">These payments were posted via an alternate method because
           the Square transaction date did not match an appointment on the same day. Please verify in TherapyAppointment
           that each payment is allocated to the correct appointment.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#e67e22;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
               <th style="text-align:right;padding:10px 12px;">Amount</th>
-              <th style="text-align:left;padding:10px 12px;">Expected Appt Date</th>
-              <th style="text-align:left;padding:10px 12px;">Status</th>
+              <th style="text-align:left;padding:10px 12px;">Expected appt date</th>
+              <th style="text-align:left;padding:10px 12px;">Actual date posted</th>
             </tr>''')
         for i, r in enumerate(v1_clients):
             bg = "#fef5eb" if i % 2 else "#fff"
@@ -1437,7 +1459,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
                 appt_date = dt.strftime("%m/%d/%Y")
             except ValueError:
                 pass
-            posted_date = r.get("posted_date", "") or ""
+            posted_date = r.get("posted_date", "") or "—"
             h.append(f'''<tr style="background:{bg};">
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
@@ -1446,69 +1468,25 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
             </tr>''')
         h.append('</table></td></tr>')
 
-    # --- Date mismatch — posted to a nearby appointment ---
+    # --- 4. Date mismatch (count + name list only — no per-transaction table) ---
     if date_mismatch:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#d84315;border-bottom:2px solid #d84315;padding-bottom:6px;">
-            Date Mismatch — Please Confirm Correct Appointment</div>
+        names = ", ".join(r["name"] for r in date_mismatch)
+        h.append(f'''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#d84315;border-bottom:3px solid #d84315;padding-bottom:6px;">
+            Date mismatch &mdash; {len(date_mismatch)} payment{'s' if len(date_mismatch) != 1 else ''} to verify</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These payments were posted, but the Square transaction date
-          did not match any appointment in TherapyAppointment. The bot posted to the <strong>closest
-          appointment within 60 days</strong>. Please verify each one is allocated to the correct session.</p>
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#d84315;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:right;padding:10px 12px;">Amount</th>
-              <th style="text-align:left;padding:10px 12px;">Square Date</th>
-              <th style="text-align:left;padding:10px 12px;">Posted To</th>
-            </tr>''')
-        for i, r in enumerate(date_mismatch):
-            bg = "#fff3e0" if i % 2 else "#fff"
-            note = r.get("note", "")
-            # Extract the TA date from the note: "Date mismatch: Square=MM/DD/YYYY, TA=MM/DD/YYYY ..."
-            ta_posted = ""
-            if "TA=" in note:
-                ta_posted = note.split("TA=")[1].split(" ")[0]
-            square_date = r.get("date", "")
-            try:
-                dt = datetime.strptime(square_date, "%Y-%m-%d")
-                square_date = dt.strftime("%m/%d/%Y")
-            except ValueError:
-                pass
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{square_date}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{ta_posted}</td>
-            </tr>''')
-        h.append('</table></td></tr>')
+          <p style="color:#666;margin:8px 0;">These payments were <strong>successfully posted</strong> to each client&rsquo;s account &mdash; this is not a failure.
+          The Square transaction date didn&rsquo;t match an appointment exactly, so the bot allocated each one to the <strong>closest appointment within 60 days</strong>.
+          Please confirm in TherapyAppointment that each payment landed on the right session.</p>
+          <p style="color:#333;margin:8px 0;"><strong>Verify in TA:</strong> {names}</p>
+        </td></tr>''')
 
-    # --- Outstanding balances ---
-    if balance_clients:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#e65100;border-bottom:2px solid #e65100;padding-bottom:6px;">
-            Outstanding Balances — Follow Up Needed</div>
-        </td></tr>
-        <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These clients had additional charges from older sessions.
-          Today's payment was posted to the correct appointment, but the remaining balance needs attention.</p>
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#e65100;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-            </tr>''')
-        for i, r in enumerate(balance_clients):
-            bg = "#fff8f0" if i % 2 else "#fff"
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-            </tr>''')
-        h.append('</table></td></tr>')
-
-    # --- Name notes ---
+    # --- 5. Name notes (lowest urgency — informational verification) ---
     if name_noted:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#1565c0;border-bottom:2px solid #1565c0;padding-bottom:6px;">
-            Name Notes — Please Verify in TherapyAppointment</div>
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#1565c0;border-bottom:3px solid #1565c0;padding-bottom:6px;">
+            Name notes &mdash; please verify in TherapyAppointment</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
           <p style="color:#666;margin:8px 0;">These clients have middle or extra names in Square that may not match
@@ -1516,11 +1494,10 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#1565c0;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:left;padding:10px 12px;">Extra Name in Square</th>
+              <th style="text-align:left;padding:10px 12px;">Extra name in Square</th>
             </tr>''')
         for i, r in enumerate(name_noted):
             bg = "#f0f4ff" if i % 2 else "#fff"
-            # Extract the middle name from the note
             note = r.get("note", "")
             extra = note.split("'")[1] if "'" in note else note
             h.append(f'''<tr style="background:{bg};">
@@ -1528,6 +1505,18 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{extra}</td>
             </tr>''')
         h.append('</table></td></tr>')
+
+    # ============================================================
+    # COMPLETED PAYMENTS — one-line summary at the bottom
+    # ============================================================
+    if succeeded:
+        h.append(f'''<tr><td style="padding:24px 32px 8px;">
+          <div style="font-size:15px;font-weight:700;color:#346756;border-bottom:2px solid #346756;padding-bottom:6px;">
+            Completed payments</div>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;font-size:14px;color:#333;">
+          <strong style="color:#2e7d32;font-size:16px;">{len(succeeded)} payment{'s' if len(succeeded) != 1 else ''} posted successfully &mdash; ${total_amount:,.2f} total.</strong>
+        </td></tr>''')
 
     # --- Footer ---
     h.append(f'''<tr><td style="padding:24px 32px;font-size:13px;color:#666;">
