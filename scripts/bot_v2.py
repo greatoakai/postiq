@@ -513,18 +513,78 @@ def navigate_to_clients(page):
     page.wait_for_timeout(1000)
 
 
+def _resolve_search_inputs(page, timeout_ms=8000):
+    """Locate the First Name and Last Name search inputs on the Clients page.
+
+    The Clients search form can lag a moment behind navigation (TA hydrates the
+    page after networkidle), so a snap-second count of "visible text inputs"
+    sometimes returned 0 and killed the V2 attempt. This helper waits for the
+    form to be ready and uses accessibility-anchored selectors that survive
+    layout changes.
+
+    Resolution order (each step waits up to its share of timeout_ms):
+      1. get_by_label('First Name' / 'Last Name') — accessibility-anchored
+      2. get_by_placeholder('First Name' / 'Last Name')
+      3. input[name='first_name'] / input[name='last_name'] (and 'first'/'last' loose attribute match)
+      4. First two visible text inputs — positional heuristic (logs a warning)
+
+    Returns (first_name_input, last_name_input) ready-to-fill Locators.
+    Raises Exception('STAGE:search ...') if no usable pair resolves within the timeout.
+    """
+    import time
+    per_step_timeout = max(1500, timeout_ms // 3)
+
+    def _try(first_loc, last_loc):
+        try:
+            first_loc.first.wait_for(state="visible", timeout=per_step_timeout)
+            last_loc.first.wait_for(state="visible", timeout=per_step_timeout)
+            return first_loc.first, last_loc.first
+        except Exception:
+            return None
+
+    # Step 1: label association (most resilient)
+    result = _try(page.get_by_label("First Name"), page.get_by_label("Last Name"))
+    if result:
+        return result
+
+    # Step 2: placeholder text
+    result = _try(page.get_by_placeholder("First Name"), page.get_by_placeholder("Last Name"))
+    if result:
+        return result
+
+    # Step 3: name / id attribute selectors
+    first_attr = page.locator("input[name='first_name'], input[id='first_name'], input[name*='first' i]")
+    last_attr = page.locator("input[name='last_name'], input[id='last_name'], input[name*='last' i]")
+    result = _try(first_attr, last_attr)
+    if result:
+        return result
+
+    # Step 4: positional heuristic, polled until the deadline
+    print("  [search] WARNING: label/placeholder/attribute selectors all missed — using positional text-input fallback")
+    deadline = time.monotonic() + (per_step_timeout / 1000.0)
+    while time.monotonic() < deadline:
+        visible = [inp for inp in page.locator("input[type='text']").all() if inp.is_visible()]
+        if len(visible) >= 2:
+            return visible[0], visible[1]
+        page.wait_for_timeout(500)
+
+    visible_count = len([inp for inp in page.locator("input[type='text']").all() if inp.is_visible()])
+    raise Exception(
+        f"STAGE:search Expected First Name + Last Name search inputs, found {visible_count} visible text inputs"
+    )
+
+
 def _do_search(page, first_search, last_search):
-    """Fill the search form and submit. Returns visible table rows."""
-    visible_text_inputs = []
-    for inp in page.locator("input[type='text']").all():
-        if inp.is_visible():
-            visible_text_inputs.append(inp)
+    """Fill the search form and submit. Returns visible table rows.
 
-    if len(visible_text_inputs) < 2:
-        raise Exception(f"Expected at least 2 visible text inputs, found {len(visible_text_inputs)}")
+    Resolves the First Name + Last Name inputs via labels (with placeholder,
+    attribute, and positional fallbacks) before filling, so a slow-hydrating
+    page doesn't immediately kill the V2 attempt.
+    """
+    first_input, last_input = _resolve_search_inputs(page)
 
-    visible_text_inputs[0].fill(first_search)
-    visible_text_inputs[1].fill(last_search)
+    first_input.fill(first_search)
+    last_input.fill(last_search)
 
     page.locator("button:has-text('Search')").first.click()
     page.wait_for_load_state("networkidle")
@@ -586,8 +646,25 @@ def _try_search(page, search_name):
         match_parts.extend(part.split("-"))
 
     print(f"  Searching: First={first_search} (from {first}), Last={last_search} (from {last})")
-    navigate_to_clients(page)
-    rows = _do_search(page, first_search, last_search)
+
+    # Search-stage retry: if _do_search raises STAGE:search (search form not
+    # yet hydrated), retry the navigate+search pair up to 2 more times with a
+    # stabilization wait between attempts. Without this, a flaky one-second
+    # rendering delay used to bubble all the way up and trigger the V1
+    # fallback, which can post payments as Prepayment / Credit.
+    rows = None
+    for attempt in range(3):
+        try:
+            navigate_to_clients(page)
+            rows = _do_search(page, first_search, last_search)
+            break
+        except Exception as e:
+            if "STAGE:search" in str(e) and attempt < 2:
+                print(f"  Search attempt {attempt + 1} hit transient form-not-ready; stabilizing and retrying...")
+                page.wait_for_timeout(2000)
+                continue
+            raise
+
     matching = _match_rows(rows, match_parts)
 
     # If no results among active clients, try including inactive clients
@@ -937,26 +1014,93 @@ def click_accept_payment(page, name):
     return balance_note
 
 
+def _resolve_payment_amount_input(page, timeout_ms=4000):
+    """Locate the Payment Amount input on the Client Payment form.
+
+    The V2 form shows two side-by-side amount fields: "Due From Client Now"
+    (the displayed balance) and "Payment Amount" (the editable input). When
+    both are pre-filled with the same value via Accept Payment, a value-based
+    or positional heuristic can pick the wrong one. Use label/attribute
+    selectors first and fall back only with a warning.
+    """
+    try:
+        loc = page.get_by_label("Payment Amount", exact=True)
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    try:
+        loc = page.locator(
+            "input[name='payment_amount'], input[id='payment_amount'], "
+            "input[name*='payment_amount' i], input[name*='amount' i]:not([readonly]):not([disabled])"
+        )
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    return None
+
+
+def _resolve_reference_input(page, timeout_ms=4000):
+    """Locate the Reference / Check # input on the Client Payment form."""
+    try:
+        loc = page.get_by_placeholder("Reference / Check #")
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    try:
+        loc = page.get_by_placeholder("Reference", exact=False)
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    try:
+        loc = page.get_by_label("Reference", exact=False)
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    return None
+
+
 def fill_payment_form(page, amount):
-    """Fill in the payment form fields."""
+    """Fill in the payment form fields.
+
+    Uses label/placeholder-anchored selectors for the Payment Amount and
+    Reference inputs (resilient to layout shuffles and to both-fields-prefilled
+    states). Falls back to the legacy value/attribute heuristic only if those
+    miss, and logs when the fallback fires.
+    """
     print(f"  Entering amount: ${amount}")
 
-    all_inputs = page.locator("input[type='text'], input:not([type])").all()
-    payment_input = None
-    for inp in all_inputs:
-        try:
-            val = inp.get_attribute("value") or ""
-            name_attr = inp.get_attribute("name") or ""
-            placeholder = inp.get_attribute("placeholder") or ""
-            combined = (placeholder + name_attr).lower()
-            if val == "0.00" or "amount" in combined or "payment" in combined:
-                payment_input = inp
-                break
-        except Exception:
-            continue
-
+    payment_input = _resolve_payment_amount_input(page)
     if payment_input is None:
-        payment_input = all_inputs[1] if len(all_inputs) > 1 else all_inputs[0]
+        print("  [form] WARNING: Payment Amount label/attribute lookup missed — using value-based heuristic")
+        all_inputs = page.locator("input[type='text'], input:not([type])").all()
+        for inp in all_inputs:
+            try:
+                val = inp.get_attribute("value") or ""
+                name_attr = inp.get_attribute("name") or ""
+                placeholder = inp.get_attribute("placeholder") or ""
+                combined = (placeholder + name_attr).lower()
+                if val == "0.00" or "amount" in combined or "payment" in combined:
+                    payment_input = inp
+                    break
+            except Exception:
+                continue
+        if payment_input is None and all_inputs:
+            payment_input = all_inputs[1] if len(all_inputs) > 1 else all_inputs[0]
 
     payment_input.click(click_count=3)
     payment_input.fill(amount)
@@ -965,16 +1109,18 @@ def fill_payment_form(page, amount):
     page.click("text=External Credit Card")
 
     print("  Entering reference: Square")
-    ref_input = None
-    for inp in page.locator("input[type='text'], input:not([type])").all():
-        placeholder = inp.get_attribute("placeholder") or ""
-        name_attr = inp.get_attribute("name") or ""
-        combined = (placeholder + name_attr).lower()
-        if "reference" in combined or "check" in combined:
-            ref_input = inp
-            break
+    ref_input = _resolve_reference_input(page)
     if ref_input is None:
-        ref_input = page.locator("input[placeholder*='Reference'], input[placeholder*='Check']").first
+        print("  [form] WARNING: Reference label/placeholder lookup missed — using attribute heuristic")
+        for inp in page.locator("input[type='text'], input:not([type])").all():
+            placeholder = inp.get_attribute("placeholder") or ""
+            name_attr = inp.get_attribute("name") or ""
+            combined = (placeholder + name_attr).lower()
+            if "reference" in combined or "check" in combined:
+                ref_input = inp
+                break
+        if ref_input is None:
+            ref_input = page.locator("input[placeholder*='Reference'], input[placeholder*='Check']").first
     ref_input.fill("Square")
 
 
@@ -1133,10 +1279,17 @@ def scrape_allocation_date(page):
     'Unapplied Payment' contains the appointment date the payment will be
     allocated to.
 
-    Returns the date string (MM/DD/YYYY) or None if not found.
+    Returns (date_str, has_real_charge):
+      date_str: MM/DD/YYYY of the first non-Unapplied row, or None
+      has_real_charge: True if any row in the distribution is NOT an
+        'Unapplied Payment' — i.e., a real outstanding charge exists.
+        When False, V1 would post the payment as Prepayment / Credit
+        with no DOS attached, and the caller should bail.
     """
     import re
     date_pattern = re.compile(r'(\d{2}/\d{2}/\d{4})')
+    has_real_charge = False
+    found_date = None
     try:
         rows = page.locator("table tr").all()
         for row in rows:
@@ -1147,12 +1300,14 @@ def scrape_allocation_date(page):
             second_cell = (cells[1].text_content() or "").strip()
             if "Unapplied" in second_cell:
                 continue
-            match = date_pattern.match(first_cell)
-            if match:
-                return match.group(1)
+            has_real_charge = True
+            if found_date is None:
+                match = date_pattern.match(first_cell)
+                if match:
+                    found_date = match.group(1)
     except Exception as e:
         print(f"  WARNING: Could not scrape allocation date: {e}")
-    return None
+    return found_date, has_real_charge
 
 
 def scrape_confirmation_date(page):
@@ -1200,9 +1355,19 @@ def post_payment_v1(page, name, amount, dry_run=False):
     select_client_v1(page, name)
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_01_form")
 
-    # Scrape the allocation date from the Payment Distribution table
-    # before submitting — this is the appointment TA will allocate to
-    posted_date = scrape_allocation_date(page)
+    # Scrape the allocation date and check whether real charges exist.
+    # If every row in the Payment Distribution is an "Unapplied Payment"
+    # (no outstanding charge yet — typical when a session note hasn't been
+    # finalized), submitting here would post as Prepayment / Credit with no
+    # DOS attached. Bail with a FLAG so the row surfaces for manual review
+    # instead of silently posting a misallocated payment.
+    posted_date, has_real_charge = scrape_allocation_date(page)
+    if not has_real_charge:
+        raise Exception(
+            f"FLAG: V1 would post as Prepayment for {name} — Payment Distribution "
+            f"shows no outstanding charges (only Unapplied rows). Session note may "
+            f"not yet be finalized. Needs manual review."
+        )
     if posted_date:
         print(f"  Allocation target: appointment on {posted_date}")
 
@@ -1220,6 +1385,10 @@ def post_payment_v1(page, name, amount, dry_run=False):
             posted_date = confirmation_date
             print(f"  Confirmed: payment posted to {posted_date}")
 
+    # Return a status string (not posted_date) — per cb13f95, scrape_allocation_date
+    # is unreliable across clients with multiple historical charges, so its value
+    # must not flow into the report's date column. The has_real_charge gate above
+    # is what prevents Prepayment posts; this string just signals V1 success.
     return True, "Posted ✓"
 
 
@@ -1459,12 +1628,21 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
                 appt_date = dt.strftime("%m/%d/%Y")
             except ValueError:
                 pass
-            posted_date = r.get("posted_date", "") or "—"
-            h.append(f'''<tr style="background:{bg};">
+            raw_posted = r.get("posted_date", "") or ""
+            if raw_posted:
+                posted_cell = raw_posted
+                row_bg = bg
+            else:
+                # V1 succeeded but the Date-of-Service couldn't be confirmed —
+                # this is the Prepayment / Credit risk pattern. Flag the row
+                # loudly so staff verify the allocation in TA.
+                posted_cell = '<span style="color:#c62828;font-weight:700;">&#9888; No DOS detected &mdash; verify allocation (possible Prepayment)</span>'
+                row_bg = "#fdecea"
+            h.append(f'''<tr style="background:{row_bg};">
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{appt_date}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{posted_date}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{posted_cell}</td>
             </tr>''')
         h.append('</table></td></tr>')
 
@@ -1693,7 +1871,11 @@ def generate_tech_report(results, csv_date):
               <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">V2 Failure</th>
             </tr>''')
         for r in v1_fallbacks:
-            posted_date = r.get("posted_date", "") or ""
+            raw_posted = r.get("posted_date", "") or ""
+            if raw_posted:
+                posted_cell = raw_posted
+            else:
+                posted_cell = '<span style="color:#c62828;font-weight:700;">&#9888; No DOS &mdash; verify (possible Prepayment)</span>'
             v2_err = r.get("v2_error", "") or ""
             # Shorten V2 error for readability
             if len(v2_err) > 120:
@@ -1702,7 +1884,7 @@ def generate_tech_report(results, csv_date):
               <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;">{r.get("date", "")}</td>
-              <td style="padding:8px;border-bottom:1px solid #eee;">{posted_date}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{posted_cell}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:10px;color:#666;">{v2_err}</td>
             </tr>''')
         h.append('</table></td></tr>')
