@@ -1,10 +1,11 @@
 import argparse
 import csv
+import json
 import os
 import subprocess
 import sys
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as date_type
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +15,8 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
 DATA_DIR = PROJECT_ROOT / "data"
+PENDING_DIR = DATA_DIR / "pending_reports"
+PENDING_ARCHIVE = PENDING_DIR / "archive"
 LOG_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -1463,11 +1466,75 @@ def _stat_box(value, label, color):
     </td>'''
 
 
-def generate_report(results, duplicates, csv_date, dry_run=False):
-    """Generate the HTML staff report (for Hannah) and save to logs."""
+def _day_subheading_row(payload, colspan):
+    """Render a per-day subheading row to insert inside a multi-day action table.
+
+    Returns HTML for a single `<tr>` that spans all columns of the table,
+    showing 'Saturday, May 16' (etc.). Callers should only emit this when the
+    report covers more than one day; for single-day reports it adds visual noise.
+    """
+    label = _format_day_header(payload.get("run_date"))
+    return (
+        f'<tr><td colspan="{colspan}" style="background:#f4f4f4;padding:6px 12px;'
+        f'font-size:12px;font-weight:700;color:#555;border-top:1px solid #ddd;'
+        f'border-bottom:1px solid #ddd;">{label}</td></tr>'
+    )
+
+
+def _header_date_range(payloads):
+    """Build the 'Square Payments — ...' header line.
+
+    Examples:
+      One day:        'Saturday, May 16, 2026'
+      Multi-day:      'Saturday, May 16 — Monday, May 18, 2026'
+      Cross-month:    'Friday, May 29 — Monday, June 1, 2026'
+    """
+    def _parse(p):
+        return datetime.strptime(p["run_date"], "%Y-%m-%d").date()
+    dates = sorted({_parse(p) for p in payloads})
+    if not dates:
+        return "Unknown date"
+    if len(dates) == 1:
+        d = dates[0]
+        return f"{d.strftime('%A, %B')} {d.day}, {d.year}"
+    first, last = dates[0], dates[-1]
+    if first.year == last.year:
+        return (
+            f"{first.strftime('%A, %B')} {first.day} — "
+            f"{last.strftime('%A, %B')} {last.day}, {last.year}"
+        )
+    return (
+        f"{first.strftime('%A, %B')} {first.day}, {first.year} — "
+        f"{last.strftime('%A, %B')} {last.day}, {last.year}"
+    )
+
+
+def generate_report(payloads, dry_run=False):
+    """Generate the HTML staff report (for Hannah) and save to logs.
+
+    Accepts a list of payload dicts — one per day in the reporting range.
+    For single-day reports (len(payloads) == 1) the rendering matches the
+    historical layout; for multi-day reports each action section emits a
+    short 'Saturday, May 16' subheading row before each day's rows.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "DRYRUN" if dry_run else "POSTED"
     report_path = LOG_DIR / f"{ts}_report_{mode}.html"
+
+    multi_day = len(payloads) > 1
+    # Flatten across all days for stat boxes + overall totals. Each row gets
+    # tagged with its payload's run_date so per-day grouping can find it later.
+    results = []
+    for p in payloads:
+        for r in p["results"]:
+            results.append({**r, "run_date": p["run_date"]})
+
+    def _by_day(section_rows):
+        """Yield (payload, [rows]) in chronological order. Empty days are skipped."""
+        for p in payloads:
+            day_rows = [r for r in section_rows if r.get("run_date") == p["run_date"]]
+            if day_rows:
+                yield p, day_rows
 
     succeeded = [r for r in results if r["status"] == "OK"]
     failed = [r for r in results if r["status"] == "FAILED"]
@@ -1480,14 +1547,10 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     name_noted = [r for r in results if r.get("note") and "Middle/extra name" in r["note"]]
 
     total_amount = sum(float(r["amount"]) for r in succeeded)
-    has_actions = bool(manual or v1_clients or date_mismatch or balance_clients or name_noted or duplicates)
+    any_duplicates = any(p.get("duplicates") for p in payloads)
+    has_actions = bool(manual or v1_clients or date_mismatch or balance_clients or name_noted or any_duplicates)
 
-    # Pretty date for header
-    try:
-        dt = datetime.strptime(csv_date, "%m/%d/%Y")
-        display_date = dt.strftime("%A, %B %d, %Y")
-    except ValueError:
-        display_date = csv_date
+    display_date = _header_date_range(payloads)
 
     # --- Build HTML ---
     h = []
@@ -1531,7 +1594,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     # ============================================================
 
     # --- 1. Duplicate names (verify each payment landed on the right account) ---
-    if duplicates:
+    if any_duplicates:
         h.append('''<tr><td style="padding:16px 32px 8px;">
           <div style="font-size:18px;font-weight:700;color:#b8860b;border-bottom:3px solid #ffc107;padding-bottom:6px;">
             Duplicate names &mdash; verify correct client</div>
@@ -1541,9 +1604,19 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
           can&rsquo;t tell which person in TherapyAppointment each payment belongs to. Please confirm in TA that
           each payment was posted to the correct client&rsquo;s account.</p>
           <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:12px 16px;">''')
-        for name in sorted(duplicates):
-            count = sum(1 for r in results if r["name"] == name)
-            h.append(f'{name} ({count} entries)<br>')
+        # Duplicates are detected per CSV (per day) — render each day's set
+        # under its own subheading when the report covers multiple days.
+        for p in payloads:
+            if not p.get("duplicates"):
+                continue
+            if multi_day:
+                h.append(
+                    f'<div style="font-weight:700;color:#555;margin:10px 0 4px;">'
+                    f'{_format_day_header(p["run_date"])}</div>'
+                )
+            for name in sorted(p["duplicates"]):
+                count = sum(1 for r in p["results"] if r["name"] == name)
+                h.append(f'{name} ({count} entries)<br>')
         h.append('</div></td></tr>')
 
     # --- 2. Manual posting needed (must do — bot did not post) ---
@@ -1560,47 +1633,51 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
               <th style="text-align:right;padding:10px 12px;">Amount</th>
               <th style="text-align:left;padding:10px 12px;">Reason</th>
             </tr>''')
-        for i, r in enumerate(manual):
-            bg = "#fff5f5" if i % 2 else "#fff"
-            reason = r.get("reason", r["status"])
-            if "Multiple appointments" in reason:
-                short_reason = "Multiple appointments on same date"
-            elif "not found in search" in reason:
-                short_reason = "Client not found in system"
-            else:
-                short_reason = reason[:80]
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{short_reason}</td>
-            </tr>''')
+        for p, day_rows in _by_day(manual):
+            if multi_day:
+                h.append(_day_subheading_row(p, colspan=3))
+            for i, r in enumerate(day_rows):
+                bg = "#fff5f5" if i % 2 else "#fff"
+                reason = r.get("reason", r["status"])
+                if "Multiple appointments" in reason:
+                    short_reason = "Multiple appointments on same date"
+                elif "not found in search" in reason:
+                    short_reason = "Client not found in system"
+                else:
+                    short_reason = reason[:80]
+                h.append(f'''<tr style="background:{bg};">
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{short_reason}</td>
+                </tr>''')
         h.append('</table></td></tr>')
 
-    # --- 2. Outstanding balances (follow up — bot posted today, older charges remain) ---
+    # --- 2. Outstanding balances (follow up — bot posted, older charges remain) ---
     if balance_clients:
         h.append('''<tr><td style="padding:16px 32px 8px;">
           <div style="font-size:18px;font-weight:700;color:#e65100;border-bottom:3px solid #e65100;padding-bottom:6px;">
             Outstanding balances &mdash; follow up needed</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">Today's payment was posted, but additional charges exist for these clients.
+          <p style="color:#666;margin:8px 0;">The bot posted the payment, but additional charges exist for these clients.
           Look up each client in TherapyAppointment to see the remaining balance and follow up.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#e65100;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
               <th style="text-align:right;padding:10px 12px;">Amount due</th>
             </tr>''')
-        for i, r in enumerate(balance_clients):
-            bg = "#fff8f0" if i % 2 else "#fff"
-            # The bot doesn't currently scrape the dollar amount from the
-            # additional-charges modal — placeholder until that's wired up.
-            amount_due = r.get("balance_amount") or "—"
-            if isinstance(amount_due, (int, float)):
-                amount_due = f"${float(amount_due):,.2f}"
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#999;">{amount_due}</td>
-            </tr>''')
+        for p, day_rows in _by_day(balance_clients):
+            if multi_day:
+                h.append(_day_subheading_row(p, colspan=2))
+            for i, r in enumerate(day_rows):
+                bg = "#fff8f0" if i % 2 else "#fff"
+                amount_due = r.get("balance_amount") or "—"
+                if isinstance(amount_due, (int, float)):
+                    amount_due = f"${float(amount_due):,.2f}"
+                h.append(f'''<tr style="background:{bg};">
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#999;">{amount_due}</td>
+                </tr>''')
         h.append('</table></td></tr>')
 
     # --- 3. Alternate date postings (verify allocation in TA) ---
@@ -1620,35 +1697,34 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
               <th style="text-align:left;padding:10px 12px;">Expected appt date</th>
               <th style="text-align:left;padding:10px 12px;">Actual date posted</th>
             </tr>''')
-        for i, r in enumerate(v1_clients):
-            bg = "#fef5eb" if i % 2 else "#fff"
-            appt_date = r.get("date", "")
-            try:
-                dt = datetime.strptime(appt_date, "%Y-%m-%d")
-                appt_date = dt.strftime("%m/%d/%Y")
-            except ValueError:
-                pass
-            raw_posted = r.get("posted_date", "") or ""
-            if raw_posted:
-                posted_cell = raw_posted
-                row_bg = bg
-            else:
-                # V1 succeeded but the Date-of-Service couldn't be confirmed —
-                # this is the Prepayment / Credit risk pattern. Flag the row
-                # loudly so staff verify the allocation in TA.
-                posted_cell = '<span style="color:#c62828;font-weight:700;">&#9888; No DOS detected &mdash; verify allocation (possible Prepayment)</span>'
-                row_bg = "#fdecea"
-            h.append(f'''<tr style="background:{row_bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{appt_date}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{posted_cell}</td>
-            </tr>''')
+        for p, day_rows in _by_day(v1_clients):
+            if multi_day:
+                h.append(_day_subheading_row(p, colspan=4))
+            for i, r in enumerate(day_rows):
+                bg = "#fef5eb" if i % 2 else "#fff"
+                appt_date = r.get("date", "")
+                try:
+                    dt = datetime.strptime(appt_date, "%Y-%m-%d")
+                    appt_date = dt.strftime("%m/%d/%Y")
+                except ValueError:
+                    pass
+                raw_posted = r.get("posted_date", "") or ""
+                if raw_posted:
+                    posted_cell = raw_posted
+                    row_bg = bg
+                else:
+                    posted_cell = '<span style="color:#c62828;font-weight:700;">&#9888; No DOS detected &mdash; verify allocation (possible Prepayment)</span>'
+                    row_bg = "#fdecea"
+                h.append(f'''<tr style="background:{row_bg};">
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{appt_date}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{posted_cell}</td>
+                </tr>''')
         h.append('</table></td></tr>')
 
     # --- 4. Date mismatch (count + name list only — no per-transaction table) ---
     if date_mismatch:
-        names = ", ".join(r["name"] for r in date_mismatch)
         h.append(f'''<tr><td style="padding:16px 32px 8px;">
           <div style="font-size:18px;font-weight:700;color:#d84315;border-bottom:3px solid #d84315;padding-bottom:6px;">
             Date mismatch &mdash; {len(date_mismatch)} payment{'s' if len(date_mismatch) != 1 else ''} to verify</div>
@@ -1656,9 +1732,19 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
         <tr><td style="padding:0 32px 24px;font-size:13px;">
           <p style="color:#666;margin:8px 0;">These payments were <strong>successfully posted</strong> to each client&rsquo;s account &mdash; this is not a failure.
           The Square transaction date didn&rsquo;t match an appointment exactly, so the bot allocated each one to the <strong>closest appointment within 60 days</strong>.
-          Please confirm in TherapyAppointment that each payment landed on the right session.</p>
-          <p style="color:#333;margin:8px 0;"><strong>Verify in TA:</strong> {names}</p>
-        </td></tr>''')
+          Please confirm in TherapyAppointment that each payment landed on the right session.</p>''')
+        if multi_day:
+            for p, day_rows in _by_day(date_mismatch):
+                day_label = _format_day_header(p["run_date"])
+                day_names = ", ".join(r["name"] for r in day_rows)
+                h.append(
+                    f'<p style="color:#333;margin:8px 0;">'
+                    f'<strong>{day_label}:</strong> {day_names}</p>'
+                )
+        else:
+            names = ", ".join(r["name"] for r in date_mismatch)
+            h.append(f'<p style="color:#333;margin:8px 0;"><strong>Verify in TA:</strong> {names}</p>')
+        h.append('</td></tr>')
 
     # --- 5. Name notes (lowest urgency — informational verification) ---
     if name_noted:
@@ -1674,27 +1760,55 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
               <th style="text-align:left;padding:10px 12px;">Client</th>
               <th style="text-align:left;padding:10px 12px;">Extra name in Square</th>
             </tr>''')
-        for i, r in enumerate(name_noted):
-            bg = "#f0f4ff" if i % 2 else "#fff"
-            note = r.get("note", "")
-            extra = note.split("'")[1] if "'" in note else note
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{extra}</td>
-            </tr>''')
+        for p, day_rows in _by_day(name_noted):
+            if multi_day:
+                h.append(_day_subheading_row(p, colspan=2))
+            for i, r in enumerate(day_rows):
+                bg = "#f0f4ff" if i % 2 else "#fff"
+                note = r.get("note", "")
+                extra = note.split("'")[1] if "'" in note else note
+                h.append(f'''<tr style="background:{bg};">
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #eee;">{extra}</td>
+                </tr>''')
         h.append('</table></td></tr>')
 
     # ============================================================
     # COMPLETED PAYMENTS — one-line summary at the bottom
+    # (Multi-day reports break down per day above the grand total.)
     # ============================================================
     if succeeded:
-        h.append(f'''<tr><td style="padding:24px 32px 8px;">
+        h.append('''<tr><td style="padding:24px 32px 8px;">
           <div style="font-size:15px;font-weight:700;color:#346756;border-bottom:2px solid #346756;padding-bottom:6px;">
             Completed payments</div>
         </td></tr>
-        <tr><td style="padding:0 32px 24px;font-size:14px;color:#333;">
-          <strong style="color:#2e7d32;font-size:16px;">{len(succeeded)} payment{'s' if len(succeeded) != 1 else ''} posted successfully &mdash; ${total_amount:,.2f} total.</strong>
-        </td></tr>''')
+        <tr><td style="padding:0 32px 24px;font-size:14px;color:#333;">''')
+        if multi_day:
+            for p, day_rows in _by_day(succeeded):
+                day_total = sum(float(r["amount"]) for r in day_rows)
+                day_label = _format_day_header(p["run_date"])
+                h.append(
+                    f'<div style="margin:4px 0;">'
+                    f'<strong>{day_label}:</strong> '
+                    f'{len(day_rows)} payment{"s" if len(day_rows) != 1 else ""} '
+                    f'&mdash; ${day_total:,.2f}'
+                    f'</div>'
+                )
+            h.append(
+                f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #ddd;">'
+                f'<strong style="color:#2e7d32;font-size:16px;">'
+                f'Total: {len(succeeded)} payment{"s" if len(succeeded) != 1 else ""} '
+                f'posted successfully &mdash; ${total_amount:,.2f}'
+                f'</strong>'
+                f'</div>'
+            )
+        else:
+            h.append(
+                f'<strong style="color:#2e7d32;font-size:16px;">'
+                f'{len(succeeded)} payment{"s" if len(succeeded) != 1 else ""} posted successfully '
+                f'&mdash; ${total_amount:,.2f} total.</strong>'
+            )
+        h.append('</td></tr>')
 
     # --- Footer ---
     h.append(f'''<tr><td style="padding:24px 32px;font-size:13px;color:#666;">
@@ -1749,15 +1863,22 @@ def _classify_issue(reason):
     return ("Other", "")
 
 
-def generate_tech_report(results, csv_date):
+def generate_tech_report(payloads):
     """Generate a comprehensive HTML tech report for Travis.
 
+    Accepts a list of payload dicts (one per day in the reporting range).
     Categorizes ALL non-perfect outcomes (failures, flagged, V1 fallbacks,
     encoding issues, name notes, popup blocks) into actionable groups so they
     can be reviewed and fixed. Sent only to Travis, never to Hannah.
 
     Returns (path, html) or (None, None) if there is genuinely nothing to report.
     """
+    # Flatten across days, tagging each row with its run_date for context.
+    results = []
+    for p in payloads:
+        for r in p["results"]:
+            results.append({**r, "run_date": p["run_date"]})
+    csv_date = _header_date_range(payloads)
     # Categorize results
     failed = [r for r in results if r["status"] in ("FAILED", "TIMEOUT")]
     flagged = [r for r in results if r["status"] == "FLAGGED"]
@@ -1995,8 +2116,106 @@ def generate_tech_report(results, csv_date):
     return report_path, html
 
 
+# =============================================================================
+# WEEKEND REPORT AGGREGATION
+# =============================================================================
+#
+# The bot runs every day, but no one's at a desk on Saturday or Sunday to act
+# on the action items (V1 fallbacks, FLAGs, balance alerts). Sending a report
+# nobody reads splits Hannah's attention. Instead we:
+#   - Run the bot every day (Sat/Sun included) so payments post promptly.
+#   - On Sat/Sun, persist the run's results as JSON and skip the email.
+#   - On Mon-Fri, merge any pending weekend runs with today's results into a
+#     single combined report that covers the full date range.
+#
+# Failure handling: pending JSONs only get archived after a successful email
+# send. If msmtp fails on Monday, the JSONs stay in place and Tuesday's run
+# picks them up. No data is lost.
+
+def _save_pending_results(results, duplicates, csv_date_display, run_date):
+    """Persist this run's results so a later weekday run can include them."""
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_date": run_date.isoformat(),
+        "csv_date": csv_date_display,
+        "results": results,
+        "duplicates": sorted(duplicates) if duplicates else [],
+    }
+    path = PENDING_DIR / f"results_{run_date.strftime('%Y%m%d')}.json"
+    path.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"  Results saved to pending: {path.name}")
+    return path
+
+
+def _load_pending_payloads():
+    """Load all pending result JSONs in chronological run-date order."""
+    if not PENDING_DIR.exists():
+        return []
+    files = sorted(PENDING_DIR.glob("results_*.json"))
+    payloads = []
+    for f in files:
+        try:
+            payloads.append(json.loads(f.read_text()))
+        except Exception as e:
+            print(f"  WARNING: Could not load pending {f.name}: {e}")
+    return payloads
+
+
+def _archive_pending_payloads():
+    """Move all pending JSONs to the archive folder. Called after a successful send."""
+    if not PENDING_DIR.exists():
+        return
+    PENDING_ARCHIVE.mkdir(parents=True, exist_ok=True)
+    for f in PENDING_DIR.glob("results_*.json"):
+        try:
+            f.rename(PENDING_ARCHIVE / f.name)
+        except Exception as e:
+            print(f"  WARNING: Could not archive {f.name}: {e}")
+
+
+def _format_combined_subject(payloads, has_errors):
+    """Build a date-range subject line.
+
+    Examples:
+      One day:        'Oakley's PostIQ Report — Mon, May 18'
+      Sat-Sun-Mon:    'Oakley's PostIQ Report covering Sat–Mon, May 16–18'
+      Cross-month:    'Oakley's PostIQ Report covering Fri–Mon, May 29–Jun 1'
+    """
+    def _parse(p):
+        return datetime.strptime(p["run_date"], "%Y-%m-%d").date()
+
+    dates = sorted({_parse(p) for p in payloads})
+    subject_tag = " — ERRORS DETECTED" if has_errors else ""
+
+    if len(dates) == 1:
+        d = dates[0]
+        body = f"{d.strftime('%a')}, {d.strftime('%b')} {d.day}"
+        return f"Oakley's PostIQ Report — {body}{subject_tag}"
+
+    first, last = dates[0], dates[-1]
+    if first.month == last.month:
+        date_part = f"{first.strftime('%b')} {first.day}–{last.day}"
+    else:
+        date_part = f"{first.strftime('%b %-d')}–{last.strftime('%b %-d')}"
+    dow_part = f"{first.strftime('%a')}–{last.strftime('%a')}"
+    return f"Oakley's PostIQ Report covering {dow_part}, {date_part}{subject_tag}"
+
+
+def _format_day_header(run_date_str):
+    """Render a per-day section header like 'Saturday, May 16'."""
+    try:
+        d = datetime.strptime(run_date_str, "%Y-%m-%d").date()
+        return f"{d.strftime('%A')}, {d.strftime('%b')} {d.day}"
+    except (ValueError, TypeError):
+        return run_date_str or "Unknown date"
+
+
 def send_email(to, cc, subject, body, html=True):
-    """Send an email via msmtp. Sends as HTML by default."""
+    """Send an email via msmtp. Sends as HTML by default.
+
+    Returns True on success, False on failure or skip — callers depend on
+    this to know whether it's safe to archive pending state.
+    """
     cc_header = f"Cc: {cc}\n" if cc else ""
     content_type = "text/html" if html else "text/plain"
     message = (
@@ -2016,26 +2235,68 @@ def send_email(to, cc, subject, body, html=True):
         )
         if proc.returncode == 0:
             print(f"  Email sent: {subject}")
+            return True
         else:
             print(f"  Email FAILED: {proc.stderr.strip()}")
+            return False
     except FileNotFoundError:
         print("  Email SKIPPED: msmtp not installed")
+        return False
     except Exception as e:
         print(f"  Email ERROR: {e}")
+        return False
 
 
 def send_reports(results, duplicates, csv_date, dry_run=False):
-    """Generate and email all reports."""
-    mode = "DRY RUN" if dry_run else csv_date
+    """Save this run's results, then on weekdays generate and email a combined
+    report covering today + any pending weekend runs.
 
-    # Staff report → Hannah (cc Travis, support staff)
-    staff_path, staff_body = generate_report(results, duplicates, csv_date, dry_run)
+    Sat/Sun: results are persisted as JSON and no email goes out. Mon-Fri:
+    all pending JSONs are loaded, results are flattened across days, the
+    combined report is emailed, and the pending JSONs are archived only if
+    the email succeeded.
+    """
+    run_date = datetime.now().date()
 
-    has_errors = any(r["status"] in ("FAILED", "FLAGGED", "TIMEOUT") for r in results)
-    subject_tag = " — ERRORS DETECTED" if has_errors else ""
-    staff_subject = f"Oakley's PostIQ Report — {mode}{subject_tag}"
+    # Always persist this run's results so a later weekday run can include them.
+    # Dry runs persist too — they should still aggregate into the next combined
+    # report if the user is testing the multi-day flow.
+    _save_pending_results(results, duplicates, csv_date, run_date)
 
-    send_email(
+    # Sat (5) / Sun (6) — defer email; Monday will pick this up.
+    if run_date.weekday() >= 5:
+        print(f"  Weekend run ({run_date.strftime('%A')}) — results saved, email deferred to next weekday.")
+        return
+
+    # Weekday: load every pending payload (includes the one we just saved).
+    payloads = _load_pending_payloads()
+    if not payloads:
+        # Defensive: _save_pending_results just wrote one, so this shouldn't
+        # happen. If it does, fall back to a synthetic single-day payload so
+        # Hannah still gets a report.
+        print("  WARNING: No pending payloads found — building report from current run only.")
+        payloads = [{
+            "run_date": run_date.isoformat(),
+            "csv_date": csv_date,
+            "results": results,
+            "duplicates": sorted(duplicates) if duplicates else [],
+        }]
+
+    # Flatten across days for the error check and the dry-run flag.
+    all_results = [r for p in payloads for r in p["results"]]
+    has_errors = any(r["status"] in ("FAILED", "FLAGGED", "TIMEOUT") for r in all_results)
+
+    if dry_run:
+        # Override subject to make dry-run obvious; date range still follows below.
+        staff_subject = "Oakley's PostIQ Report — DRY RUN"
+        if has_errors:
+            staff_subject += " — ERRORS DETECTED"
+    else:
+        staff_subject = _format_combined_subject(payloads, has_errors)
+
+    # Staff report → Hannah
+    staff_path, staff_body = generate_report(payloads, dry_run=dry_run)
+    staff_sent = send_email(
         to="hannah@greatoakcounseling.com",
         cc="travis@greatoakcounseling.com, supportstaff@greatoakcounseling.com",
         subject=staff_subject,
@@ -2043,14 +2304,23 @@ def send_reports(results, duplicates, csv_date, dry_run=False):
     )
 
     # Tech report → Travis only (when there are technical issues)
-    tech_path, tech_body = generate_tech_report(results, csv_date)
+    tech_path, tech_body = generate_tech_report(payloads)
+    tech_sent = True  # default True so a None body doesn't block archive
     if tech_body:
-        send_email(
+        tech_subject = staff_subject.replace("Oakley's PostIQ Report", "PostIQ Tech Report")
+        tech_sent = send_email(
             to="travis@greatoakcounseling.com",
             cc=None,
-            subject=f"PostIQ Tech Report — {csv_date}",
+            subject=tech_subject,
             body=tech_body,
         )
+
+    # Only archive pending JSONs if the staff email actually got out. If it
+    # failed, the JSONs stay in place and the next weekday run will retry.
+    if staff_sent:
+        _archive_pending_payloads()
+    else:
+        print("  Staff email did not send — pending results NOT archived; next run will retry.")
 
 
 def run():
