@@ -332,6 +332,38 @@ def dismiss_popups(page):
 
     Safe to call repeatedly — does nothing if no popup is present.
     """
+    # Strategy 0: Close any leftover Bootstrap modal blocking clicks.
+    # Generic safety net for unknown modals. We click the [data-dismiss=modal]
+    # button (the × in the corner) — semantically equivalent to "close without
+    # taking action", which is the correct default for an unrecognized modal.
+    #
+    # IMPORTANT: explicitly skip #show-other-charges-modal. For that modal,
+    # the X is semantically equivalent to "No, show all open charges" — the
+    # wrong branch. click_accept_payment() owns dismissing that one by clicking
+    # "Yes". If we see it here, Fix #1 leaked — log it loudly so we notice.
+    try:
+        result = page.evaluate("""
+            () => {
+                const modals = document.querySelectorAll('div.modal.in[role="dialog"]');
+                for (const m of modals) {
+                    if (m.offsetParent === null) continue;  // not visible
+                    if (m.id === 'show-other-charges-modal') {
+                        return 'skipped:show-other-charges-modal';
+                    }
+                    const x = m.querySelector('[data-dismiss="modal"], button.close');
+                    if (x) { x.click(); return 'dismissed:' + (m.id || 'unnamed'); }
+                }
+                return null;
+            }
+        """)
+        if result and result.startswith("skipped:"):
+            print(f"  WARNING: show-other-charges-modal leaked past click_accept_payment() — Fix #1 may have regressed")
+        elif result and result.startswith("dismissed:"):
+            print(f"  Dismissed Bootstrap modal ({result.split(':', 1)[1]})")
+            page.wait_for_timeout(300)
+    except Exception:
+        pass
+
     # Strategy 1: Use Beacon's JS API to close the widget directly.
     try:
         result = page.evaluate("""
@@ -393,28 +425,79 @@ def dismiss_popups(page):
             pass
 
 
+class UnrecoverableStateError(RuntimeError):
+    """Raised when the browser can't be returned to a known-good dashboard state.
+
+    Halts the batch run rather than letting a corrupted page silently fail every
+    subsequent payment (see 2026-05-11 cascade: 72 payments lost to a stuck modal
+    after recover_to_dashboard() swallowed the failure).
+    """
+
+
 def recover_to_dashboard(page):
-    """Navigate back to the dashboard to reset browser state between payments.
+    """Navigate back to the dashboard and verify we actually got there.
 
     Called after a failed payment so the next client starts from a clean slate
     instead of inheriting whatever modal/page state the previous failure left behind.
-    Also re-suppresses the Beacon widget (it can come back after navigation).
-    Failure to recover is logged but does not raise — the next payment attempt will
-    fall back through its own retry/fallback logic.
+
+    Verification ladder — escalates until dashboard is confirmed reachable:
+      1. goto(/dashboard) + assert sidebar (text=Clients) renders
+      2. If sidebar missing: dismiss popups + re-assert
+      3. If still missing: re-login + re-assert
+      4. If still missing: raise UnrecoverableStateError to halt the batch
+
+    Rationale: silently warning and pressing on caused the 2026-05-11 cascade
+    where 72 consecutive payments failed against the same stuck modal. Better
+    to halt loudly at payment N+1 than to mass-fail 72 in a row.
     """
+    def _sidebar_visible() -> bool:
+        try:
+            page.wait_for_selector("text=Clients", timeout=10000)
+            return True
+        except PlaywrightTimeout:
+            return False
+
+    print("  Recovering to dashboard...")
     try:
-        if "dashboard" not in (page.url or ""):
-            print("  Recovering to dashboard...")
-            page.goto(
-                "https://portal.therapyappointment.com/index.cfm/dashboard",
-                wait_until="domcontentloaded",
-                timeout=15000,
-            )
-            page.wait_for_load_state("networkidle")
-        suppress_beacon_widget(page)
-        dismiss_popups(page)
+        page.goto(
+            "https://portal.therapyappointment.com/index.cfm/dashboard",
+            wait_until="domcontentloaded",
+            timeout=15000,
+        )
+        page.wait_for_load_state("networkidle")
     except Exception as e:
-        print(f"  WARNING: Could not recover to dashboard: {e}")
+        print(f"  WARNING: dashboard goto failed: {e}")
+
+    suppress_beacon_widget(page)
+    dismiss_popups(page)
+
+    if _sidebar_visible():
+        return
+
+    # Sidebar didn't render — popups may still be blocking. Try again after a
+    # second dismiss pass (Strategy 0 in dismiss_popups now handles generic
+    # Bootstrap modals).
+    print("  Sidebar not visible after recovery — retrying popup dismissal...")
+    dismiss_popups(page)
+    if _sidebar_visible():
+        return
+
+    # Still no sidebar — assume logged out or session expired. Try re-login.
+    print("  Sidebar still not visible — attempting re-login...")
+    try:
+        login(page)
+    except Exception as e:
+        raise UnrecoverableStateError(
+            f"Recovery failed: re-login raised {type(e).__name__}: {e}"
+        )
+
+    if _sidebar_visible():
+        return
+
+    raise UnrecoverableStateError(
+        "Recovery failed: dashboard sidebar still not visible after re-login. "
+        "Halting batch to avoid cascading failures."
+    )
 
 
 # =============================================================================
@@ -430,18 +513,78 @@ def navigate_to_clients(page):
     page.wait_for_timeout(1000)
 
 
+def _resolve_search_inputs(page, timeout_ms=8000):
+    """Locate the First Name and Last Name search inputs on the Clients page.
+
+    The Clients search form can lag a moment behind navigation (TA hydrates the
+    page after networkidle), so a snap-second count of "visible text inputs"
+    sometimes returned 0 and killed the V2 attempt. This helper waits for the
+    form to be ready and uses accessibility-anchored selectors that survive
+    layout changes.
+
+    Resolution order (each step waits up to its share of timeout_ms):
+      1. get_by_label('First Name' / 'Last Name') — accessibility-anchored
+      2. get_by_placeholder('First Name' / 'Last Name')
+      3. input[name='first_name'] / input[name='last_name'] (and 'first'/'last' loose attribute match)
+      4. First two visible text inputs — positional heuristic (logs a warning)
+
+    Returns (first_name_input, last_name_input) ready-to-fill Locators.
+    Raises Exception('STAGE:search ...') if no usable pair resolves within the timeout.
+    """
+    import time
+    per_step_timeout = max(1500, timeout_ms // 3)
+
+    def _try(first_loc, last_loc):
+        try:
+            first_loc.first.wait_for(state="visible", timeout=per_step_timeout)
+            last_loc.first.wait_for(state="visible", timeout=per_step_timeout)
+            return first_loc.first, last_loc.first
+        except Exception:
+            return None
+
+    # Step 1: label association (most resilient)
+    result = _try(page.get_by_label("First Name"), page.get_by_label("Last Name"))
+    if result:
+        return result
+
+    # Step 2: placeholder text
+    result = _try(page.get_by_placeholder("First Name"), page.get_by_placeholder("Last Name"))
+    if result:
+        return result
+
+    # Step 3: name / id attribute selectors
+    first_attr = page.locator("input[name='first_name'], input[id='first_name'], input[name*='first' i]")
+    last_attr = page.locator("input[name='last_name'], input[id='last_name'], input[name*='last' i]")
+    result = _try(first_attr, last_attr)
+    if result:
+        return result
+
+    # Step 4: positional heuristic, polled until the deadline
+    print("  [search] WARNING: label/placeholder/attribute selectors all missed — using positional text-input fallback")
+    deadline = time.monotonic() + (per_step_timeout / 1000.0)
+    while time.monotonic() < deadline:
+        visible = [inp for inp in page.locator("input[type='text']").all() if inp.is_visible()]
+        if len(visible) >= 2:
+            return visible[0], visible[1]
+        page.wait_for_timeout(500)
+
+    visible_count = len([inp for inp in page.locator("input[type='text']").all() if inp.is_visible()])
+    raise Exception(
+        f"STAGE:search Expected First Name + Last Name search inputs, found {visible_count} visible text inputs"
+    )
+
+
 def _do_search(page, first_search, last_search):
-    """Fill the search form and submit. Returns visible table rows."""
-    visible_text_inputs = []
-    for inp in page.locator("input[type='text']").all():
-        if inp.is_visible():
-            visible_text_inputs.append(inp)
+    """Fill the search form and submit. Returns visible table rows.
 
-    if len(visible_text_inputs) < 2:
-        raise Exception(f"Expected at least 2 visible text inputs, found {len(visible_text_inputs)}")
+    Resolves the First Name + Last Name inputs via labels (with placeholder,
+    attribute, and positional fallbacks) before filling, so a slow-hydrating
+    page doesn't immediately kill the V2 attempt.
+    """
+    first_input, last_input = _resolve_search_inputs(page)
 
-    visible_text_inputs[0].fill(first_search)
-    visible_text_inputs[1].fill(last_search)
+    first_input.fill(first_search)
+    last_input.fill(last_search)
 
     page.locator("button:has-text('Search')").first.click()
     page.wait_for_load_state("networkidle")
@@ -503,8 +646,25 @@ def _try_search(page, search_name):
         match_parts.extend(part.split("-"))
 
     print(f"  Searching: First={first_search} (from {first}), Last={last_search} (from {last})")
-    navigate_to_clients(page)
-    rows = _do_search(page, first_search, last_search)
+
+    # Search-stage retry: if _do_search raises STAGE:search (search form not
+    # yet hydrated), retry the navigate+search pair up to 2 more times with a
+    # stabilization wait between attempts. Without this, a flaky one-second
+    # rendering delay used to bubble all the way up and trigger the V1
+    # fallback, which can post payments as Prepayment / Credit.
+    rows = None
+    for attempt in range(3):
+        try:
+            navigate_to_clients(page)
+            rows = _do_search(page, first_search, last_search)
+            break
+        except Exception as e:
+            if "STAGE:search" in str(e) and attempt < 2:
+                print(f"  Search attempt {attempt + 1} hit transient form-not-ready; stabilizing and retrying...")
+                page.wait_for_timeout(2000)
+                continue
+            raise
+
     matching = _match_rows(rows, match_parts)
 
     # If no results among active clients, try including inactive clients
@@ -835,12 +995,18 @@ def click_accept_payment(page, name):
 
     # Handle modal: "Additional charges exist for this client"
     # This means the client has an outstanding balance from older sessions.
+    # Key off the modal's stable id (#show-other-charges-modal) rather than a
+    # button class — TA has shipped the affirmative button with different
+    # classes (.btn-action vs .btn-primary vs .btn) across releases. Scoping
+    # the locator inside the modal also prevents matching the same text if it
+    # ever appears elsewhere on the page.
     balance_note = None
-    yes_btn = page.locator("button.btn-action:has-text('Yes, accept payment for this appointment')")
-    if yes_btn.is_visible(timeout=3000):
+    modal = page.locator("#show-other-charges-modal.modal.in")
+    if modal.is_visible(timeout=3000):
         print(f"  NOTE: {name} has additional charges / outstanding balance")
         balance_note = "Client has outstanding balance — additional charges exist"
         print("  Clicking: Yes, accept payment for this appointment")
+        yes_btn = modal.locator("button:has-text('Yes, accept payment for this appointment')")
         yes_btn.click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
@@ -848,26 +1014,93 @@ def click_accept_payment(page, name):
     return balance_note
 
 
+def _resolve_payment_amount_input(page, timeout_ms=4000):
+    """Locate the Payment Amount input on the Client Payment form.
+
+    The V2 form shows two side-by-side amount fields: "Due From Client Now"
+    (the displayed balance) and "Payment Amount" (the editable input). When
+    both are pre-filled with the same value via Accept Payment, a value-based
+    or positional heuristic can pick the wrong one. Use label/attribute
+    selectors first and fall back only with a warning.
+    """
+    try:
+        loc = page.get_by_label("Payment Amount", exact=True)
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    try:
+        loc = page.locator(
+            "input[name='payment_amount'], input[id='payment_amount'], "
+            "input[name*='payment_amount' i], input[name*='amount' i]:not([readonly]):not([disabled])"
+        )
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    return None
+
+
+def _resolve_reference_input(page, timeout_ms=4000):
+    """Locate the Reference / Check # input on the Client Payment form."""
+    try:
+        loc = page.get_by_placeholder("Reference / Check #")
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    try:
+        loc = page.get_by_placeholder("Reference", exact=False)
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    try:
+        loc = page.get_by_label("Reference", exact=False)
+        if loc.count() > 0:
+            loc.first.wait_for(state="visible", timeout=timeout_ms)
+            return loc.first
+    except Exception:
+        pass
+
+    return None
+
+
 def fill_payment_form(page, amount):
-    """Fill in the payment form fields."""
+    """Fill in the payment form fields.
+
+    Uses label/placeholder-anchored selectors for the Payment Amount and
+    Reference inputs (resilient to layout shuffles and to both-fields-prefilled
+    states). Falls back to the legacy value/attribute heuristic only if those
+    miss, and logs when the fallback fires.
+    """
     print(f"  Entering amount: ${amount}")
 
-    all_inputs = page.locator("input[type='text'], input:not([type])").all()
-    payment_input = None
-    for inp in all_inputs:
-        try:
-            val = inp.get_attribute("value") or ""
-            name_attr = inp.get_attribute("name") or ""
-            placeholder = inp.get_attribute("placeholder") or ""
-            combined = (placeholder + name_attr).lower()
-            if val == "0.00" or "amount" in combined or "payment" in combined:
-                payment_input = inp
-                break
-        except Exception:
-            continue
-
+    payment_input = _resolve_payment_amount_input(page)
     if payment_input is None:
-        payment_input = all_inputs[1] if len(all_inputs) > 1 else all_inputs[0]
+        print("  [form] WARNING: Payment Amount label/attribute lookup missed — using value-based heuristic")
+        all_inputs = page.locator("input[type='text'], input:not([type])").all()
+        for inp in all_inputs:
+            try:
+                val = inp.get_attribute("value") or ""
+                name_attr = inp.get_attribute("name") or ""
+                placeholder = inp.get_attribute("placeholder") or ""
+                combined = (placeholder + name_attr).lower()
+                if val == "0.00" or "amount" in combined or "payment" in combined:
+                    payment_input = inp
+                    break
+            except Exception:
+                continue
+        if payment_input is None and all_inputs:
+            payment_input = all_inputs[1] if len(all_inputs) > 1 else all_inputs[0]
 
     payment_input.click(click_count=3)
     payment_input.fill(amount)
@@ -876,16 +1109,18 @@ def fill_payment_form(page, amount):
     page.click("text=External Credit Card")
 
     print("  Entering reference: Square")
-    ref_input = None
-    for inp in page.locator("input[type='text'], input:not([type])").all():
-        placeholder = inp.get_attribute("placeholder") or ""
-        name_attr = inp.get_attribute("name") or ""
-        combined = (placeholder + name_attr).lower()
-        if "reference" in combined or "check" in combined:
-            ref_input = inp
-            break
+    ref_input = _resolve_reference_input(page)
     if ref_input is None:
-        ref_input = page.locator("input[placeholder*='Reference'], input[placeholder*='Check']").first
+        print("  [form] WARNING: Reference label/placeholder lookup missed — using attribute heuristic")
+        for inp in page.locator("input[type='text'], input:not([type])").all():
+            placeholder = inp.get_attribute("placeholder") or ""
+            name_attr = inp.get_attribute("name") or ""
+            combined = (placeholder + name_attr).lower()
+            if "reference" in combined or "check" in combined:
+                ref_input = inp
+                break
+        if ref_input is None:
+            ref_input = page.locator("input[placeholder*='Reference'], input[placeholder*='Check']").first
     ref_input.fill("Square")
 
 
@@ -1044,10 +1279,17 @@ def scrape_allocation_date(page):
     'Unapplied Payment' contains the appointment date the payment will be
     allocated to.
 
-    Returns the date string (MM/DD/YYYY) or None if not found.
+    Returns (date_str, has_real_charge):
+      date_str: MM/DD/YYYY of the first non-Unapplied row, or None
+      has_real_charge: True if any row in the distribution is NOT an
+        'Unapplied Payment' — i.e., a real outstanding charge exists.
+        When False, V1 would post the payment as Prepayment / Credit
+        with no DOS attached, and the caller should bail.
     """
     import re
     date_pattern = re.compile(r'(\d{2}/\d{2}/\d{4})')
+    has_real_charge = False
+    found_date = None
     try:
         rows = page.locator("table tr").all()
         for row in rows:
@@ -1058,12 +1300,14 @@ def scrape_allocation_date(page):
             second_cell = (cells[1].text_content() or "").strip()
             if "Unapplied" in second_cell:
                 continue
-            match = date_pattern.match(first_cell)
-            if match:
-                return match.group(1)
+            has_real_charge = True
+            if found_date is None:
+                match = date_pattern.match(first_cell)
+                if match:
+                    found_date = match.group(1)
     except Exception as e:
         print(f"  WARNING: Could not scrape allocation date: {e}")
-    return None
+    return found_date, has_real_charge
 
 
 def scrape_confirmation_date(page):
@@ -1111,9 +1355,19 @@ def post_payment_v1(page, name, amount, dry_run=False):
     select_client_v1(page, name)
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_01_form")
 
-    # Scrape the allocation date from the Payment Distribution table
-    # before submitting — this is the appointment TA will allocate to
-    posted_date = scrape_allocation_date(page)
+    # Scrape the allocation date and check whether real charges exist.
+    # If every row in the Payment Distribution is an "Unapplied Payment"
+    # (no outstanding charge yet — typical when a session note hasn't been
+    # finalized), submitting here would post as Prepayment / Credit with no
+    # DOS attached. Bail with a FLAG so the row surfaces for manual review
+    # instead of silently posting a misallocated payment.
+    posted_date, has_real_charge = scrape_allocation_date(page)
+    if not has_real_charge:
+        raise Exception(
+            f"FLAG: V1 would post as Prepayment for {name} — Payment Distribution "
+            f"shows no outstanding charges (only Unapplied rows). Session note may "
+            f"not yet be finalized. Needs manual review."
+        )
     if posted_date:
         print(f"  Allocation target: appointment on {posted_date}")
 
@@ -1131,6 +1385,10 @@ def post_payment_v1(page, name, amount, dry_run=False):
             posted_date = confirmation_date
             print(f"  Confirmed: payment posted to {posted_date}")
 
+    # Return a status string (not posted_date) — per cb13f95, scrape_allocation_date
+    # is unreliable across clients with multiple historical charges, so its value
+    # must not flow into the report's date column. The has_real_charge gate above
+    # is what prevents Prepayment posts; this string just signals V1 success.
     return True, "Posted ✓"
 
 
@@ -1222,6 +1480,7 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     name_noted = [r for r in results if r.get("note") and "Middle/extra name" in r["note"]]
 
     total_amount = sum(float(r["amount"]) for r in succeeded)
+    has_actions = bool(manual or v1_clients or date_mismatch or balance_clients or name_noted or duplicates)
 
     # Pretty date for header
     try:
@@ -1258,48 +1517,43 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
     </tr></table>
   </td></tr>''')
 
-    # --- Duplicates warning ---
+    # --- "Action required" banner introduces the action sections ---
+    if has_actions:
+        h.append('''<tr><td style="padding:8px 32px 4px;">
+          <div style="background:#fdecea;border-left:6px solid #c62828;padding:14px 18px;font-size:14px;color:#5a1a1a;">
+            <div style="font-size:16px;font-weight:700;color:#c62828;margin-bottom:4px;">Action required</div>
+            The sections below need staff attention. Completed payments summary is at the bottom.
+          </div>
+        </td></tr>''')
+
+    # ============================================================
+    # ACTION-REQUIRED SECTIONS (ordered by urgency)
+    # ============================================================
+
+    # --- 1. Duplicate names (verify each payment landed on the right account) ---
     if duplicates:
-        h.append('''<tr><td style="padding:0 32px 16px;">
-          <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:12px 16px;font-size:14px;">
-            <strong>Duplicate Names — Staff Review Required</strong><br>''')
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#b8860b;border-bottom:3px solid #ffc107;padding-bottom:6px;">
+            Duplicate names &mdash; verify correct client</div>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;font-size:13px;">
+          <p style="color:#666;margin:8px 0;">Two or more Square transactions share the same client name, so the bot
+          can&rsquo;t tell which person in TherapyAppointment each payment belongs to. Please confirm in TA that
+          each payment was posted to the correct client&rsquo;s account.</p>
+          <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:12px 16px;">''')
         for name in sorted(duplicates):
             count = sum(1 for r in results if r["name"] == name)
             h.append(f'{name} ({count} entries)<br>')
         h.append('</div></td></tr>')
 
-    # --- Successful payments table ---
-    if succeeded:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#346756;border-bottom:2px solid #346756;padding-bottom:6px;margin-bottom:0;">
-            Completed Payments</div>
-        </td></tr>
-        <tr><td style="padding:0 32px 24px;">
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#346756;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:right;padding:10px 12px;">Amount</th>
-            </tr>''')
-        for i, r in enumerate(succeeded):
-            bg = "#f9f9f9" if i % 2 else "#fff"
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
-            </tr>''')
-        h.append(f'''<tr style="background:#346756;color:#fff;font-weight:700;">
-              <td style="padding:10px 12px;">Total</td>
-              <td style="padding:10px 12px;text-align:right;">${total_amount:,.2f}</td>
-            </tr>
-          </table>
-        </td></tr>''')
-
-    # --- Manual posting needed ---
+    # --- 2. Manual posting needed (must do — bot did not post) ---
     if manual:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#c62828;border-bottom:2px solid #c62828;padding-bottom:6px;">
-            Action Required — Manual Posting Needed</div>
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#c62828;border-bottom:3px solid #c62828;padding-bottom:6px;">
+            Manual posting needed</div>
         </td></tr>
-        <tr><td style="padding:0 32px 24px;">
+        <tr><td style="padding:0 32px 24px;font-size:13px;">
+          <p style="color:#666;margin:8px 0;">The bot was unable to post these payments. Please post them manually in TherapyAppointment.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#c62828;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
@@ -1309,7 +1563,6 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
         for i, r in enumerate(manual):
             bg = "#fff5f5" if i % 2 else "#fff"
             reason = r.get("reason", r["status"])
-            # Shorten long reasons for readability
             if "Multiple appointments" in reason:
                 short_reason = "Multiple appointments on same date"
             elif "not found in search" in reason:
@@ -1323,22 +1576,49 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
             </tr>''')
         h.append('</table></td></tr>')
 
-    # --- V1 fallback — alternate date postings ---
-    if v1_clients:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#e67e22;border-bottom:2px solid #e67e22;padding-bottom:6px;">
-            Alternate Date Postings</div>
+    # --- 2. Outstanding balances (follow up — bot posted today, older charges remain) ---
+    if balance_clients:
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#e65100;border-bottom:3px solid #e65100;padding-bottom:6px;">
+            Outstanding balances &mdash; follow up needed</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These payments were posted successfully via an alternate method because
+          <p style="color:#666;margin:8px 0;">Today's payment was posted, but additional charges exist for these clients.
+          Look up each client in TherapyAppointment to see the remaining balance and follow up.</p>
+          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
+            <tr style="background:#e65100;color:#fff;">
+              <th style="text-align:left;padding:10px 12px;">Client</th>
+              <th style="text-align:right;padding:10px 12px;">Amount due</th>
+            </tr>''')
+        for i, r in enumerate(balance_clients):
+            bg = "#fff8f0" if i % 2 else "#fff"
+            # The bot doesn't currently scrape the dollar amount from the
+            # additional-charges modal — placeholder until that's wired up.
+            amount_due = r.get("balance_amount") or "—"
+            if isinstance(amount_due, (int, float)):
+                amount_due = f"${float(amount_due):,.2f}"
+            h.append(f'''<tr style="background:{bg};">
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#999;">{amount_due}</td>
+            </tr>''')
+        h.append('</table></td></tr>')
+
+    # --- 3. Alternate date postings (verify allocation in TA) ---
+    if v1_clients:
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#e67e22;border-bottom:3px solid #e67e22;padding-bottom:6px;">
+            Alternate date postings</div>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;font-size:13px;">
+          <p style="color:#666;margin:8px 0;">These payments were posted via an alternate method because
           the Square transaction date did not match an appointment on the same day. Please verify in TherapyAppointment
           that each payment is allocated to the correct appointment.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#e67e22;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
               <th style="text-align:right;padding:10px 12px;">Amount</th>
-              <th style="text-align:left;padding:10px 12px;">Expected Appt Date</th>
-              <th style="text-align:left;padding:10px 12px;">Status</th>
+              <th style="text-align:left;padding:10px 12px;">Expected appt date</th>
+              <th style="text-align:left;padding:10px 12px;">Actual date posted</th>
             </tr>''')
         for i, r in enumerate(v1_clients):
             bg = "#fef5eb" if i % 2 else "#fff"
@@ -1348,78 +1628,43 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
                 appt_date = dt.strftime("%m/%d/%Y")
             except ValueError:
                 pass
-            posted_date = r.get("posted_date", "") or ""
-            h.append(f'''<tr style="background:{bg};">
+            raw_posted = r.get("posted_date", "") or ""
+            if raw_posted:
+                posted_cell = raw_posted
+                row_bg = bg
+            else:
+                # V1 succeeded but the Date-of-Service couldn't be confirmed —
+                # this is the Prepayment / Credit risk pattern. Flag the row
+                # loudly so staff verify the allocation in TA.
+                posted_cell = '<span style="color:#c62828;font-weight:700;">&#9888; No DOS detected &mdash; verify allocation (possible Prepayment)</span>'
+                row_bg = "#fdecea"
+            h.append(f'''<tr style="background:{row_bg};">
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{appt_date}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{posted_date}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{posted_cell}</td>
             </tr>''')
         h.append('</table></td></tr>')
 
-    # --- Date mismatch — posted to a nearby appointment ---
+    # --- 4. Date mismatch (count + name list only — no per-transaction table) ---
     if date_mismatch:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#d84315;border-bottom:2px solid #d84315;padding-bottom:6px;">
-            Date Mismatch — Please Confirm Correct Appointment</div>
+        names = ", ".join(r["name"] for r in date_mismatch)
+        h.append(f'''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#d84315;border-bottom:3px solid #d84315;padding-bottom:6px;">
+            Date mismatch &mdash; {len(date_mismatch)} payment{'s' if len(date_mismatch) != 1 else ''} to verify</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These payments were posted, but the Square transaction date
-          did not match any appointment in TherapyAppointment. The bot posted to the <strong>closest
-          appointment within 60 days</strong>. Please verify each one is allocated to the correct session.</p>
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#d84315;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:right;padding:10px 12px;">Amount</th>
-              <th style="text-align:left;padding:10px 12px;">Square Date</th>
-              <th style="text-align:left;padding:10px 12px;">Posted To</th>
-            </tr>''')
-        for i, r in enumerate(date_mismatch):
-            bg = "#fff3e0" if i % 2 else "#fff"
-            note = r.get("note", "")
-            # Extract the TA date from the note: "Date mismatch: Square=MM/DD/YYYY, TA=MM/DD/YYYY ..."
-            ta_posted = ""
-            if "TA=" in note:
-                ta_posted = note.split("TA=")[1].split(" ")[0]
-            square_date = r.get("date", "")
-            try:
-                dt = datetime.strptime(square_date, "%Y-%m-%d")
-                square_date = dt.strftime("%m/%d/%Y")
-            except ValueError:
-                pass
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{square_date}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{ta_posted}</td>
-            </tr>''')
-        h.append('</table></td></tr>')
+          <p style="color:#666;margin:8px 0;">These payments were <strong>successfully posted</strong> to each client&rsquo;s account &mdash; this is not a failure.
+          The Square transaction date didn&rsquo;t match an appointment exactly, so the bot allocated each one to the <strong>closest appointment within 60 days</strong>.
+          Please confirm in TherapyAppointment that each payment landed on the right session.</p>
+          <p style="color:#333;margin:8px 0;"><strong>Verify in TA:</strong> {names}</p>
+        </td></tr>''')
 
-    # --- Outstanding balances ---
-    if balance_clients:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#e65100;border-bottom:2px solid #e65100;padding-bottom:6px;">
-            Outstanding Balances — Follow Up Needed</div>
-        </td></tr>
-        <tr><td style="padding:0 32px 24px;font-size:13px;">
-          <p style="color:#666;margin:8px 0;">These clients had additional charges from older sessions.
-          Today's payment was posted to the correct appointment, but the remaining balance needs attention.</p>
-          <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
-            <tr style="background:#e65100;color:#fff;">
-              <th style="text-align:left;padding:10px 12px;">Client</th>
-            </tr>''')
-        for i, r in enumerate(balance_clients):
-            bg = "#fff8f0" if i % 2 else "#fff"
-            h.append(f'''<tr style="background:{bg};">
-              <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
-            </tr>''')
-        h.append('</table></td></tr>')
-
-    # --- Name notes ---
+    # --- 5. Name notes (lowest urgency — informational verification) ---
     if name_noted:
-        h.append('''<tr><td style="padding:0 32px 8px;">
-          <div style="font-size:15px;font-weight:700;color:#1565c0;border-bottom:2px solid #1565c0;padding-bottom:6px;">
-            Name Notes — Please Verify in TherapyAppointment</div>
+        h.append('''<tr><td style="padding:16px 32px 8px;">
+          <div style="font-size:18px;font-weight:700;color:#1565c0;border-bottom:3px solid #1565c0;padding-bottom:6px;">
+            Name notes &mdash; please verify in TherapyAppointment</div>
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
           <p style="color:#666;margin:8px 0;">These clients have middle or extra names in Square that may not match
@@ -1427,11 +1672,10 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#1565c0;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
-              <th style="text-align:left;padding:10px 12px;">Extra Name in Square</th>
+              <th style="text-align:left;padding:10px 12px;">Extra name in Square</th>
             </tr>''')
         for i, r in enumerate(name_noted):
             bg = "#f0f4ff" if i % 2 else "#fff"
-            # Extract the middle name from the note
             note = r.get("note", "")
             extra = note.split("'")[1] if "'" in note else note
             h.append(f'''<tr style="background:{bg};">
@@ -1439,6 +1683,18 @@ def generate_report(results, duplicates, csv_date, dry_run=False):
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{extra}</td>
             </tr>''')
         h.append('</table></td></tr>')
+
+    # ============================================================
+    # COMPLETED PAYMENTS — one-line summary at the bottom
+    # ============================================================
+    if succeeded:
+        h.append(f'''<tr><td style="padding:24px 32px 8px;">
+          <div style="font-size:15px;font-weight:700;color:#346756;border-bottom:2px solid #346756;padding-bottom:6px;">
+            Completed payments</div>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;font-size:14px;color:#333;">
+          <strong style="color:#2e7d32;font-size:16px;">{len(succeeded)} payment{'s' if len(succeeded) != 1 else ''} posted successfully &mdash; ${total_amount:,.2f} total.</strong>
+        </td></tr>''')
 
     # --- Footer ---
     h.append(f'''<tr><td style="padding:24px 32px;font-size:13px;color:#666;">
@@ -1615,7 +1871,11 @@ def generate_tech_report(results, csv_date):
               <th style="text-align:left;padding:8px;border-bottom:1px solid #ddd;">V2 Failure</th>
             </tr>''')
         for r in v1_fallbacks:
-            posted_date = r.get("posted_date", "") or ""
+            raw_posted = r.get("posted_date", "") or ""
+            if raw_posted:
+                posted_cell = raw_posted
+            else:
+                posted_cell = '<span style="color:#c62828;font-weight:700;">&#9888; No DOS &mdash; verify (possible Prepayment)</span>'
             v2_err = r.get("v2_error", "") or ""
             # Shorten V2 error for readability
             if len(v2_err) > 120:
@@ -1624,7 +1884,7 @@ def generate_tech_report(results, csv_date):
               <td style="padding:8px;border-bottom:1px solid #eee;">{r["name"]}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;">${float(r["amount"]):,.2f}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;">{r.get("date", "")}</td>
-              <td style="padding:8px;border-bottom:1px solid #eee;">{posted_date}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{posted_cell}</td>
               <td style="padding:8px;border-bottom:1px solid #eee;font-family:monospace;font-size:10px;color:#666;">{v2_err}</td>
             </tr>''')
         h.append('</table></td></tr>')
@@ -1870,6 +2130,11 @@ def run():
                                         "status": "FAILED", "method": "", "reason": error, "note": note})
                         recover_to_dashboard(page)
 
+                except UnrecoverableStateError:
+                    # Recovery layer has decided the browser is wedged. Let this
+                    # propagate to the outer handler so the batch halts loudly
+                    # instead of mass-failing every remaining payment.
+                    raise
                 except PlaywrightTimeout:
                     screenshot(page, f"error_timeout_{name.replace(' ', '_')}")
                     print(f"  ERROR: Timed out for {name}")
