@@ -26,6 +26,19 @@ USERNAME = os.getenv("TA_USERNAME")
 PASSWORD = os.getenv("TA_PASSWORD")
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
+# Which button to click on TA's "Additional charges exist for this client" modal
+# (#show-other-charges-modal), shown when a client carries open charges beyond the
+# current appointment:
+#   "this_appointment" (default) → "Yes, accept payment for this appointment"
+#                                   Pins the payment to the current appointment.
+#   "all_open_charges"           → "No, show all open charges"
+#                                   Reveals the full ledger so TA's automatic
+#                                   distribution applies the payment to the
+#                                   client's oldest open balance first.
+# Kept as an env flag so the behaviour can be A/B tested via a dry run before
+# committing. Defaults to the historical behaviour.
+CHARGES_MODAL_CHOICE = os.getenv("CHARGES_MODAL_CHOICE", "this_appointment").strip().lower()
+
 ACTION_TIMEOUT = 30000
 
 
@@ -969,11 +982,41 @@ def click_appointment_by_date(page, date_str, name):
     return note
 
 
+def _scrape_due_now(page):
+    """Scrape the 'Due From Client Now' figure from the Client Payment form.
+
+    TA holds this figure in an input named 'patientResponsibility' and renders
+    the visible '$' separately as text — so a textContent scrape grabs the
+    co-pay note ("has a 30.00 co-pay…") instead of the real balance. Read the
+    input value directly.
+
+    Returns a string like '20.00' (no $ / commas), or None if it can't be found.
+    Best-effort: on any miss it returns None so the report falls back to '—'
+    rather than showing a wrong number.
+    """
+    import re
+    try:
+        loc = page.locator("input[name='patientResponsibility']")
+        if loc.count() == 0:
+            return None
+        raw = (loc.first.input_value() or "").replace("$", "").replace(",", "").strip()
+        if not raw:
+            return None
+        m = re.search(r"\d+(?:\.\d{1,2})?", raw)
+        return f"{float(m.group(0)):.2f}" if m else None
+    except Exception as e:
+        print(f"  WARNING: could not scrape Due From Client Now: {e}")
+        return None
+
+
 def click_accept_payment(page, name):
     """Click the Accept Payment button on the appointment summary.
 
-    Returns a note string if the client has an outstanding balance (additional
-    charges modal appeared), or None if clean.
+    Returns (balance_note, balance_amount):
+      balance_note:   a note string if the client has an outstanding balance
+                      (additional-charges modal appeared), else None.
+      balance_amount: the 'Due From Client Now' figure as a string (e.g.
+                      '20.00') for the report's Amount-due column, else None.
     """
     print("  Clicking Accept Payment...")
     suppress_beacon_widget(page)
@@ -997,24 +1040,37 @@ def click_accept_payment(page, name):
     page.wait_for_timeout(2000)
 
     # Handle modal: "Additional charges exist for this client"
-    # This means the client has an outstanding balance from older sessions.
-    # Key off the modal's stable id (#show-other-charges-modal) rather than a
-    # button class — TA has shipped the affirmative button with different
-    # classes (.btn-action vs .btn-primary vs .btn) across releases. Scoping
-    # the locator inside the modal also prevents matching the same text if it
-    # ever appears elsewhere on the page.
+    # (#show-other-charges-modal) — the client carries open charges beyond this
+    # appointment. Key off the modal's stable id rather than a button class — TA
+    # has shipped the buttons with different classes across releases, and scoping
+    # the locator inside the modal prevents matching stray text on the page.
+    # Which branch we take is governed by CHARGES_MODAL_CHOICE (see top of file).
     balance_note = None
+    balance_amount = None
     modal = page.locator("#show-other-charges-modal.modal.in")
     if modal.is_visible(timeout=3000):
         print(f"  NOTE: {name} has additional charges / outstanding balance")
         balance_note = "Client has outstanding balance — additional charges exist"
-        print("  Clicking: Yes, accept payment for this appointment")
-        yes_btn = modal.locator("button:has-text('Yes, accept payment for this appointment')")
-        yes_btn.click()
+        # Capture the modal for the audit trail (no screenshot of it existed before).
+        screenshot(page, f"payment_{name.replace(' ', '_')}_00_charges_modal")
+        if CHARGES_MODAL_CHOICE == "all_open_charges":
+            print("  Clicking: No, show all open charges")
+            btn = modal.locator("button:has-text('No, show all open charges')")
+        else:
+            print("  Clicking: Yes, accept payment for this appointment")
+            btn = modal.locator("button:has-text('Yes, accept payment for this appointment')")
+        btn.click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
+        # Capture what TA now reports as owed, for the report's Amount-due column.
+        # On the "all_open_charges" path this is the client's total open
+        # client-responsible balance; on the "this_appointment" path it is the
+        # current appointment's balance.
+        balance_amount = _scrape_due_now(page)
+        if balance_amount:
+            print(f"  Outstanding (Due From Client Now): ${balance_amount}")
 
-    return balance_note
+    return balance_note, balance_amount
 
 
 def _resolve_payment_amount_input(page, timeout_ms=4000):
@@ -1164,7 +1220,7 @@ def post_payment_v2(page, name, date, amount, dry_run=False):
     navigate_to_appointments(page)
     ensure_date_filters(page)
     date_note = click_appointment_by_date(page, date, name)
-    balance_note = click_accept_payment(page, name)
+    balance_note, balance_amount = click_accept_payment(page, name)
     screenshot(page, f"payment_{name.replace(' ', '_')}_01_form")
 
     # Combine notes (middle name + date mismatch + outstanding balance)
@@ -1179,7 +1235,7 @@ def post_payment_v2(page, name, date, amount, dry_run=False):
     if not submit_payment(page, name, dry_run):
         raise Exception("V2 submit_payment returned failure")
 
-    return True, note
+    return True, note, balance_amount
 
 
 # =============================================================================
@@ -1406,36 +1462,38 @@ def post_payment(page, name, date, amount, dry_run=False):
     2. If V2 fails (not flagged), retry V2 once with fresh navigation
     3. If V2 retry fails, try V1 (Billing > Take Payment > Search Charges)
     4. If all fail, mark as FAILED
-    Returns (success, method, error, note, posted_date, v2_error)
+    Returns (success, method, error, note, posted_date, v2_error, balance_amount)
     - posted_date: the appointment date TA allocated the V1 payment to (V1 only)
     - v2_error: why V2 failed, so the report can show it (V1 only)
+    - balance_amount: 'Due From Client Now' for the report's Amount-due column
+      (V2 outstanding-balance clients only; None otherwise)
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
 
     # --- Attempt 1: V2 flow ---
     v2_error = None
     try:
-        ok, note = post_payment_v2(page, name, date, amount, dry_run)
+        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run)
         if not ok:
             raise Exception("V2 returned ok=False")
-        return True, "V2", None, note, None, None
+        return True, "V2", None, note, None, None, balance_amount
     except Exception as e:
         v2_error = str(e)
         if "FLAG" in v2_error:
-            return False, "FLAGGED", v2_error, None, None, None
+            return False, "FLAGGED", v2_error, None, None, None, None
         print(f"  V2 failed: {v2_error}")
 
     # --- Attempt 2: Retry V2 with fresh navigation ---
     print(f"  Retrying V2...")
     try:
-        ok, note = post_payment_v2(page, name, date, amount, dry_run)
+        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run)
         if not ok:
             raise Exception("V2-retry returned ok=False")
-        return True, "V2-retry", None, note, None, None
+        return True, "V2-retry", None, note, None, None, balance_amount
     except Exception as e:
         v2_retry_error = str(e)
         if "FLAG" in v2_retry_error:
-            return False, "FLAGGED", v2_retry_error, None, None, None
+            return False, "FLAGGED", v2_retry_error, None, None, None, None
         print(f"  V2 retry failed: {v2_retry_error}")
         print(f"  Falling back to V1...")
 
@@ -1447,15 +1505,15 @@ def post_payment(page, name, date, amount, dry_run=False):
         v1_ok, posted_date = post_payment_v1(page, name, amount, dry_run)
         if not v1_ok:
             raise Exception("V1 submit_payment returned failure")
-        return True, "V1", None, None, posted_date, combined_v2_error
+        return True, "V1", None, None, posted_date, combined_v2_error, None
     except Exception as e:
         v1_error = str(e)
         if "FLAG" in v1_error:
-            return False, "FLAGGED", v1_error, None, None, None
+            return False, "FLAGGED", v1_error, None, None, None, None
         print(f"  V1 also failed: {v1_error}")
 
     # --- All attempts failed ---
-    return False, "FAILED", f"{combined_v2_error}; V1: {v1_error}", None, None, None
+    return False, "FAILED", f"{combined_v2_error}; V1: {v1_error}", None, None, None, None
 
 
 def _stat_box(value, label, color):
@@ -1580,6 +1638,18 @@ def generate_report(payloads, dry_run=False):
     </tr></table>
   </td></tr>''')
 
+    # --- Extra-emphasis banner for Hannah when the new distribution mode is on ---
+    # Gated on CHARGES_MODAL_CHOICE so it appears only on runs that used
+    # "No, show all open charges" and disappears automatically once reverted.
+    if CHARGES_MODAL_CHOICE == "all_open_charges":
+        h.append('''<tr><td style="padding:12px 32px 4px;">
+          <div style="background:#fff3cd;border:2px solid #e0a800;border-radius:4px;padding:16px 20px;font-size:14px;color:#5a4a00;">
+            <div style="font-size:17px;font-weight:800;color:#9a6a00;margin-bottom:6px;">&#9888;&#65039; Hannah &mdash; please cross-check this run</div>
+            <p style="margin:6px 0;">This run posted payments with a <strong>new distribution method</strong> (&ldquo;show all open charges&rdquo;): each payment was distributed across the client&rsquo;s open charges, <strong>oldest balance first</strong>, instead of being applied to a single appointment.</p>
+            <p style="margin:6px 0;">Please verify in TherapyAppointment that <strong>each payment landed on the correct line item(s)</strong> &mdash; especially the <strong>Outstanding balances</strong> clients below, and anyone with multiple payments or multiple open charges. Confirm nothing was over-applied to one appointment or left unapplied, and flag anything that looks off.</p>
+          </div>
+        </td></tr>''')
+
     # --- "Action required" banner introduces the action sections ---
     if has_actions:
         h.append('''<tr><td style="padding:8px 32px 4px;">
@@ -1671,9 +1741,14 @@ def generate_report(payloads, dry_run=False):
                 h.append(_day_subheading_row(p, colspan=2))
             for i, r in enumerate(day_rows):
                 bg = "#fff8f0" if i % 2 else "#fff"
-                amount_due = r.get("balance_amount") or "—"
-                if isinstance(amount_due, (int, float)):
-                    amount_due = f"${float(amount_due):,.2f}"
+                amount_due = r.get("balance_amount")
+                if amount_due in (None, ""):
+                    amount_due = "—"
+                else:
+                    try:
+                        amount_due = f"${float(amount_due):,.2f}"
+                    except (ValueError, TypeError):
+                        amount_due = str(amount_due)
                 h.append(f'''<tr style="background:{bg};">
                   <td style="padding:8px 12px;border-bottom:1px solid #eee;">{r["name"]}</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#999;">{amount_due}</td>
@@ -2328,6 +2403,10 @@ def run():
     parser.add_argument("csv_file", help="Path to the payment CSV file")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fill forms but don't submit (cancels instead of saving)")
+    parser.add_argument("--no-email", action="store_true",
+                        help="Skip send_reports (no staff email, no pending-state changes); "
+                             "just generate and save the report HTML to logs/ for review. "
+                             "Use for test/dry-run batches.")
     args = parser.parse_args()
 
     csv_path = Path(args.csv_file)
@@ -2383,12 +2462,13 @@ def run():
                 print(f"\n[{i}/{len(payments)}]", end="")
 
                 try:
-                    success, method, error, note, posted_date, v2_error = post_payment(page, name, date, amount, dry_run=args.dry_run)
+                    success, method, error, note, posted_date, v2_error, balance_amount = post_payment(page, name, date, amount, dry_run=args.dry_run)
 
                     if success:
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "OK", "method": method, "note": note,
-                                        "posted_date": posted_date, "v2_error": v2_error})
+                                        "posted_date": posted_date, "v2_error": v2_error,
+                                        "balance_amount": balance_amount})
                     elif method == "FLAGGED":
                         results.append({"name": name, "date": date, "amount": amount,
                                         "status": "FLAGGED", "method": "", "reason": error, "note": note})
@@ -2430,7 +2510,19 @@ def run():
             print("\nClosing browser.")
             browser.close()
 
-    send_reports(results, duplicates, csv_date_display, dry_run=args.dry_run)
+    if args.no_email:
+        # Test/dry-run mode: build the report locally for review without emailing
+        # staff or touching the pending-JSON state.
+        payload = {
+            "run_date": datetime.now().date().isoformat(),
+            "csv_date": csv_date_display,
+            "results": results,
+            "duplicates": sorted(duplicates) if duplicates else [],
+        }
+        report_path, _ = generate_report([payload], dry_run=args.dry_run)
+        print(f"  --no-email: report saved locally, no email sent → {report_path.name}")
+    else:
+        send_reports(results, duplicates, csv_date_display, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
