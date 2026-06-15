@@ -10,10 +10,11 @@ STATUS: v1, dev-test only. NOT wired into production. Before this can run / merg
   1. SQUARE_ACCESS_TOKEN must be in .env. The daily-CSV flow doesn't use a Square
      API token, so one must be created in the Square Developer Dashboard
      (scope: PAYMENTS_READ). Until then this script exits cleanly.
-  2. *** Payer-name extraction must be validated *** — see extract_payment_fields().
-     Square doesn't put the client's full name on the payment object, so how the
-     name is resolved must match the daily CSV exporter (squaredailyreport).
-     Run with --dry-run to inspect what it extracts before trusting it.
+  2. SQUARE_ACCESS_TOKEN needs PAYMENTS_READ + CUSTOMERS_READ. The payer name is
+     the linked customer's given_name + family_name (validated 2026-06-15 against
+     the 6/13 CSV — matches "Full Name", NOT the cardholder name, which can be a
+     parent/payer). The posted amount is the BASE (total / 1.03), since the client
+     pays a 3% card surcharge that is not a payment toward their therapy balance.
   3. Live test (--once --dry-run, then --once) once the token is in place.
 
 Cadence (machine-local time, so CST/CDT DST is automatic):
@@ -110,8 +111,10 @@ def cadence_should_act(state, now):
     return elapsed_min >= (interval - CADENCE_SLACK_MIN), interval
 
 
-def square_get(path, params):
-    url = f"{SQUARE_API_BASE}{path}?{urllib.parse.urlencode(params)}"
+def square_get(path, params=None):
+    url = f"{SQUARE_API_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
         "Square-Version": SQUARE_VERSION,
@@ -135,26 +138,44 @@ def fetch_completed_payments(since_iso):
             return out
 
 
+_customer_name_cache = {}
+
+
+def resolve_customer_name(customer_id):
+    """Resolve a Square customer_id to 'Given Family' (cached). Empty if unknown."""
+    if not customer_id:
+        return ""
+    if customer_id in _customer_name_cache:
+        return _customer_name_cache[customer_id]
+    name = ""
+    try:
+        c = square_get(f"/v2/customers/{customer_id}").get("customer", {})
+        name = f"{(c.get('given_name') or '').strip()} {(c.get('family_name') or '').strip()}".strip()
+    except Exception as e:
+        log(f"  WARNING: could not resolve customer {customer_id}: {e}")
+    _customer_name_cache[customer_id] = name
+    return name
+
+
 def extract_payment_fields(p):
     """Map a Square payment -> (name, date, amount).
 
-    *** VALIDATION REQUIRED before production ***
-    Square does NOT carry the client's full name on the payment object. Depending
-    on how this practice captures Square payments, the name may live in the
-    payment note, the linked customer (customer_id), or the linked order's
-    fulfillment/recipient. This must be reconciled with how the daily CSV
-    exporter (squaredailyreport) derives "Full Name". The note field below is a
-    PLACEHOLDER. Run --dry-run and compare against a known day's CSV to confirm.
+    name   : the linked customer's given_name + family_name (the client), which
+             matches the daily CSV exporter's "Full Name" — NOT the cardholder
+             name (validated 2026-06-15 against the 6/13 CSV).
+    amount : the BASE applied to the client's balance = total / 1.03 (the client
+             pays a 3% card surcharge on top; that fee is not a payment toward
+             their therapy balance — matches the CSV "Base Amount" column).
+    date   : the payment's local (Central) transaction date, MM/DD/YYYY.
     """
-    amount_cents = (p.get("amount_money") or {}).get("amount", 0)
-    amount = f"{amount_cents / 100:.2f}"
+    total_cents = (p.get("amount_money") or {}).get("amount", 0)
+    amount = f"{round(total_cents / 100 / 1.03, 2):.2f}"
     created = p.get("created_at", "")
     try:
-        dt_local = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone()
-        date = dt_local.strftime("%m/%d/%Y")
+        date = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone().strftime("%m/%d/%Y")
     except Exception:
         date = ""
-    name = (p.get("note") or "").strip()  # PLACEHOLDER — validate per docstring
+    name = resolve_customer_name(p.get("customer_id", ""))
     return name, date, amount
 
 
