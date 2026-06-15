@@ -90,6 +90,33 @@ def save_state(state):
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
+LEDGER_DIR = bot.DATA_DIR / "poll_ledger"
+
+
+def record_ledger(payment_id, name, date, amount, status):
+    """Append/update a payment in the per-transaction-date ledger (idempotent by id).
+
+    The ledger is the poller's record of what it did (or, in shadow mode, would
+    do) each day — it's what the daily reconciliation diffs against the full CSV.
+    `date` is MM/DD/YYYY (the Square transaction date). status is one of:
+    OK / FAILED / ERROR / SKIPPED_NO_NAME / WOULD_POST (shadow).
+    """
+    if not date:
+        return
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    path = LEDGER_DIR / f"{date.replace('/', '')}.json"
+    entries = []
+    if path.exists():
+        try:
+            entries = json.loads(path.read_text())
+        except Exception:
+            entries = []
+    entries = [e for e in entries if e.get("id") != payment_id]
+    entries.append({"id": payment_id, "name": name, "date": date,
+                    "amount": amount, "status": status})
+    path.write_text(json.dumps(entries, indent=2))
+
+
 def in_business_hours(now):
     if now.weekday() not in BUSINESS_DAYS:
         return False
@@ -215,7 +242,9 @@ def post_new_payments(to_post, posted_ids):
 def main():
     ap = argparse.ArgumentParser(description="Near-real-time Square -> TA poster (dev-test).")
     ap.add_argument("--once", action="store_true", help="Ignore cadence; poll once now.")
-    ap.add_argument("--dry-run", action="store_true", help="Show what would post; post nothing.")
+    ap.add_argument("--dry-run", action="store_true", help="Show what would post; post nothing, persist nothing.")
+    ap.add_argument("--shadow", action="store_true",
+                    help="Observe-only: record would-post to the ledger for reconciliation, but post nothing.")
     ap.add_argument("--since", default=None, help="Override cursor (RFC3339 UTC).")
     args = ap.parse_args()
 
@@ -271,17 +300,36 @@ def main():
         name, date, amount = extract_payment_fields(p)
         rec = {"id": p["id"], "name": name, "date": date, "amount": amount}
         (to_post if name else unresolved).append(rec)
-    for u in unresolved:
-        log(f"  SKIP (no name resolved) ${u['amount']} on {u['date']} (sq:{u['id']}) — needs manual posting")
-
+    # --- DRY RUN: preview only, no side effects ---
     if args.dry_run:
         log("DRY RUN — would post:")
         for item in to_post:
             log(f"  {item['name']} — ${item['amount']} on {item['date']} (sq:{item['id']})")
+        for u in unresolved:
+            log(f"  SKIP (no name) ${u['amount']} on {u['date']} (sq:{u['id']})")
         return
 
-    results = post_new_payments(to_post, posted_ids)
+    # --- SHADOW: record would-post to the ledger for reconciliation; post nothing ---
+    if args.shadow:
+        log("SHADOW — recording would-post to ledger (no posting):")
+        for item in to_post:
+            record_ledger(item["id"], item["name"], item["date"], item["amount"], "WOULD_POST")
+            log(f"  WOULD POST {item['name']} ${item['amount']} on {item['date']}")
+        for u in unresolved:
+            record_ledger(u["id"], u["name"], u["date"], u["amount"], "SKIPPED_NO_NAME")
+            log(f"  SKIP (no name) ${u['amount']} on {u['date']} (sq:{u['id']})")
+        state.update(last_polled_at=next_cursor, last_action_at=now.isoformat())
+        save_state(state)
+        log(f"Shadow done: {len(to_post)} would-post, {len(unresolved)} skipped (no name).")
+        return
 
+    # --- LIVE: post for real, record outcomes to the ledger ---
+    for u in unresolved:
+        record_ledger(u["id"], u["name"], u["date"], u["amount"], "SKIPPED_NO_NAME")
+        log(f"  SKIP (no name resolved) ${u['amount']} on {u['date']} (sq:{u['id']}) — needs manual posting")
+    results = post_new_payments(to_post, posted_ids)
+    for r in results:
+        record_ledger(r["id"], r["name"], r["date"], r["amount"], r["status"])
     state.update(
         posted_payment_ids=sorted(posted_ids),
         last_polled_at=next_cursor,
