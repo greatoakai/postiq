@@ -2333,29 +2333,28 @@ def send_reports(results, duplicates, csv_date, dry_run=False):
     """
     run_date = datetime.now().date()
 
-    # Always persist this run's results so a later weekday run can include them.
-    # Dry runs persist too — they should still aggregate into the next combined
-    # report if the user is testing the multi-day flow.
-    _save_pending_results(results, duplicates, csv_date, run_date)
+    # Persist this run's results so a later weekday run can include them — but
+    # only when there's something to persist. An empty (no-payment) day saves
+    # nothing, yet on a weekday it still proceeds below to flush any deferred
+    # weekend reports that were waiting. Dry runs persist too.
+    if results:
+        _save_pending_results(results, duplicates, csv_date, run_date)
 
-    # Sat (5) / Sun (6) — defer email; Monday will pick this up.
+    # Sat (5) / Sun (6) — defer email; the next weekday picks this up.
     if run_date.weekday() >= 5:
-        print(f"  Weekend run ({run_date.strftime('%A')}) — results saved, email deferred to next weekday.")
+        if results:
+            print(f"  Weekend run ({run_date.strftime('%A')}) — results saved, email deferred to next weekday.")
+        else:
+            print(f"  Weekend run ({run_date.strftime('%A')}), no payments — nothing to defer.")
         return
 
-    # Weekday: load every pending payload (includes the one we just saved).
+    # Weekday: load every pending payload (today's, if saved, plus any deferred
+    # weekend runs). If there's nothing at all, send no email (don't crash, and
+    # don't spam an empty report).
     payloads = _load_pending_payloads()
     if not payloads:
-        # Defensive: _save_pending_results just wrote one, so this shouldn't
-        # happen. If it does, fall back to a synthetic single-day payload so
-        # Hannah still gets a report.
-        print("  WARNING: No pending payloads found — building report from current run only.")
-        payloads = [{
-            "run_date": run_date.isoformat(),
-            "csv_date": csv_date,
-            "results": results,
-            "duplicates": sorted(duplicates) if duplicates else [],
-        }]
+        print("  No payments today and no deferred reports pending — nothing to send.")
+        return
 
     # Flatten across days for the error check and the dry-run flag.
     all_results = [r for p in payloads for r in p["results"]]
@@ -2424,8 +2423,19 @@ def run():
 
     payments = read_csv(csv_path)
     if not payments:
-        print("ERROR: No valid payment rows found in CSV.")
-        sys.exit(1)
+        # No payments for this date (e.g. a quiet weekend day with an empty
+        # Square export). This is NOT a failure, and we must NOT crash — on a
+        # weekday this run is what flushes any deferred weekend reports, so
+        # exiting here would strand them (see 2026-06-15: empty Sunday CSV
+        # crashed Monday before the weekend report could send). Skip posting
+        # (no browser/login needed) and still run the report step.
+        import re as _re
+        _m = _re.match(r"(\d{2})\.(\d{2})\.(\d{4})", csv_path.name)
+        csv_date_display = f"{_m.group(1)}/{_m.group(2)}/{_m.group(3)}" if _m else "unknown"
+        print(f"No valid payment rows in {csv_path.name} — nothing to post today. "
+              f"Running report step to flush any deferred reports.")
+        send_reports([], set(), csv_date_display, dry_run=args.dry_run)
+        return
 
     duplicates = detect_duplicates(payments)
 
