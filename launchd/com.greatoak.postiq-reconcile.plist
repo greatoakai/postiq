@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.greatoak.postiq-reconcile — daily emailed reconcile for the shadow proving window.
+
+  Runs at 8:00 AM (after the 7:00 batch), reconciles YESTERDAY's poller ledger
+  against yesterday's CSV, and emails the result (CLEAN or itemized exceptions)
+  to Travis. Posts nothing. Pairs with the shadow poller during the proving window.
+
+  Install:
+    cp launchd/com.greatoak.postiq-reconcile.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.greatoak.postiq-reconcile.plist
+  Remove after the proving window (before cutover wires reconcile into the batch):
+    launchctl unload ~/Library/LaunchAgents/com.greatoak.postiq-reconcile.plist
+    rm ~/Library/LaunchAgents/com.greatoak.postiq-reconcile.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.greatoak.postiq-reconcile</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/travmegsam/Developer/postiq-dev/scripts/reconcile.py</string>
+        <string>--email</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>8</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/reconcile_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/reconcile_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/travmegsam</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
