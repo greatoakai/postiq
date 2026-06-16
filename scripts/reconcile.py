@@ -101,16 +101,14 @@ def reconcile(csv_path):
         else:
             errors.append({**c, "status": e.get("status")})
 
-    extras = [e for e in ledger if id(e) not in used and e.get("status") in POSTED_OK]
+    posted_ok = [e for e in ledger if e.get("status") in POSTED_OK]
+    extras = [e for e in posted_ok if id(e) not in used]
 
     # Clients the poller handled but whose Square profile has no Account #
     # (reference_id). They had to match by name this time; adding the Account #
     # in Square lets future card payments match deterministically. Surfaced to
     # staff as an action item regardless of whether the reconciliation is clean.
-    missing_account = [
-        e for e in ledger
-        if e.get("status") in POSTED_OK and not (e.get("account") or "").strip()
-    ]
+    missing_account = [e for e in posted_ok if not (e.get("account") or "").strip()]
 
     return {
         "csv": csv_path.name, "txn_date": txn_date,

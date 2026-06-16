@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import unicodedata
@@ -738,7 +739,6 @@ def search_client_by_account(page, account):
         return False, "no account number"
 
     print(f"  [acct] Searching by Account Number: {account}")
-    acct_lower = account.lower()
     rows = None
     for attempt in range(3):
         try:
@@ -763,11 +763,11 @@ def search_client_by_account(page, account):
                 continue
             return False, f"account search error: {e}"
 
-    matching = _match_rows(rows, [acct_lower])
+    matching = _rows_matching_account(rows, account)
     if len(matching) == 0:
         inactive_rows = _try_inactive_clients(page)
         if inactive_rows is not None:
-            matching = _match_rows(inactive_rows, [acct_lower])
+            matching = _rows_matching_account(inactive_rows, account)
 
     if len(matching) > 1:
         # Account numbers are unique; more than one match means something is wrong.
@@ -781,6 +781,65 @@ def search_client_by_account(page, account):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
     return True, f"Matched by Account # {account}"
+
+
+# TA Account # token: 'C' + 9 digits (the Clients search field caps at 10 chars).
+_ACCOUNT_RE = re.compile(r"\bC\d{9}\b")
+
+
+def _account_from_row(row):
+    """Return the TA Account # (C#########) from a Clients results row, or ''.
+
+    Matched against the row's concatenated cell text. Returns a value ONLY when
+    exactly one account-shaped token is present — if zero or more than one match
+    (e.g. another 'C#########' token slipped into the row), return '' so callers
+    fail safe (fall back to name search / skip the backfill) rather than act on a
+    guessed number.
+    """
+    found = set(_ACCOUNT_RE.findall(row.text_content() or ""))
+    return found.pop() if len(found) == 1 else ""
+
+
+def _rows_matching_account(rows, account):
+    """Rows whose Account # exactly equals `account` (and that contain a link).
+
+    Exact match (not substring) — avoids a shorter account matching inside a
+    longer one, or the digits colliding with another numeric cell in the row.
+    """
+    out = []
+    for row in rows:
+        if _account_from_row(row) == account:
+            links = row.locator("a")
+            if links.count() > 0:
+                out.append((row, links.first))
+    return out
+
+
+def scrape_account_for_name(page, name):
+    """Name-search for a client and return their TA Account # (C#########), or ''.
+
+    Reuses the same name-resolution chain as search_client (alias → as-is →
+    normalized → nickname variations) but does NOT open the profile — it only
+    reads the Account # from the unique results row. Returns '' if the client
+    can't be uniquely matched (so a wrong number is never written back).
+    Used by the Square reference_id backfill (poll_square --backfill-missing).
+    """
+    resolved = resolve_name(name)
+    norm = normalize_name(resolved)
+
+    # Ordered candidate search names: as-is, normalized (if different), then
+    # nickname variations — the same ladder search_client() walks.
+    candidates = [resolved]
+    if norm != resolved:
+        candidates.append(norm)
+    candidates.extend(var_name for var_name, _ in get_name_variations(resolved))
+
+    for candidate in candidates:
+        rows = _try_search(page, candidate)
+        if len(rows) == 1:
+            return _account_from_row(rows[0][0])
+
+    return ""
 
 
 def search_client(page, name, account=None):
