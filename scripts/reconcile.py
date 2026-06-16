@@ -103,11 +103,21 @@ def reconcile(csv_path):
 
     extras = [e for e in ledger if id(e) not in used and e.get("status") in POSTED_OK]
 
+    # Clients the poller handled but whose Square profile has no Account #
+    # (reference_id). They had to match by name this time; adding the Account #
+    # in Square lets future card payments match deterministically. Surfaced to
+    # staff as an action item regardless of whether the reconciliation is clean.
+    missing_account = [
+        e for e in ledger
+        if e.get("status") in POSTED_OK and not (e.get("account") or "").strip()
+    ]
+
     return {
         "csv": csv_path.name, "txn_date": txn_date,
         "csv_count": len(csv_payments), "ledger_count": len(ledger),
         "matched": matched, "gaps": gaps, "errors": errors,
         "discrepancies": discrepancies, "extras": extras,
+        "missing_account": missing_account,
     }
 
 
@@ -117,17 +127,21 @@ def print_report(r):
     print(f"CSV: {r['csv_count']} | ledger: {r['ledger_count']} | matched: {len(r['matched'])}")
     if clean:
         print("RESULT: CLEAN — every CSV payment is in the poller ledger, amounts match, no extras.")
-        return True
-    print("RESULT: EXCEPTIONS")
-    for g in r["gaps"]:
-        print(f"  GAP         {g['name']} ${g['amount']} on {g['date']} — poller never posted (auto-fill candidate)")
-    for e in r["errors"]:
-        print(f"  ERROR       {e['name']} ${e['amount']} on {e['date']} — poller status {e['status']} (staff)")
-    for d in r["discrepancies"]:
-        print(f"  DISCREPANCY {d['name']} CSV ${d['amount']} vs ledger ${d['ledger_amount']} (staff)")
-    for x in r["extras"]:
-        print(f"  EXTRA       {x.get('name')} ${x.get('amount')} on {x.get('date')} — poller posted, not in CSV (staff)")
-    return False
+    else:
+        print("RESULT: EXCEPTIONS")
+        for g in r["gaps"]:
+            print(f"  GAP         {g['name']} ${g['amount']} on {g['date']} — poller never posted (auto-fill candidate)")
+        for e in r["errors"]:
+            print(f"  ERROR       {e['name']} ${e['amount']} on {e['date']} — poller status {e['status']} (staff)")
+        for d in r["discrepancies"]:
+            print(f"  DISCREPANCY {d['name']} CSV ${d['amount']} vs ledger ${d['ledger_amount']} (staff)")
+        for x in r["extras"]:
+            print(f"  EXTRA       {x.get('name')} ${x.get('amount')} on {x.get('date')} — poller posted, not in CSV (staff)")
+    # Maintenance action item — independent of CLEAN/EXCEPTIONS, doesn't flip the result.
+    for m in r.get("missing_account", []):
+        print(f"  NEEDS SQUARE ACCT#  {m.get('name')} ${m.get('amount')} on {m.get('date')} "
+              f"(sq:{m.get('id')}) — add Account # in Square so it auto-matches next time")
+    return clean
 
 
 def build_report_html(r):
@@ -157,6 +171,16 @@ def build_report_html(r):
              lambda d: f"{d['name']} — CSV ${d['amount']} vs ledger ${d['ledger_amount']}", "#d84315")
         sect("Extras — poller posted, not in CSV (staff)", r["extras"],
              lambda x: f"{x.get('name')} — ${x.get('amount')} on {x.get('date')}", "#6a1b9a")
+
+    # Maintenance section — rendered whether clean or not. These clients need a
+    # one-time Account # added in Square so future card payments match by
+    # Account # instead of by name.
+    if r.get("missing_account"):
+        sect("Missing Square Account # — add in Square so future payments auto-match (staff action)",
+             r["missing_account"],
+             lambda m: f"{m.get('name')} — ${m.get('amount')} on {m.get('date')} (Square payment {m.get('id')})",
+             "#1565c0")
+        subject += f" · {len(r['missing_account'])} need Acct#"
 
     html = (f'<html><body style="font-family:Arial,sans-serif;color:#333;">'
             f'<h2 style="color:#346756;">Shadow Reconcile — {r["txn_date"]}</h2>'
