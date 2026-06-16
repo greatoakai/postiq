@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import unicodedata
@@ -781,6 +782,46 @@ def search_client_by_account(page, account):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
     return True, f"Matched by Account # {account}"
+
+
+# TA Account # token: 'C' followed by digits (observed as C + 9 digits). Matched
+# inside a results-row's text; no other 'C<digits>' token appears in a client row.
+_ACCOUNT_RE = re.compile(r"\bC\d{6,10}\b")
+
+
+def _account_from_row(row):
+    """Extract the TA Account # (C#########) from a Clients results row, or ''."""
+    m = _ACCOUNT_RE.search(row.text_content() or "")
+    return m.group(0) if m else ""
+
+
+def scrape_account_for_name(page, name):
+    """Name-search for a client and return their TA Account # (C#########), or ''.
+
+    Reuses the same name-resolution chain as search_client (alias → as-is →
+    normalized → nickname variations) but does NOT open the profile — it only
+    reads the Account # from the unique results row. Returns '' if the client
+    can't be uniquely matched (so a wrong number is never written back).
+    Used by the Square reference_id backfill (poll_square --backfill-missing).
+    """
+    resolved = resolve_name(name)
+
+    rows = _try_search(page, resolved)
+    if len(rows) == 1:
+        return _account_from_row(rows[0][0])
+
+    norm = normalize_name(resolved)
+    if norm != resolved:
+        rows = _try_search(page, norm)
+        if len(rows) == 1:
+            return _account_from_row(rows[0][0])
+
+    for var_name, _var_type in get_name_variations(resolved):
+        rows = _try_search(page, var_name)
+        if len(rows) == 1:
+            return _account_from_row(rows[0][0])
+
+    return ""
 
 
 def search_client(page, name, account=None):

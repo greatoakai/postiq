@@ -10,11 +10,12 @@ STATUS: v1, dev-test only. NOT wired into production. Before this can run / merg
   1. SQUARE_ACCESS_TOKEN must be in .env. The daily-CSV flow doesn't use a Square
      API token, so one must be created in the Square Developer Dashboard
      (scope: PAYMENTS_READ). Until then this script exits cleanly.
-  2. SQUARE_ACCESS_TOKEN needs PAYMENTS_READ + CUSTOMERS_READ. The payer name is
-     the linked customer's given_name + family_name (validated 2026-06-15 against
-     the 6/13 CSV — matches "Full Name", NOT the cardholder name, which can be a
-     parent/payer). The posted amount is the BASE (total / 1.03), since the client
-     pays a 3% card surcharge that is not a payment toward their therapy balance.
+  2. SQUARE_ACCESS_TOKEN needs PAYMENTS_READ + CUSTOMERS_READ (plus CUSTOMERS_WRITE
+     for --backfill-missing). The payer name is the linked customer's given_name +
+     family_name (validated 2026-06-15 against the 6/13 CSV — matches "Full Name",
+     NOT the cardholder name, which can be a parent/payer). The posted amount is the
+     BASE (total / 1.03), since the client pays a 3% card surcharge that is not a
+     payment toward their therapy balance.
   3. Live test (--once --dry-run, then --once) once the token is in place.
 
 Cadence (machine-local time, so CST/CDT DST is automatic):
@@ -33,6 +34,8 @@ Usage:
   python3 scripts/poll_square.py --once     # ignore cadence; poll once now
   python3 scripts/poll_square.py --dry-run  # show what would post; post nothing
   python3 scripts/poll_square.py --since 2026-06-15T00:00:00Z   # override cursor
+  python3 scripts/poll_square.py --backfill-missing --dry-run   # find missing Account #s (no writes)
+  python3 scripts/poll_square.py --backfill-missing             # write TA Account #s back to Square
 """
 
 import argparse
@@ -153,6 +156,36 @@ def square_get(path, params=None):
         return json.loads(resp.read().decode())
 
 
+def square_put(path, body):
+    """PUT JSON to the Square API and return the parsed response. Requires the
+    relevant write scope on SQUARE_ACCESS_TOKEN (CUSTOMERS_WRITE for customers)."""
+    url = f"{SQUARE_API_BASE}{path}"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="PUT", headers={
+        "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+        "Square-Version": SQUARE_VERSION,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def update_customer_reference(customer_id, account):
+    """Set a Square customer's reference_id (== TA Account #) and return the value
+    Square echoes back (read-after-write confirmation). Raises on API error.
+
+    UpdateCustomer returns the full updated customer, so the response itself is
+    the confirmation — no separate GET needed. Also refresh the local cache so a
+    subsequent resolve_customer() reflects the new account.
+    """
+    resp = square_put(f"/v2/customers/{customer_id}", {"reference_id": account})
+    confirmed = ((resp.get("customer") or {}).get("reference_id") or "").strip()
+    if customer_id in _customer_cache:
+        _customer_cache[customer_id]["account"] = confirmed
+    return confirmed
+
+
 def fetch_completed_payments(since_iso):
     """Fetch COMPLETED payments created since `since_iso` (RFC3339 UTC). Paginates."""
     out, cursor = [], None
@@ -253,6 +286,89 @@ def post_new_payments(to_post, posted_ids):
     return results
 
 
+def backfill_missing(since_iso, dry_run=False, limit=None):
+    """Self-heal missing Square Account #s. Posts NOTHING.
+
+    For each recent COMPLETED payment whose Square customer has no reference_id,
+    look the client up in TA by name, read their Account # off the results row,
+    and write it back to Square (customer.reference_id). After this, that client
+    matches deterministically by Account # forever.
+
+    dry_run: do the TA lookup and report the Account # we WOULD set, but write
+    nothing to Square. Returns a list of per-customer result dicts.
+    """
+    log(f"BACKFILL: scanning COMPLETED payments since {since_iso} for missing Account #s ...")
+    try:
+        payments = fetch_completed_payments(since_iso)
+    except Exception as e:
+        log(f"ERROR: Square request failed — {e}")
+        return []
+
+    # Unique customers missing a reference_id, skipping ones we can't name-match.
+    seen, targets = set(), []
+    for p in payments:
+        cid = p.get("customer_id", "")
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        cust = resolve_customer(cid)
+        if cust["account"]:
+            continue  # already has an Account #
+        if not cust["name"]:
+            log(f"  SKIP {cid}: Square customer has no name — can't look up in TA")
+            continue
+        targets.append({"customer_id": cid, "name": cust["name"]})
+
+    if limit:
+        targets = targets[:limit]
+    log(f"BACKFILL: {len(targets)} customer(s) missing an Account #"
+        + (" — DRY RUN, nothing will be written" if dry_run else ""))
+    if not targets:
+        return []
+
+    results = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=bot.HEADLESS)
+        page = browser.new_page()
+        page.set_default_timeout(bot.ACTION_TIMEOUT)
+        try:
+            bot.login(page)
+            for t in targets:
+                rec = {**t, "found": "", "status": ""}
+                try:
+                    acct = bot.scrape_account_for_name(page, t["name"])
+                    if not acct:
+                        rec["status"] = "NOT_FOUND_IN_TA"
+                        log(f"  {t['name']}: no unique Account # found in TA — needs manual review")
+                    elif dry_run:
+                        rec.update(found=acct, status="WOULD_SET")
+                        log(f"  {t['name']}: would set Square reference_id = {acct}")
+                    else:
+                        confirmed = update_customer_reference(t["customer_id"], acct)
+                        ok = (confirmed == acct)
+                        rec.update(found=acct, confirmed=confirmed,
+                                   status="SET" if ok else "SET_MISMATCH")
+                        log(f"  {t['name']}: set Square reference_id = {acct}"
+                            + ("" if ok else f" but Square returned {confirmed!r}"))
+                except Exception as e:
+                    rec["status"] = "ERROR"
+                    rec["error"] = str(e)
+                    log(f"  ERROR {t['name']}: {e}")
+                    try:
+                        bot.recover_to_dashboard(page)
+                    except Exception:
+                        pass
+                results.append(rec)
+        finally:
+            browser.close()
+
+    n_set = sum(1 for r in results if r["status"] == "SET")
+    n_would = sum(1 for r in results if r["status"] == "WOULD_SET")
+    log(f"BACKFILL done: {n_set} set, {n_would} would-set (dry-run), "
+        f"{len(results) - n_set - n_would} unresolved/error.")
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description="Near-real-time Square -> TA poster (dev-test).")
     ap.add_argument("--once", action="store_true", help="Ignore cadence; poll once now.")
@@ -260,9 +376,26 @@ def main():
     ap.add_argument("--shadow", action="store_true",
                     help="Observe-only: record would-post to the ledger for reconciliation, but post nothing.")
     ap.add_argument("--since", default=None, help="Override cursor (RFC3339 UTC).")
+    ap.add_argument("--backfill-missing", action="store_true",
+                    help="Self-heal: for Square customers missing a reference_id, look up their "
+                         "TA Account # and write it back to Square. Posts nothing. Honors "
+                         "--dry-run (lookup only), --since (default: last 7 days), and --limit.")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="Cap how many customers --backfill-missing processes (for smoke tests).")
     args = ap.parse_args()
 
     now = datetime.now()
+
+    if not SQUARE_ACCESS_TOKEN:
+        log("SQUARE_ACCESS_TOKEN not set in .env — cannot poll. (See module header.)")
+        sys.exit(1)
+
+    # --- BACKFILL: self-heal missing Account #s; posts nothing, ignores cadence/state ---
+    if args.backfill_missing:
+        since = args.since or (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        backfill_missing(since, dry_run=args.dry_run, limit=args.limit)
+        return
+
     state = load_state()
 
     # Cadence gate (skipped by --once)
@@ -271,10 +404,6 @@ def main():
         if not should_act:
             log(f"Cadence not elapsed (interval={interval}m) — skipping this fire.")
             return
-
-    if not SQUARE_ACCESS_TOKEN:
-        log("SQUARE_ACCESS_TOKEN not set in .env — cannot poll. (See module header.)")
-        sys.exit(1)
 
     # Cursor: where to start fetching from
     since = args.since or state.get("last_polled_at")
