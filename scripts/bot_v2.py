@@ -739,7 +739,6 @@ def search_client_by_account(page, account):
         return False, "no account number"
 
     print(f"  [acct] Searching by Account Number: {account}")
-    acct_lower = account.lower()
     rows = None
     for attempt in range(3):
         try:
@@ -764,11 +763,11 @@ def search_client_by_account(page, account):
                 continue
             return False, f"account search error: {e}"
 
-    matching = _match_rows(rows, [acct_lower])
+    matching = _rows_matching_account(rows, account)
     if len(matching) == 0:
         inactive_rows = _try_inactive_clients(page)
         if inactive_rows is not None:
-            matching = _match_rows(inactive_rows, [acct_lower])
+            matching = _rows_matching_account(inactive_rows, account)
 
     if len(matching) > 1:
         # Account numbers are unique; more than one match means something is wrong.
@@ -784,15 +783,36 @@ def search_client_by_account(page, account):
     return True, f"Matched by Account # {account}"
 
 
-# TA Account # token: 'C' followed by digits (observed as C + 9 digits). Matched
-# inside a results-row's text; no other 'C<digits>' token appears in a client row.
-_ACCOUNT_RE = re.compile(r"\bC\d{6,10}\b")
+# TA Account # token: 'C' + 9 digits (the Clients search field caps at 10 chars).
+_ACCOUNT_RE = re.compile(r"\bC\d{9}\b")
 
 
 def _account_from_row(row):
-    """Extract the TA Account # (C#########) from a Clients results row, or ''."""
-    m = _ACCOUNT_RE.search(row.text_content() or "")
-    return m.group(0) if m else ""
+    """Return the TA Account # (C#########) from a Clients results row, or ''.
+
+    Matched against the row's concatenated cell text. Returns a value ONLY when
+    exactly one account-shaped token is present — if zero or more than one match
+    (e.g. another 'C#########' token slipped into the row), return '' so callers
+    fail safe (fall back to name search / skip the backfill) rather than act on a
+    guessed number.
+    """
+    found = set(_ACCOUNT_RE.findall(row.text_content() or ""))
+    return found.pop() if len(found) == 1 else ""
+
+
+def _rows_matching_account(rows, account):
+    """Rows whose Account # exactly equals `account` (and that contain a link).
+
+    Exact match (not substring) — avoids a shorter account matching inside a
+    longer one, or the digits colliding with another numeric cell in the row.
+    """
+    out = []
+    for row in rows:
+        if _account_from_row(row) == account:
+            links = row.locator("a")
+            if links.count() > 0:
+                out.append((row, links.first))
+    return out
 
 
 def scrape_account_for_name(page, name):
@@ -805,19 +825,17 @@ def scrape_account_for_name(page, name):
     Used by the Square reference_id backfill (poll_square --backfill-missing).
     """
     resolved = resolve_name(name)
-
-    rows = _try_search(page, resolved)
-    if len(rows) == 1:
-        return _account_from_row(rows[0][0])
-
     norm = normalize_name(resolved)
-    if norm != resolved:
-        rows = _try_search(page, norm)
-        if len(rows) == 1:
-            return _account_from_row(rows[0][0])
 
-    for var_name, _var_type in get_name_variations(resolved):
-        rows = _try_search(page, var_name)
+    # Ordered candidate search names: as-is, normalized (if different), then
+    # nickname variations — the same ladder search_client() walks.
+    candidates = [resolved]
+    if norm != resolved:
+        candidates.append(norm)
+    candidates.extend(var_name for var_name, _ in get_name_variations(resolved))
+
+    for candidate in candidates:
+        rows = _try_search(page, candidate)
         if len(rows) == 1:
             return _account_from_row(rows[0][0])
 

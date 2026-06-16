@@ -143,32 +143,37 @@ def cadence_should_act(state, now):
     return elapsed_min >= (interval - CADENCE_SLACK_MIN), interval
 
 
-def square_get(path, params=None):
+def _square_request(method, path, params=None, body=None):
+    """Issue an authenticated Square API request and return the parsed JSON.
+
+    Shared by square_get/square_put so the auth + Square-Version headers live in
+    one place. `body` (a dict) is JSON-encoded for write methods.
+    """
     url = f"{SQUARE_API_BASE}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={
+    headers = {
         "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
         "Square-Version": SQUARE_VERSION,
         "Accept": "application/json",
-    })
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
+
+
+def square_get(path, params=None):
+    return _square_request("GET", path, params=params)
 
 
 def square_put(path, body):
-    """PUT JSON to the Square API and return the parsed response. Requires the
-    relevant write scope on SQUARE_ACCESS_TOKEN (CUSTOMERS_WRITE for customers)."""
-    url = f"{SQUARE_API_BASE}{path}"
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data, method="PUT", headers={
-        "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-        "Square-Version": SQUARE_VERSION,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
+    """PUT JSON to Square. Requires the relevant write scope on SQUARE_ACCESS_TOKEN
+    (CUSTOMERS_WRITE for customers)."""
+    return _square_request("PUT", path, body=body)
 
 
 def update_customer_reference(customer_id, account):
@@ -216,7 +221,7 @@ def resolve_customer(customer_id):
     if not customer_id:
         return {"name": "", "account": ""}
     if customer_id in _customer_cache:
-        return _customer_cache[customer_id]
+        return dict(_customer_cache[customer_id])
     info = {"name": "", "account": ""}
     try:
         c = square_get(f"/v2/customers/{customer_id}").get("customer", {})
@@ -225,7 +230,7 @@ def resolve_customer(customer_id):
     except Exception as e:
         log(f"  WARNING: could not resolve customer {customer_id}: {e}")
     _customer_cache[customer_id] = info
-    return info
+    return dict(info)
 
 
 def extract_payment_fields(p):
@@ -322,7 +327,8 @@ def backfill_missing(since_iso, dry_run=False, limit=None):
     if limit:
         targets = targets[:limit]
     log(f"BACKFILL: {len(targets)} customer(s) missing an Account #"
-        + (" — DRY RUN, nothing will be written" if dry_run else ""))
+        + (" — DRY RUN, nothing will be written" if dry_run
+           else " — LIVE: will WRITE reference_id to PRODUCTION Square"))
     if not targets:
         return []
 
@@ -386,24 +392,27 @@ def main():
 
     now = datetime.now()
 
-    if not SQUARE_ACCESS_TOKEN:
-        log("SQUARE_ACCESS_TOKEN not set in .env — cannot poll. (See module header.)")
-        sys.exit(1)
-
     # --- BACKFILL: self-heal missing Account #s; posts nothing, ignores cadence/state ---
     if args.backfill_missing:
+        if not SQUARE_ACCESS_TOKEN:
+            log("SQUARE_ACCESS_TOKEN not set in .env — cannot backfill.")
+            sys.exit(1)
         since = args.since or (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
         backfill_missing(since, dry_run=args.dry_run, limit=args.limit)
         return
 
     state = load_state()
 
-    # Cadence gate (skipped by --once)
+    # Cadence gate (skipped by --once) — cheap skip before any token/network work.
     if not args.once:
         should_act, interval = cadence_should_act(state, now)
         if not should_act:
             log(f"Cadence not elapsed (interval={interval}m) — skipping this fire.")
             return
+
+    if not SQUARE_ACCESS_TOKEN:
+        log("SQUARE_ACCESS_TOKEN not set in .env — cannot poll. (See module header.)")
+        sys.exit(1)
 
     # Cursor: where to start fetching from
     since = args.since or state.get("last_polled_at")
