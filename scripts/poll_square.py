@@ -339,10 +339,27 @@ def backfill_missing(since_iso, dry_run=False, limit=None):
         page.set_default_timeout(bot.ACTION_TIMEOUT)
         try:
             bot.login(page)
+            # Warm up the Clients page once so the FIRST client's search inputs are
+            # hydrated — a cold first-search-after-login can otherwise come back with
+            # empty fields and zero results (observed for the first target).
+            try:
+                bot.navigate_to_clients(page)
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
             for t in targets:
                 rec = {**t, "found": "", "status": ""}
                 try:
-                    acct = bot.scrape_account_for_name(page, t["name"])
+                    # TA's Clients search is flaky (a search can intermittently
+                    # return zero rows). An empty result only ever causes a miss,
+                    # never a wrong write, so retry once before giving up.
+                    acct = ""
+                    for scrape_attempt in range(2):
+                        acct = bot.scrape_account_for_name(page, t["name"])
+                        if acct:
+                            break
+                        if scrape_attempt == 0:
+                            page.wait_for_timeout(1500)
                     if not acct:
                         rec["status"] = "NOT_FOUND_IN_TA"
                         log(f"  {t['name']}: no unique Account # found in TA — needs manual review")
