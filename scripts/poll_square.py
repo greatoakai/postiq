@@ -93,13 +93,15 @@ def save_state(state):
 LEDGER_DIR = bot.DATA_DIR / "poll_ledger"
 
 
-def record_ledger(payment_id, name, date, amount, status):
+def record_ledger(payment_id, name, date, amount, status, account=""):
     """Append/update a payment in the per-transaction-date ledger (idempotent by id).
 
     The ledger is the poller's record of what it did (or, in shadow mode, would
     do) each day — it's what the daily reconciliation diffs against the full CSV.
     `date` is MM/DD/YYYY (the Square transaction date). status is one of:
     OK / FAILED / ERROR / SKIPPED_NO_NAME / WOULD_POST (shadow).
+    `account` is the Square customer reference_id == TA "Account Number"
+    (C#########) used as the deterministic TA match key; "" if Square has none.
     """
     if not date:
         return
@@ -113,7 +115,7 @@ def record_ledger(payment_id, name, date, amount, status):
             entries = []
     entries = [e for e in entries if e.get("id") != payment_id]
     entries.append({"id": payment_id, "name": name, "date": date,
-                    "amount": amount, "status": status})
+                    "amount": amount, "status": status, "account": account})
     path.write_text(json.dumps(entries, indent=2))
 
 
@@ -165,35 +167,46 @@ def fetch_completed_payments(since_iso):
             return out
 
 
-_customer_name_cache = {}
+_customer_cache = {}
 
 
-def resolve_customer_name(customer_id):
-    """Resolve a Square customer_id to 'Given Family' (cached). Empty if unknown."""
+def resolve_customer(customer_id):
+    """Resolve a Square customer_id to {'name', 'account'} (cached).
+
+    name    : given_name + family_name — the client, matching the daily CSV's
+              "Full Name" (NOT the cardholder, who can be a parent/payer).
+    account : the customer's reference_id, which equals TA's "Account Number"
+              (C#########). This is the deterministic TA match key — it sidesteps
+              every name-matching failure (nicknames, misspellings, maiden names,
+              Jr/multi-word surnames). "" when Square has no reference_id set.
+    """
     if not customer_id:
-        return ""
-    if customer_id in _customer_name_cache:
-        return _customer_name_cache[customer_id]
-    name = ""
+        return {"name": "", "account": ""}
+    if customer_id in _customer_cache:
+        return _customer_cache[customer_id]
+    info = {"name": "", "account": ""}
     try:
         c = square_get(f"/v2/customers/{customer_id}").get("customer", {})
-        name = f"{(c.get('given_name') or '').strip()} {(c.get('family_name') or '').strip()}".strip()
+        info["name"] = f"{(c.get('given_name') or '').strip()} {(c.get('family_name') or '').strip()}".strip()
+        info["account"] = (c.get("reference_id") or "").strip()
     except Exception as e:
         log(f"  WARNING: could not resolve customer {customer_id}: {e}")
-    _customer_name_cache[customer_id] = name
-    return name
+    _customer_cache[customer_id] = info
+    return info
 
 
 def extract_payment_fields(p):
-    """Map a Square payment -> (name, date, amount).
+    """Map a Square payment -> (name, date, amount, account).
 
-    name   : the linked customer's given_name + family_name (the client), which
-             matches the daily CSV exporter's "Full Name" — NOT the cardholder
-             name (validated 2026-06-15 against the 6/13 CSV).
-    amount : the BASE applied to the client's balance = total / 1.03 (the client
-             pays a 3% card surcharge on top; that fee is not a payment toward
-             their therapy balance — matches the CSV "Base Amount" column).
-    date   : the payment's local (Central) transaction date, MM/DD/YYYY.
+    name    : the linked customer's given_name + family_name (the client), which
+              matches the daily CSV exporter's "Full Name" — NOT the cardholder
+              name (validated 2026-06-15 against the 6/13 CSV).
+    amount  : the BASE applied to the client's balance = total / 1.03 (the client
+              pays a 3% card surcharge on top; that fee is not a payment toward
+              their therapy balance — matches the CSV "Base Amount" column).
+    date    : the payment's local (Central) transaction date, MM/DD/YYYY.
+    account : the customer's reference_id == TA "Account Number" (C#########), the
+              deterministic match key. "" when Square has no reference_id set.
     """
     total_cents = (p.get("amount_money") or {}).get("amount", 0)
     amount = f"{round(total_cents / 100 / 1.03, 2):.2f}"
@@ -202,8 +215,8 @@ def extract_payment_fields(p):
         date = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone().strftime("%m/%d/%Y")
     except Exception:
         date = ""
-    name = resolve_customer_name(p.get("customer_id", ""))
-    return name, date, amount
+    cust = resolve_customer(p.get("customer_id", ""))
+    return cust["name"], date, amount, cust["account"]
 
 
 def post_new_payments(to_post, posted_ids):
@@ -218,7 +231,8 @@ def post_new_payments(to_post, posted_ids):
             for item in to_post:
                 try:
                     success, method, error, *_ = bot.post_payment(
-                        page, item["name"], item["date"], item["amount"])
+                        page, item["name"], item["date"], item["amount"],
+                        account=item.get("account"))
                     if success:
                         posted_ids.add(item["id"])
                         results.append({**item, "status": "OK", "method": method})
@@ -297,14 +311,15 @@ def main():
     # Build post list; flag any payment whose name can't be resolved (don't post blanks)
     to_post, unresolved = [], []
     for p in new:
-        name, date, amount = extract_payment_fields(p)
-        rec = {"id": p["id"], "name": name, "date": date, "amount": amount}
+        name, date, amount, account = extract_payment_fields(p)
+        rec = {"id": p["id"], "name": name, "date": date, "amount": amount, "account": account}
         (to_post if name else unresolved).append(rec)
     # --- DRY RUN: preview only, no side effects ---
     if args.dry_run:
         log("DRY RUN — would post:")
         for item in to_post:
-            log(f"  {item['name']} — ${item['amount']} on {item['date']} (sq:{item['id']})")
+            log(f"  {item['name']} — ${item['amount']} on {item['date']} "
+                f"[acct {item['account'] or 'NONE'}] (sq:{item['id']})")
         for u in unresolved:
             log(f"  SKIP (no name) ${u['amount']} on {u['date']} (sq:{u['id']})")
         return
@@ -313,10 +328,13 @@ def main():
     if args.shadow:
         log("SHADOW — recording would-post to ledger (no posting):")
         for item in to_post:
-            record_ledger(item["id"], item["name"], item["date"], item["amount"], "WOULD_POST")
-            log(f"  WOULD POST {item['name']} ${item['amount']} on {item['date']}")
+            record_ledger(item["id"], item["name"], item["date"], item["amount"],
+                          "WOULD_POST", item["account"])
+            log(f"  WOULD POST {item['name']} ${item['amount']} on {item['date']} "
+                f"[acct {item['account'] or 'NONE'}]")
         for u in unresolved:
-            record_ledger(u["id"], u["name"], u["date"], u["amount"], "SKIPPED_NO_NAME")
+            record_ledger(u["id"], u["name"], u["date"], u["amount"],
+                          "SKIPPED_NO_NAME", u["account"])
             log(f"  SKIP (no name) ${u['amount']} on {u['date']} (sq:{u['id']})")
         state.update(last_polled_at=next_cursor, last_action_at=now.isoformat())
         save_state(state)
@@ -325,11 +343,13 @@ def main():
 
     # --- LIVE: post for real, record outcomes to the ledger ---
     for u in unresolved:
-        record_ledger(u["id"], u["name"], u["date"], u["amount"], "SKIPPED_NO_NAME")
+        record_ledger(u["id"], u["name"], u["date"], u["amount"],
+                      "SKIPPED_NO_NAME", u["account"])
         log(f"  SKIP (no name resolved) ${u['amount']} on {u['date']} (sq:{u['id']}) — needs manual posting")
     results = post_new_payments(to_post, posted_ids)
     for r in results:
-        record_ledger(r["id"], r["name"], r["date"], r["amount"], r["status"])
+        record_ledger(r["id"], r["name"], r["date"], r["amount"],
+                      r["status"], r.get("account", ""))
     state.update(
         posted_payment_ids=sorted(posted_ids),
         last_polled_at=next_cursor,
