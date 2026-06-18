@@ -40,11 +40,10 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 # committing. Defaults to the historical behaviour.
 CHARGES_MODAL_CHOICE = os.getenv("CHARGES_MODAL_CHOICE", "this_appointment").strip().lower()
 
-# Account-Number-first client matching (search_client_by_account). Off by default:
-# as of 2026-06-18 the TA Account Number search field doesn't return results even
-# for valid accounts (needs debugging), so the account path is dead weight that
-# only falls back to name search. Backfill still collects reference_ids. Flip to
-# "on" in .env once the account search is fixed and verified.
+# Account-Number-first client matching (search_client_by_account). TA's account
+# field shows a fixed 'C' prefix icon, so the search types digits only (fixed +
+# verified 2026-06-18 against Doud C007660727). Enable with ACCOUNT_MATCH=on in
+# .env; default off falls back to the proven name matching.
 ACCOUNT_MATCH_ENABLED = os.getenv("ACCOUNT_MATCH", "off").strip().lower() == "on"
 
 ACTION_TIMEOUT = 30000
@@ -750,7 +749,11 @@ def search_client_by_account(page, account):
     if not account:
         return False, "no account number"
 
-    print(f"  [acct] Searching by Account Number: {account}")
+    # TA's Account # field renders a fixed 'C' prefix icon, so the input takes
+    # only the digits — filling the full 'C#########' searches for the wrong value
+    # and returns nothing. Type the digits; still match the full account on the row.
+    search_value = account[1:] if account[:1].upper() == "C" else account
+    print(f"  [acct] Searching by Account Number: {account} (typing '{search_value}')")
     rows = None
     for attempt in range(3):
         try:
@@ -761,7 +764,7 @@ def search_client_by_account(page, account):
                     page.wait_for_timeout(2000)
                     continue
                 return False, "account field not found"
-            acct_input.fill(account)
+            acct_input.fill(search_value)
             page.locator("button:has-text('Search')").first.click()
             page.wait_for_load_state("networkidle")
             page.wait_for_timeout(2000)
