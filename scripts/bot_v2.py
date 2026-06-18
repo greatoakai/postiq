@@ -40,6 +40,13 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 # committing. Defaults to the historical behaviour.
 CHARGES_MODAL_CHOICE = os.getenv("CHARGES_MODAL_CHOICE", "this_appointment").strip().lower()
 
+# Account-Number-first client matching (search_client_by_account). Off by default:
+# as of 2026-06-18 the TA Account Number search field doesn't return results even
+# for valid accounts (needs debugging), so the account path is dead weight that
+# only falls back to name search. Backfill still collects reference_ids. Flip to
+# "on" in .env once the account search is fixed and verified.
+ACCOUNT_MATCH_ENABLED = os.getenv("ACCOUNT_MATCH", "off").strip().lower() == "on"
+
 ACTION_TIMEOUT = 30000
 
 
@@ -694,29 +701,34 @@ def _try_search(page, search_name):
 
 
 def _resolve_account_input(page, timeout_ms=8000):
-    """Locate the 'Account Number' search input on the Clients page.
+    """Locate the 'Account Number' SEARCH INPUT on the Clients page.
 
-    TA's account field is a Vuetify text input whose id is dynamic (input-NNN),
-    so we NEVER key off the id. Resolution order (accessibility-anchored first):
-      1. get_by_label('Account Number')      — the <label for=…> association
-      2. get_by_placeholder('Account Number')
-      3. input[role='searchbox'][maxlength='10'] — distinctive attribute combo
-         (account numbers are 'C' + 9 digits = 10 chars)
+    Must target the <input> specifically: the results table renders each account
+    as a <td aria-label="Account Number for <name>">, which a loose
+    get_by_label('Account Number') matches — then fill() fails on the <td>. So we
+    select the input by attributes / exact label and verify the tag before use.
+    Resolution order (id is dynamic Vuetify input-NNN — never keyed on):
+      1. input[role='searchbox'][maxlength='10'] — the account box (C + 9 digits)
+      2. get_by_label('Account Number', exact=True) — exact name excludes the
+         'Account Number for <name>' result cells
+      3. get_by_placeholder('Account Number')
 
-    Returns a ready-to-fill Locator, or None if none resolve within the timeout.
-    The 'Account Number' column header is a <th>, not a <label>, so get_by_label
-    won't collide with it.
+    Returns a ready-to-fill <input> Locator, or None if none resolve in time.
     """
     per_step = max(1500, timeout_ms // 3)
     candidates = [
-        page.get_by_label("Account Number"),
-        page.get_by_placeholder("Account Number"),
         page.locator("input[role='searchbox'][maxlength='10']"),
+        page.get_by_label("Account Number", exact=True),
+        page.get_by_placeholder("Account Number"),
     ]
     for loc in candidates:
         try:
-            loc.first.wait_for(state="visible", timeout=per_step)
-            return loc.first
+            el = loc.first
+            el.wait_for(state="visible", timeout=per_step)
+            # Guard against matching a results <td> (or any non-field element).
+            if (el.evaluate("e => e.tagName") or "").lower() != "input":
+                continue
+            return el
         except Exception:
             continue
     return None
@@ -860,8 +872,9 @@ def search_client(page, name, account=None):
     extra name part, or if the bot had to use an alternate name to find the client.
     """
     # Step 0: Deterministic match by Account Number (Square reference_id), when
-    # available. Falls through to name resolution on any miss or unresolved field.
-    if account:
+    # available AND enabled. Falls through to name resolution on any miss. Gated
+    # by ACCOUNT_MATCH_ENABLED — off until TA's account search is fixed/verified.
+    if account and ACCOUNT_MATCH_ENABLED:
         try:
             ok, acct_note = search_client_by_account(page, account)
             if ok:
