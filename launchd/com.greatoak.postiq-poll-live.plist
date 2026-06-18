@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.greatoak.postiq-poll-live — LIVE near-real-time Square -> TA poster.
+
+  Runs poll_square.py (NO --shadow): it POSTS payments to TherapyAppointment in
+  near-real-time. Fires every 30 min (:00/:30); poll_square's own cadence acts
+  every fire during business hours, hourly off-hours.
+
+  *** DO NOT load this while com.greatoak.postiq (the daily CSV batch) still
+  posts — they would double-post the same payments. Disable the batch first. ***
+
+  INSTALL (cutover):
+    launchctl unload ~/Library/LaunchAgents/com.greatoak.postiq-poll-shadow.plist
+    launchctl unload ~/Library/LaunchAgents/com.greatoak.postiq.plist   # stop daily batch posting
+    cp launchd/com.greatoak.postiq-poll-live.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.greatoak.postiq-poll-live.plist
+  ROLLBACK:
+    launchctl unload ~/Library/LaunchAgents/com.greatoak.postiq-poll-live.plist
+    launchctl load ~/Library/LaunchAgents/com.greatoak.postiq-poll-shadow.plist
+    launchctl load ~/Library/LaunchAgents/com.greatoak.postiq.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.greatoak.postiq-poll-live</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/travmegsam/Developer/postiq-dev/scripts/poll_square.py</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/poll_live_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/poll_live_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/travmegsam</string>
+        <key>HEADLESS</key>
+        <string>true</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
