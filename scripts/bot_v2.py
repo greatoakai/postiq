@@ -754,7 +754,7 @@ def search_client_by_account(page, account):
     # and returns nothing. Type the digits; still match the full account on the row.
     search_value = account[1:] if account[:1].upper() == "C" else account
     print(f"  [acct] Searching by Account Number: {account} (typing '{search_value}')")
-    rows = None
+    matching = []
     for attempt in range(3):
         try:
             navigate_to_clients(page)
@@ -769,20 +769,25 @@ def search_client_by_account(page, account):
             page.wait_for_load_state("networkidle")
             page.wait_for_timeout(2000)
             screenshot(page, f"search_acct_{account}")
-            rows = page.locator("table tr").all()
-            break
+            matching = _rows_matching_account(page.locator("table tr").all(), account)
+            if not matching:
+                inactive_rows = _try_inactive_clients(page)
+                if inactive_rows is not None:
+                    matching = _rows_matching_account(inactive_rows, account)
+            if matching:
+                break
+            # 0 results: TA's Clients search intermittently flakes to empty for a
+            # valid query (same flake the backfill hit). Retry before giving up.
+            if attempt < 2:
+                print(f"  [acct] attempt {attempt + 1}: 0 results (TA search can flake); retrying...")
+                page.wait_for_timeout(1500)
+                continue
         except Exception as e:
             if attempt < 2:
                 print(f"  [acct] attempt {attempt + 1} transient error ({e}); retrying...")
                 page.wait_for_timeout(2000)
                 continue
             return False, f"account search error: {e}"
-
-    matching = _rows_matching_account(rows, account)
-    if len(matching) == 0:
-        inactive_rows = _try_inactive_clients(page)
-        if inactive_rows is not None:
-            matching = _rows_matching_account(inactive_rows, account)
 
     if len(matching) > 1:
         # Account numbers are unique; more than one match means something is wrong.
