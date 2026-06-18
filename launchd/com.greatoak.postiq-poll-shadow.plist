@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.greatoak.postiq-poll-shadow — SHADOW proving run for the Square poller.
+
+  Runs poll_square.py from the dev-test worktree in --shadow mode every 30 min:
+  it records what it WOULD post to the per-day ledger but posts NOTHING, so the
+  live daily batch keeps posting untouched (no double-post, zero risk).
+
+  START the proving window:
+    cp launchd/com.greatoak.postiq-poll-shadow.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.greatoak.postiq-poll-shadow.plist
+  Each morning, reconcile that day against the CSV (CLEAN = poller matched it):
+    python3 /Users/travmegsam/Developer/postiq-dev/scripts/reconcile.py --date MM.DD.YYYY
+  STOP after ~3-5 clean days, before cutover:
+    launchctl unload ~/Library/LaunchAgents/com.greatoak.postiq-poll-shadow.plist
+    rm ~/Library/LaunchAgents/com.greatoak.postiq-poll-shadow.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.greatoak.postiq-poll-shadow</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/travmegsam/Developer/postiq-dev/scripts/poll_square.py</string>
+        <string>--shadow</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/poll_shadow_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/poll_shadow_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/travmegsam</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

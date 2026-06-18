@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import unicodedata
@@ -38,6 +39,12 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 # Kept as an env flag so the behaviour can be A/B tested via a dry run before
 # committing. Defaults to the historical behaviour.
 CHARGES_MODAL_CHOICE = os.getenv("CHARGES_MODAL_CHOICE", "this_appointment").strip().lower()
+
+# Account-Number-first client matching (search_client_by_account). TA's account
+# field shows a fixed 'C' prefix icon, so the search types digits only (fixed +
+# verified 2026-06-18 against Doud C007660727). Enable with ACCOUNT_MATCH=on in
+# .env; default off falls back to the proven name matching.
+ACCOUNT_MATCH_ENABLED = os.getenv("ACCOUNT_MATCH", "off").strip().lower() == "on"
 
 ACTION_TIMEOUT = 30000
 
@@ -692,10 +699,178 @@ def _try_search(page, search_name):
     return matching
 
 
-def search_client(page, name):
-    """Search for a client by first and last name. Returns True if a unique match was clicked.
+def _resolve_account_input(page, timeout_ms=8000):
+    """Locate the 'Account Number' SEARCH INPUT on the Clients page.
 
-    Resolution order (stops at first unique match):
+    Must target the <input> specifically: the results table renders each account
+    as a <td aria-label="Account Number for <name>">, which a loose
+    get_by_label('Account Number') matches — then fill() fails on the <td>. So we
+    select the input by attributes / exact label and verify the tag before use.
+    Resolution order (id is dynamic Vuetify input-NNN — never keyed on):
+      1. input[role='searchbox'][maxlength='10'] — the account box (C + 9 digits)
+      2. get_by_label('Account Number', exact=True) — exact name excludes the
+         'Account Number for <name>' result cells
+      3. get_by_placeholder('Account Number')
+
+    Returns a ready-to-fill <input> Locator, or None if none resolve in time.
+    """
+    per_step = max(1500, timeout_ms // 3)
+    candidates = [
+        page.locator("input[role='searchbox'][maxlength='10']"),
+        page.get_by_label("Account Number", exact=True),
+        page.get_by_placeholder("Account Number"),
+    ]
+    for loc in candidates:
+        try:
+            el = loc.first
+            el.wait_for(state="visible", timeout=per_step)
+            # Guard against matching a results <td> (or any non-field element).
+            if (el.evaluate("e => e.tagName") or "").lower() != "input":
+                continue
+            return el
+        except Exception:
+            continue
+    return None
+
+
+def search_client_by_account(page, account):
+    """Find a client by TA 'Account Number' (== the Square customer reference_id).
+
+    This is the deterministic match path: account numbers are unique, so it
+    sidesteps every name-matching failure (nicknames, misspellings, maiden
+    names, Jr / multi-word surnames).
+
+    Returns (True, note) on a unique match (client profile opened), or
+    (False, reason) on a plain miss / unresolved field so the caller can fall
+    back to name search. Raises only with a FLAG on the can't-happen case of
+    multiple clients sharing one account number.
+    """
+    account = (account or "").strip()
+    if not account:
+        return False, "no account number"
+
+    # TA's Account # field renders a fixed 'C' prefix icon, so the input takes
+    # only the digits — filling the full 'C#########' searches for the wrong value
+    # and returns nothing. Type the digits; still match the full account on the row.
+    search_value = account[1:] if account[:1].upper() == "C" else account
+    print(f"  [acct] Searching by Account Number: {account} (typing '{search_value}')")
+    matching = []
+    for attempt in range(3):
+        try:
+            navigate_to_clients(page)
+            acct_input = _resolve_account_input(page)
+            if acct_input is None:
+                if attempt < 2:
+                    page.wait_for_timeout(2000)
+                    continue
+                return False, "account field not found"
+            acct_input.fill(search_value)
+            page.locator("button:has-text('Search')").first.click()
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(2000)
+            screenshot(page, f"search_acct_{account}")
+            matching = _rows_matching_account(page.locator("table tr").all(), account)
+            if not matching:
+                inactive_rows = _try_inactive_clients(page)
+                if inactive_rows is not None:
+                    matching = _rows_matching_account(inactive_rows, account)
+            if matching:
+                break
+            # 0 results: TA's Clients search intermittently flakes to empty for a
+            # valid query (same flake the backfill hit). Retry before giving up.
+            if attempt < 2:
+                print(f"  [acct] attempt {attempt + 1}: 0 results (TA search can flake); retrying...")
+                page.wait_for_timeout(1500)
+                continue
+        except Exception as e:
+            if attempt < 2:
+                print(f"  [acct] attempt {attempt + 1} transient error ({e}); retrying...")
+                page.wait_for_timeout(2000)
+                continue
+            return False, f"account search error: {e}"
+
+    if len(matching) > 1:
+        # Account numbers are unique; more than one match means something is wrong.
+        raise Exception(f"FLAG: Multiple clients matched Account # {account} — needs manual review")
+    if len(matching) == 0:
+        return False, f"Account # {account} not found"
+
+    row, link = matching[0]
+    print(f"  [acct] Found client: {row.text_content().strip()[:60]}")
+    link.click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
+    return True, f"Matched by Account # {account}"
+
+
+# TA Account # token: 'C' + 9 digits (the Clients search field caps at 10 chars).
+_ACCOUNT_RE = re.compile(r"\bC\d{9}\b")
+
+
+def _account_from_row(row):
+    """Return the TA Account # (C#########) from a Clients results row, or ''.
+
+    Matched against the row's concatenated cell text. Returns a value ONLY when
+    exactly one account-shaped token is present — if zero or more than one match
+    (e.g. another 'C#########' token slipped into the row), return '' so callers
+    fail safe (fall back to name search / skip the backfill) rather than act on a
+    guessed number.
+    """
+    found = set(_ACCOUNT_RE.findall(row.text_content() or ""))
+    return found.pop() if len(found) == 1 else ""
+
+
+def _rows_matching_account(rows, account):
+    """Rows whose Account # exactly equals `account` (and that contain a link).
+
+    Exact match (not substring) — avoids a shorter account matching inside a
+    longer one, or the digits colliding with another numeric cell in the row.
+    """
+    out = []
+    for row in rows:
+        if _account_from_row(row) == account:
+            links = row.locator("a")
+            if links.count() > 0:
+                out.append((row, links.first))
+    return out
+
+
+def scrape_account_for_name(page, name):
+    """Name-search for a client and return their TA Account # (C#########), or ''.
+
+    Reuses the same name-resolution chain as search_client (alias → as-is →
+    normalized → nickname variations) but does NOT open the profile — it only
+    reads the Account # from the unique results row. Returns '' if the client
+    can't be uniquely matched (so a wrong number is never written back).
+    Used by the Square reference_id backfill (poll_square --backfill-missing).
+    """
+    resolved = resolve_name(name)
+    norm = normalize_name(resolved)
+
+    # Ordered candidate search names: as-is, normalized (if different), then
+    # nickname variations — the same ladder search_client() walks.
+    candidates = [resolved]
+    if norm != resolved:
+        candidates.append(norm)
+    candidates.extend(var_name for var_name, _ in get_name_variations(resolved))
+
+    for candidate in candidates:
+        rows = _try_search(page, candidate)
+        if len(rows) == 1:
+            return _account_from_row(rows[0][0])
+
+    return ""
+
+
+def search_client(page, name, account=None):
+    """Search for a client and open their profile. Returns (True, note) on a unique match.
+
+    When an `account` (TA Account Number == Square reference_id) is supplied, try
+    it first — it's a deterministic, unique key. Fall back to the name-resolution
+    chain below on any miss or unresolved field, so behavior is unchanged when no
+    account is available (e.g. the daily CSV batch passes none).
+
+    Name-resolution order (stops at first unique match):
         1. Explicit alias from name_aliases.json (resolve_name)
         2. Original name as-is
         3. Normalized name (strip accents / fix encoding)
@@ -704,6 +879,20 @@ def search_client(page, name):
     Also returns a note string if the CSV name contains a middle name or
     extra name part, or if the bot had to use an alternate name to find the client.
     """
+    # Step 0: Deterministic match by Account Number (Square reference_id), when
+    # available AND enabled. Falls through to name resolution on any miss. Gated
+    # by ACCOUNT_MATCH_ENABLED — off until TA's account search is fixed/verified.
+    if account and ACCOUNT_MATCH_ENABLED:
+        try:
+            ok, acct_note = search_client_by_account(page, account)
+            if ok:
+                return True, acct_note
+            print(f"  [acct] {acct_note} — falling back to name search")
+        except Exception as e:
+            if "FLAG" in str(e):
+                raise
+            print(f"  [acct] account search errored ({e}) — falling back to name search")
+
     first, last = split_first_last(name)
     parts = name.split()
     # Middle parts: everything between first and last, excluding suffixes
@@ -1207,16 +1396,17 @@ def submit_payment(page, name, dry_run=False):
     return True
 
 
-def post_payment_v2(page, name, date, amount, dry_run=False):
+def post_payment_v2(page, name, date, amount, dry_run=False, account=None):
     """V2 flow: Clients > Appointments > Accept Payment.
 
     Returns (success: bool, note: str or None). Raises on hard failure
-    so the caller can fall back to V1.
+    so the caller can fall back to V1. `account` is the TA Account Number
+    (Square reference_id) used for deterministic client matching when present.
     """
     print(f"  [V2] Clients > Appointments > Accept Payment")
 
     # search_client() handles its own navigation to the Clients page
-    _ok, name_note = search_client(page, name)
+    _ok, name_note = search_client(page, name, account=account)
     navigate_to_appointments(page)
     ensure_date_filters(page)
     date_note = click_appointment_by_date(page, date, name)
@@ -1455,7 +1645,7 @@ def post_payment_v1(page, name, amount, dry_run=False):
 # MAIN LOGIC: Try V2, fallback to V1, then fail
 # =============================================================================
 
-def post_payment(page, name, date, amount, dry_run=False):
+def post_payment(page, name, date, amount, dry_run=False, account=None):
     """
     Post a payment with retry and fallback logic:
     1. Try V2 (Clients > Appointments > Accept Payment)
@@ -1467,13 +1657,16 @@ def post_payment(page, name, date, amount, dry_run=False):
     - v2_error: why V2 failed, so the report can show it (V1 only)
     - balance_amount: 'Due From Client Now' for the report's Amount-due column
       (V2 outstanding-balance clients only; None otherwise)
+    `account` is the TA Account Number (Square reference_id); when present, V2
+    matches the client by it deterministically and only falls back to name on a
+    miss. V1 (the billing-autocomplete fallback) remains name-based.
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
 
     # --- Attempt 1: V2 flow ---
     v2_error = None
     try:
-        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run)
+        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run, account=account)
         if not ok:
             raise Exception("V2 returned ok=False")
         return True, "V2", None, note, None, None, balance_amount
@@ -1486,7 +1679,7 @@ def post_payment(page, name, date, amount, dry_run=False):
     # --- Attempt 2: Retry V2 with fresh navigation ---
     print(f"  Retrying V2...")
     try:
-        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run)
+        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run, account=account)
         if not ok:
             raise Exception("V2-retry returned ok=False")
         return True, "V2-retry", None, note, None, None, balance_amount

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.greatoak.postiq-poll — near-real-time Square -> TA poster (dev-test).
+
+  TEMPLATE — NOT INSTALLED. Do not `launchctl load` this until:
+    1. SQUARE_ACCESS_TOKEN is in .env
+    2. poll_square.py payer-name extraction is validated (see its header)
+    3. The feature is merged to main (this points at the production path)
+
+  Fires every 30 min around the clock (Minute 0 and Minute 30). poll_square.py
+  itself decides whether to act: every fire during business hours (Mon-Fri
+  08:00-18:30 local), hourly otherwise. Install with:
+    cp launchd/com.greatoak.postiq-poll.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.greatoak.postiq-poll.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.greatoak.postiq-poll</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/travmegsam/Developer/postiq/scripts/poll_square.py</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/travmegsam/Developer/postiq/logs/poll_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/travmegsam/Developer/postiq/logs/poll_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/travmegsam</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

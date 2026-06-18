@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.greatoak.postiq-backfill — self-heal missing Square Account #s.
+
+  Runs poll_square.py --backfill-missing (LIVE: WRITES customer.reference_id to
+  PRODUCTION Square) from the dev-test worktree. Posts NO payments. For each
+  recent COMPLETED payment whose Square customer has no reference_id, it looks
+  the client up in TA by name, scrapes their Account #, and writes it back.
+
+  Fires hourly at :45 (offset from the :00/:30 shadow poller so two TA browser
+  sessions don't overlap), 08:45-18:45 local, every day. It's a cheap no-op when
+  nothing is missing — it only opens a TA browser session when there is actually
+  a customer to heal, so weekend/idle fires just do a quick Square read.
+
+  INSTALL (only after authorizing production Square writes):
+    cp launchd/com.greatoak.postiq-backfill.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.greatoak.postiq-backfill.plist
+  UNINSTALL:
+    launchctl unload ~/Library/LaunchAgents/com.greatoak.postiq-backfill.plist
+    rm ~/Library/LaunchAgents/com.greatoak.postiq-backfill.plist
+  To preview without writing, add a <string>--dry-run</string> arg below.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.greatoak.postiq-backfill</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/travmegsam/Developer/postiq-dev/scripts/poll_square.py</string>
+        <string>--backfill-missing</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>45</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/backfill_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/travmegsam/Developer/postiq-dev/logs/backfill_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/travmegsam</string>
+        <key>HEADLESS</key>
+        <string>true</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
