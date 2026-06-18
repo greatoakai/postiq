@@ -96,10 +96,14 @@ Please review the other files manually."
     send_email "[PostIQ] ALERT: Multiple unprocessed CSV files" "$alert_msg"
 fi
 
-# Run the bot — emails are sent automatically by bot_v2.py
-log "Running bot on: $newest_name"
+# Run the bot — emails are sent automatically by bot_v2.py.
+# REPORT-ONLY (--dry-run) as of the 2026-06-18 shadow->live cutover: the live
+# poller (poll_square / com.greatoak.postiq-poll-live) now does the real posting,
+# so this daily batch posts NOTHING (avoids double-posting) but still emails the
+# morning "Oakley's PostIQ Report" exception view. Remove --dry-run to revert.
+log "Running bot on: $newest_name (REPORT-ONLY / --dry-run)"
 BOT_EXIT=0
-BOT_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/bot_v2.py" "$newest" 2>&1) || BOT_EXIT=$?
+BOT_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/bot_v2.py" "$newest" --dry-run 2>&1) || BOT_EXIT=$?
 echo "$BOT_OUTPUT" >> "$LOGFILE"
 
 # If bot crashed before it could send its own report, alert Travis
