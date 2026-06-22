@@ -1036,6 +1036,28 @@ def ensure_date_filters(page):
     print(f"  Filters set: {expected_from} — {expected_to}")
 
 
+def _appt_target_eligible(link):
+    """Is this TA appointment row a valid payment target?
+
+    Post to Active appointments and to chargeable cancellations (no-show /
+    late-cancel fees). Skip 'Rescheduled to ...' (the slot was moved — the real
+    appointment is a different row) and plain 'Cancelled' (no charge). Keep
+    anything unreadable/unknown so we never drop a real appointment on a status
+    we couldn't parse.
+    """
+    try:
+        t = (link.locator("xpath=ancestor::tr").text_content() or "").lower()
+    except Exception:
+        return True
+    if "reschedul" in t:
+        return False  # moved to another date — the real appointment is elsewhere
+    if "no show" in t or "noshow" in t or "late cancel" in t or "latecancel" in t:
+        return True   # chargeable cancellation fee
+    if "cancel" in t:
+        return False  # plain cancellation, no charge
+    return True       # active or unrecognized status
+
+
 def click_appointment_by_date(page, date_str, name):
     """Find and click an appointment row matching the given date.
 
@@ -1044,9 +1066,11 @@ def click_appointment_by_date(page, date_str, name):
 
     Resolution order:
       1. Exact date match on the transaction date
-      2. If no exact match, scan all visible appointment links for dates
-         within 60 days prior. Pick the closest date to the original.
-      3. If multiple appointments on the same closest date, flag for review.
+      2. If no exact match, scan visible appointment links within
+         APPT_MATCH_LOOKBACK_DAYS prior, keep only valid posting targets
+         (_appt_target_eligible — Active / chargeable cancellation, never a
+         rescheduled or plainly-cancelled slot), then pick the closest.
+      3. If multiple valid appointments share the closest date, flag for review.
 
     Returns a note string if a nearby (non-exact) date was used, or None
     if the exact date matched.
@@ -1077,26 +1101,15 @@ def click_appointment_by_date(page, date_str, name):
         return None  # exact match, no note needed
 
     if len(date_links) > 1:
-        # Multiple rows on the same date — filter to only "Active" appointments
-        # (rescheduled slots stay as rows with "Rescheduled to..." status)
-        active_links = []
-        for link in date_links:
-            try:
-                row = link.locator("xpath=ancestor::tr")
-                row_text = (row.text_content() or "").strip()
-                # Check that the row contains "Active" as a status,
-                # but NOT "Rescheduled" or "Cancelled"
-                if "\tActive" in row_text or row_text.endswith("Active"):
-                    active_links.append(link)
-            except Exception:
-                continue
-
-        if len(active_links) == 1:
-            print(f"  Multiple rows on {ta_date}, picking Active appointment")
-            active_links[0].click()
+        # Multiple rows on the same date — keep only valid posting targets
+        # (Active or chargeable cancellation; drop Rescheduled / plain Cancelled).
+        eligible = [l for l in date_links if _appt_target_eligible(l)]
+        if len(eligible) == 1:
+            print(f"  Multiple rows on {ta_date}, picking the eligible appointment")
+            eligible[0].click()
             page.wait_for_load_state("networkidle")
             page.wait_for_timeout(1000)
-            return None  # resolved via Active status
+            return None  # resolved via status
 
         raise Exception(
             f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review"
@@ -1140,34 +1153,27 @@ def click_appointment_by_date(page, date_str, name):
     if not candidates:
         raise Exception(f"No appointment found on {ta_date} for {name}")
 
+    # Keep only valid posting targets BEFORE choosing the closest date, so a
+    # payment skips e.g. a "Rescheduled to ..." slot (Travis Friga 6/18 -> both
+    # rescheduled to 6/16) and falls through to the real Active appointment.
+    candidates = [c for c in candidates if _appt_target_eligible(c["link"])]
+    if not candidates:
+        raise Exception(
+            f"No active appointment within {APPT_MATCH_LOOKBACK_DAYS} days of {ta_date} for {name}"
+        )
+
     # Sort by proximity (closest first)
     candidates.sort(key=lambda c: c["days_diff"])
 
-    # Check if the closest date has multiple appointments
+    # Flag only if multiple VALID appointments share the closest date.
     closest_date = candidates[0]["date_str"]
     same_date = [c for c in candidates if c["date_str"] == closest_date]
-
     if len(same_date) > 1:
-        # Filter to only Active appointments (exclude Rescheduled/Cancelled)
-        active_candidates = []
-        for c in same_date:
-            try:
-                row = c["link"].locator("xpath=ancestor::tr")
-                row_text = (row.text_content() or "").strip()
-                if "\tActive" in row_text or row_text.endswith("Active"):
-                    active_candidates.append(c)
-            except Exception:
-                continue
+        raise Exception(
+            f"FLAG: Multiple active appointments near {ta_date} on {closest_date} "
+            f"for {name} — needs manual review"
+        )
 
-        if len(active_candidates) == 1:
-            same_date = active_candidates
-        else:
-            raise Exception(
-                f"FLAG: Multiple appointments near {ta_date} on {closest_date} "
-                f"for {name} — needs manual review"
-            )
-
-    # Click the closest appointment (use same_date which may be active-filtered)
     chosen = same_date[0]
     print(
         f"  Nearest appointment found: {chosen['text'][:60]} "
