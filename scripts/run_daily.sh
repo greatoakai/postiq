@@ -1,5 +1,6 @@
 #!/bin/bash
-# run_daily.sh — Watch for new Square CSV, run PostIQ bot, email report
+# run_daily.sh — Sync the day's Square CSV from S3 and archive it for reconciliation.
+# The live poller posts; com.greatoak.postiq-reconcile emails the single daily report.
 # Called by LaunchAgent or manually
 
 set -euo pipefail
@@ -96,46 +97,14 @@ Please review the other files manually."
     send_email "[PostIQ] ALERT: Multiple unprocessed CSV files" "$alert_msg"
 fi
 
-# Run the bot — emails are sent automatically by bot_v2.py.
-# REPORT-ONLY (--dry-run) as of the 2026-06-18 shadow->live cutover: the live
-# poller (poll_square / com.greatoak.postiq-poll-live) now does the real posting,
-# so this daily batch posts NOTHING (avoids double-posting) but still emails the
-# morning "Oakley's PostIQ Report" exception view. Remove --dry-run to revert.
-log "Running bot on: $newest_name (REPORT-ONLY / --dry-run)"
-BOT_EXIT=0
-BOT_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/bot_v2.py" "$newest" --dry-run 2>&1) || BOT_EXIT=$?
-echo "$BOT_OUTPUT" >> "$LOGFILE"
-
-# If bot crashed before it could send its own report, alert Travis
-if [ "$BOT_EXIT" -ne 0 ]; then
-    log "ERROR: Bot exited with code $BOT_EXIT"
-    # Grab the last 50 lines of output for context
-    error_tail=$(echo "$BOT_OUTPUT" | tail -50)
-    msmtp -t <<ERRMSG
-To: travis@greatoakcounseling.com
-From: Oakley, Great Oak AI Assistant <travis@greatoakcounseling.com>
-Subject: [PostIQ] SYSTEM ERROR — bot did not complete
-MIME-Version: 1.0
-Content-Type: text/plain; charset=utf-8
-
-The PostIQ daily run failed before it could generate a report.
-
-CSV file: $newest_name
-Exit code: $BOT_EXIT
-Time: $(date '+%Y-%m-%d %H:%M:%S')
-
---- Last 50 lines of output ---
-
-$error_tail
-
---- End of output ---
-
-Check the full log at: $LOGFILE
-
-Oakley, Great Oak Counseling's AI Assistant
-ERRMSG
-    log "Crash alert emailed to Travis."
-fi
+# NOTE (2026-06-22): this job no longer runs bot_v2.py.
+# Since the shadow->live cutover, the live poller (com.greatoak.postiq-poll-live)
+# does the real posting in near-real-time, and com.greatoak.postiq-reconcile emails
+# the single daily report (poller ledger vs this CSV). The old report-only
+# `bot_v2.py --dry-run` step was removed to stop the redundant "DRY RUN — ERRORS
+# DETECTED" staff + tech emails (they re-simulated a batch that posts nothing).
+# This job now only syncs the day's CSV from S3 (above) and archives it (below) so
+# the reconcile has it to compare against.
 
 # Mark as processed (even on failure, to avoid retry loops —
 # failed files should be re-run manually after fixing the issue)
