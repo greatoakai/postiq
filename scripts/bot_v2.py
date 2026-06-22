@@ -972,13 +972,26 @@ def navigate_to_appointments(page):
     page.wait_for_timeout(1000)
 
 
+# How far back click_appointment_by_date() will match an appointment to a payment.
+# The Appointments filter (ensure_date_filters) MUST be wider than this, or
+# matchable appointments get hidden from the list — e.g. Cassie Chitty 6/19: her
+# 6/2 appointment was 17 days back, but a 15-day filter started 6/4 and hid it,
+# producing a false "no appointment found". Defined once so the two windows can't
+# drift apart again.
+APPT_MATCH_LOOKBACK_DAYS = 60
+
+
 def ensure_date_filters(page):
     """Set the Appointments filter dates on every client visit.
 
-    Sets From = 15 days before today, To = 12/31/{year}.
-    Always re-applies because TA resets filters when navigating between clients.
+    Sets From = (APPT_MATCH_LOOKBACK_DAYS + 10) days before today, To = 12/31/{year}.
+    The filter is derived from the matcher's lookback so it's always wider; the
+    +10 buffer absorbs the gap between when a payment is processed (anchored to
+    'now') and the payment's own date (the matcher anchors to that — the batch
+    runs the next morning, and the poller can lag if the Mac was off). Always
+    re-applies because TA resets filters when navigating between clients.
     """
-    from_date = datetime.now() - timedelta(days=15)
+    from_date = datetime.now() - timedelta(days=APPT_MATCH_LOOKBACK_DAYS + 10)
     year = datetime.now().year
     expected_from = from_date.strftime("%m/%d/%Y")
     expected_to = f"12/31/{year}"
@@ -1111,9 +1124,9 @@ def click_appointment_by_date(page, date_str, name):
             link_date_str = match.group(1)
             link_dt = datetime.strptime(link_date_str, "%m/%d/%Y")
 
-            # Only consider dates within 60 days BEFORE the target (not after)
+            # Only consider dates within the lookback window BEFORE the target (not after)
             days_diff = (target_dt - link_dt).days
-            if 0 < days_diff <= 60:
+            if 0 < days_diff <= APPT_MATCH_LOOKBACK_DAYS:
                 candidates.append({
                     "link": link,
                     "date_str": link_date_str,
