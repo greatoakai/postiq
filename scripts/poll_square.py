@@ -191,6 +191,43 @@ def update_customer_reference(customer_id, account):
     return confirmed
 
 
+HEAL_LOG = bot.DATA_DIR / "poll_heals.json"
+_healed = set()  # customer_ids self-healed this run (avoid duplicate writes)
+
+
+def record_heal(name, before, after, customer_id):
+    """Append a self-heal to the rolling log so the daily reconcile can surface it
+    for staff to confirm. Exactly-once reporting via a per-entry 'reported' flag."""
+    entries = []
+    if HEAL_LOG.exists():
+        try:
+            entries = json.loads(HEAL_LOG.read_text())
+        except Exception:
+            entries = []
+    entries.append({"name": name, "before": before, "after": after,
+                    "customer_id": customer_id, "reported": False,
+                    "at": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    HEAL_LOG.write_text(json.dumps(entries, indent=2))
+
+
+def _self_heal_account(customer_id, raw, name):
+    """Autonomous self-heal (LIVE only): after a payment posts via a stripped/
+    malformed account #, write the canonical C######### back to Square so future
+    payments match, and record it for staff confirmation. One write per customer."""
+    canon = bot.normalize_account(raw)
+    if not customer_id or not canon or canon == (raw or "").strip():
+        return  # no id, empty, already canonical, or unreconstructable -> nothing to do
+    if customer_id in _healed:
+        return
+    _healed.add(customer_id)
+    try:
+        confirmed = update_customer_reference(customer_id, canon)
+        log(f"  [heal] account '{raw}' -> '{confirmed}' for {name} — corrected in Square")
+        record_heal(name, raw, confirmed, customer_id)
+    except Exception as e:
+        log(f"  [heal] WARNING: could not correct '{raw}' for {name} in Square: {e}")
+
+
 def fetch_completed_payments(since_iso):
     """Fetch COMPLETED payments created since `since_iso` (RFC3339 UTC). Paginates."""
     out, cursor = [], None
@@ -275,6 +312,7 @@ def post_new_payments(to_post, posted_ids):
                         posted_ids.add(item["id"])
                         results.append({**item, "status": "OK", "method": method})
                         log(f"  POSTED {item['name']} ${item['amount']} ({method})")
+                        _self_heal_account(item.get("customer_id"), item.get("account"), item["name"])
                     else:
                         results.append({**item, "status": method or "FAILED", "error": error})
                         log(f"  NOT POSTED {item['name']}: {error}")
@@ -467,7 +505,8 @@ def main():
     to_post, unresolved = [], []
     for p in new:
         name, date, amount, account = extract_payment_fields(p)
-        rec = {"id": p["id"], "name": name, "date": date, "amount": amount, "account": account}
+        rec = {"id": p["id"], "name": name, "date": date, "amount": amount,
+               "account": account, "customer_id": p.get("customer_id", "")}
         (to_post if name else unresolved).append(rec)
     # --- DRY RUN: preview only, no side effects ---
     if args.dry_run:

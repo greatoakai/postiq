@@ -54,6 +54,29 @@ def _amt(a):
         return str(a)
 
 
+HEAL_LOG = bot.DATA_DIR / "poll_heals.json"
+
+
+def load_unreported_heals():
+    """Return (all_entries, unreported) from the poller's self-heal log."""
+    if not HEAL_LOG.exists():
+        return [], []
+    try:
+        entries = json.loads(HEAL_LOG.read_text())
+    except Exception:
+        return [], []
+    return entries, [e for e in entries if not e.get("reported")]
+
+
+def mark_heals_reported(entries):
+    for e in entries:
+        e["reported"] = True
+    try:
+        HEAL_LOG.write_text(json.dumps(entries, indent=2))
+    except Exception:
+        pass
+
+
 def load_ledger_for_date(mmddyyyy):
     key = mmddyyyy.replace("/", "").replace(".", "")
     path = LEDGER_DIR / f"{key}.json"
@@ -119,7 +142,7 @@ def reconcile(csv_path):
     }
 
 
-def print_report(r):
+def print_report(r, heals=()):
     clean = not (r["gaps"] or r["errors"] or r["discrepancies"] or r["extras"])
     print(f"=== Reconciliation: {r['csv']} (txn {r['txn_date']}) ===")
     print(f"CSV: {r['csv_count']} | ledger: {r['ledger_count']} | matched: {len(r['matched'])}")
@@ -139,10 +162,13 @@ def print_report(r):
     for m in r.get("missing_account", []):
         print(f"  NEEDS SQUARE ACCT#  {m.get('name')} ${m.get('amount')} on {m.get('date')} "
               f"(sq:{m.get('id')}) — add Account # in Square so it auto-matches next time")
+    for h in heals:
+        print(f"  SELF-HEALED  {h.get('name')} {h.get('before')} -> {h.get('after')} "
+              f"— auto-corrected in Square (please confirm)")
     return clean
 
 
-def build_report_html(r):
+def build_report_html(r, heals=()):
     """Build (subject, html, clean) for the reconcile report. Pure — no send."""
     clean = not (r["gaps"] or r["errors"] or r["discrepancies"] or r["extras"])
     status = "CLEAN" if clean else "EXCEPTIONS"
@@ -180,6 +206,15 @@ def build_report_html(r):
              "#1565c0")
         subject += f" · {len(r['missing_account'])} need Acct#"
 
+    # Self-heal confirmation — Account #s the poller auto-corrected in Square (the
+    # 'C00' stripping repair). Already applied; staff just confirm they look right.
+    if heals:
+        sect("Self-healed Account #s — auto-corrected in Square, please confirm (staff)",
+             heals,
+             lambda h: f"{h.get('name')} — {h.get('before')} → {h.get('after')}",
+             "#2e7d32")
+        subject += f" · {len(heals)} self-healed"
+
     html = (f'<html><body style="font-family:Arial,sans-serif;color:#333;">'
             f'<h2 style="color:#346756;">Shadow Reconcile — {r["txn_date"]}</h2>'
             f'<p style="color:#666;font-size:13px;">{r["csv"]} · {r["csv_count"]} CSV payment(s) · '
@@ -190,9 +225,9 @@ def build_report_html(r):
     return subject, html, clean
 
 
-def email_report(r):
+def email_report(r, heals=()):
     """Email the reconciliation outcome to RECONCILE_TO (proving-window report)."""
-    subject, html, clean = build_report_html(r)
+    subject, html, clean = build_report_html(r, heals)
     bot.send_email(to=RECONCILE_TO, cc=None, subject=subject, body=html, html=True)
     print(f"  Emailed reconcile report to {RECONCILE_TO} ({'CLEAN' if clean else 'EXCEPTIONS'})")
 
@@ -223,10 +258,13 @@ def main():
                 pass
         sys.exit(1)
 
+    all_heals, unreported_heals = load_unreported_heals()
     r = reconcile(csv_path)
-    clean = print_report(r)
+    clean = print_report(r, unreported_heals)
     if args.email:
-        email_report(r)
+        email_report(r, unreported_heals)
+        if unreported_heals:
+            mark_heals_reported(all_heals)  # exactly-once: don't re-report tomorrow
     sys.exit(0 if clean else 2)
 
 
