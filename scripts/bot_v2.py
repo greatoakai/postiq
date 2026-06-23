@@ -733,6 +733,20 @@ def _resolve_account_input(page, timeout_ms=8000):
     return None
 
 
+def normalize_account(raw):
+    """Canonicalize a TA Account # to 'C' + 9 digits, repairing the 'C00' stripping
+    that happens when the value is stored as a number (the leading C and zeros
+    vanish: C006276206 -> 6276206). Returns '' when it isn't a real account # — no
+    digits, or >9 digits (a 10-digit check-in reference_id is never an account #).
+    Idempotent on already-canonical values.
+    """
+    import re as _re
+    digits = _re.sub(r"\D", "", raw or "")
+    if not (1 <= len(digits) <= 9):
+        return ""
+    return "C" + digits.zfill(9)
+
+
 def search_client_by_account(page, account):
     """Find a client by TA 'Account Number' (== the Square customer reference_id).
 
@@ -745,7 +759,9 @@ def search_client_by_account(page, account):
     back to name search. Raises only with a FLAG on the can't-happen case of
     multiple clients sharing one account number.
     """
-    account = (account or "").strip()
+    # Canonicalize first — repairs the 'C00' stripping so a value like '6276206'
+    # searches as '006276206' and matches TA's 'C006276206'.
+    account = normalize_account(account)
     if not account:
         return False, "no account number"
 
