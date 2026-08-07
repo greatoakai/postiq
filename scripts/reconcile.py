@@ -508,21 +508,34 @@ def flag_already_posted(gaps, extras):
     costs the reader ten seconds in TA and cannot lose money. It's also safe to
     apply from more than one place, where consuming a pairing is not.
 
+    Flagged only on a one-to-one match — one unlisted payment, one unposted row
+    for that client and amount. Two gaps pointing at a single posting would tell
+    the reader both were handled when only one was, which is the same money loss
+    by a different route.
+
+    Not cancelled, and the straddle therefore keeps appearing until someone
+    confirms it: the payment really is on Square's report and really isn't in
+    that day's ledger, and only a person looking at TA can settle it. --clear
+    takes it off the list once they have.
+
     Only real postings count: a shadow-era WOULD_POST never reached TA.
     """
-    by_extra = {}
-    for x in extras:
-        if x.get("status", "OK") != "OK":
-            continue
-        by_extra.setdefault((_norm(x.get("name")), _amt(x.get("amount"))), []).append(x)
+    def index(seq, keep=lambda i: True):
+        out = {}
+        for i in seq:
+            if keep(i):
+                out.setdefault((_norm(i.get("name")), _amt(i.get("amount"))), []).append(i)
+        return out
 
-    for g in gaps:
-        gd = _dt(g.get("date"))
-        for x in by_extra.get((_norm(g.get("name")), _amt(g.get("amount"))), []):
-            xd = _dt(x.get("date"))
-            if gd and xd and 0 < abs((gd - xd).days) <= 2:
-                g["also_posted"] = x.get("date")
-                break
+    by_gap = index(gaps)
+    by_extra = index(extras, keep=lambda x: x.get("status", "OK") == "OK")
+    for key, gs in by_gap.items():
+        xs = by_extra.get(key) or []
+        if len(gs) != 1 or len(xs) != 1:
+            continue
+        gd, xd = _dt(gs[0].get("date")), _dt(xs[0].get("date"))
+        if gd and xd and 0 < abs((gd - xd).days) <= 2:
+            gs[0]["also_posted"] = xs[0].get("date")
 
 
 def combine(results):
@@ -557,8 +570,8 @@ def combine(results):
                         out["extras"] + (day_extras(before.strftime("%m.%d.%Y")) if before else []))
     for g in out["gaps"]:
         if g.get("also_posted"):
-            print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']} but the bot posted "
-                  f"that amount on {g['also_posted']} — may be one payment, not two.")
+            print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']}, bot posted that "
+                  f"amount on {g['also_posted']} — may be one payment on two reports.")
     return out
 
 
@@ -703,9 +716,9 @@ def _blocks_html(items, accent="#c62828"):
             f'<span style="color:#888;">&#9744;</span> &nbsp;<strong>{esc(_money(p["amount"]))}</strong>'
             f'<span style="color:#555;"> &nbsp;paid {esc(p["date"])}</span>'
             + (f'<div style="font-size:12px;color:#e65100;padding:2px 0 4px 22px;">'
-               f'The bot already posted this amount for this client on '
-               f'{esc(p["also_posted"])} — likely the same payment showing up on the next '
-               f'day&rsquo;s report. Check TA before posting it again.</div>'
+               f'The bot posted this same amount for this client on {esc(p["also_posted"])} — '
+               f'probably one payment landing on two different daily reports. Check TA before '
+               f'posting it again.</div>'
                if p.get("also_posted") else "")
             + '</div>'
             for p in sorted(g["payments"], key=lambda p: _dt(p["date"]) or datetime.min)
