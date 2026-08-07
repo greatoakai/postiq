@@ -285,17 +285,27 @@ def item_key(date, name, amount):
 
 
 def load_cleared():
+    """The set of payment keys staff have confirmed they handled.
+
+    A corrupt file is renamed rather than parsed as empty — silently starting
+    over would resurrect the whole backlog and, worse, the next save would
+    overwrite the only record of what had been cleared.
+    """
     if not CLEARED_FILE.exists():
-        return {"cleared_through": "", "keys": []}
+        return {"keys": []}
     try:
         d = json.loads(CLEARED_FILE.read_text())
-        return {"cleared_through": d.get("cleared_through", ""), "keys": list(d.get("keys", []))}
-    except Exception:
-        return {"cleared_through": "", "keys": []}
+        return {"keys": list(d.get("keys", []))}
+    except Exception as e:
+        bad = CLEARED_FILE.with_suffix(".json.corrupt")
+        CLEARED_FILE.rename(bad)
+        print(f"  reconcile: {CLEARED_FILE.name} is unreadable ({e}) — kept it as "
+              f"{bad.name}; the outstanding list will be back to full until it's restored.")
+        return {"keys": []}
 
 
 def save_cleared(c):
-    CLEARED_FILE.write_text(json.dumps(c, indent=2))
+    CLEARED_FILE.write_text(json.dumps({"keys": sorted(set(c["keys"]))}, indent=2))
 
 
 def is_cleared(cleared, date, name, amount, *aliases):
@@ -306,12 +316,7 @@ def is_cleared(cleared, date, name, amount, *aliases):
     archived yet, and a payment cleared under one shouldn't come back under the
     other.
     """
-    for n in (name, *aliases):
-        if n and item_key(date, n, amount) in cleared["keys"]:
-            return True
-    through = _dt(cleared.get("cleared_through") or "")
-    d = _dt(date)
-    return bool(through and d and d <= through)
+    return any(n and item_key(date, n, amount) in cleared["keys"] for n in (name, *aliases))
 
 
 # =============================================================================
@@ -368,18 +373,19 @@ def reconcile(csv_path):
             continue
         m = next(e for e in leftover
                  if e.get("date") == g["date"] and _amt(e.get("amount")) == _amt(g["amount"]))
-        # An empty ledger name means the poller couldn't identify the payer at
-        # all, so anything at that date+amount is it. Otherwise the two names
-        # have to look like the same person.
+        # One unclaimed CSV row and one unclaimed failure, same day, same cents:
+        # almost always one payment under two spellings. Pair them rather than
+        # print it twice — two blocks each saying "post it in TA" is how a client
+        # gets charged twice. When the names don't look alike, pair it but say
+        # the identification is uncertain.
         led_name = (m.get("name") or "").strip()
-        if led_name and not _shares_name_token(led_name, g["name"]):
-            continue
+        uncertain = bool(led_name) and not _shares_name_token(led_name, g["name"])
         used.add(id(m))
         leftover.remove(m)
         gaps.remove(g)
         errors.append({**g, "status": m.get("status"), "reason": m.get("reason", ""),
                        "account": m.get("account", ""), "id": m.get("id"),
-                       "square_name": m.get("name", "")})
+                       "square_name": m.get("name", ""), "uncertain": uncertain})
 
     # Anything the poller tried and failed that no CSV row claimed — a payment
     # missing from the export, a name too different to pair, an amount that
@@ -410,6 +416,27 @@ def reconcile(csv_path):
         "discrepancies": discrepancies, "extras": extras,
         "missing_account": missing_account,
     }
+
+
+def reconcile_ledger_only(date_slashed):
+    """The same result shape for a day whose Square report never arrived.
+
+    Gaps can't be detected without the CSV — the poller's own record is all
+    there is — but its failures are exactly the payments staff need to chase,
+    and holding the whole email back over a missing export would hide them.
+    """
+    ledger = load_ledger_for_date(date_slashed)
+    errors = [{"name": _clean(e.get("name")) or "(unknown client)",
+               "date": e.get("date") or date_slashed, "amount": e.get("amount"),
+               "status": e.get("status"), "reason": e.get("reason", ""),
+               "account": e.get("account", ""), "id": e.get("id")}
+              for e in ledger if e.get("status") and e.get("status") not in POSTED_OK]
+    posted_ok = [e for e in ledger if e.get("status") in POSTED_OK]
+    return {"csv": "(no Square report for this day)", "txn_date": date_slashed,
+            "csv_count": 0, "ledger_count": len(ledger), "matched": [], "gaps": [],
+            "errors": errors, "discrepancies": [], "extras": [],
+            "missing_account": [e for e in posted_ok if not (e.get("account") or "").strip()],
+            "no_csv": True}
 
 
 def unposted_for_day(date_dotted, log_reasons):
@@ -514,7 +541,9 @@ def _group(items):
         why, todo = explain(i.get("status", ""), i.get("reason", ""), i.get("square_name") or i["name"])
         key = (i["name"], why)
         g = groups.setdefault(key, {"name": i["name"], "why": why, "todo": todo,
-                                    "account": "", "square_name": "", "payments": []})
+                                    "account": "", "square_name": "", "uncertain": False,
+                                    "payments": []})
+        g["uncertain"] = g["uncertain"] or bool(i.get("uncertain"))
         g["payments"].append(i)
         g["account"] = g["account"] or _account(i.get("account"))
         if i.get("square_name") and _norm(i["square_name"]) != _norm(i["name"]):
@@ -534,6 +563,12 @@ def _blocks_html(items, accent="#c62828"):
                 f'<span style="font-family:monospace;">{esc(g["account"])}</span></span>') if g["account"] else ""
         alias = (f'<span style="color:#666;font-weight:400;"> &middot; in Square as '
                  f'&ldquo;{esc(g["square_name"])}&rdquo;</span>') if g["square_name"] else ""
+        caution = (
+            f'<div style="font-size:13px;color:#e65100;margin-top:5px;">'
+            f'<strong>Check before posting:</strong> the Square report calls this '
+            f'&ldquo;{esc(g["name"])}&rdquo; and the bot&rsquo;s log calls it '
+            f'&ldquo;{esc(g["square_name"])}&rdquo;. That is almost certainly one payment, not two — '
+            f'look at both and post it once.</div>') if g["uncertain"] else ""
         rows = "".join(
             f'<div style="font-size:14px;color:#222;padding:3px 0 3px 4px;">'
             f'<span style="color:#888;">&#9744;</span> &nbsp;<strong>{esc(_money(p["amount"]))}</strong>'
@@ -547,7 +582,7 @@ def _blocks_html(items, accent="#c62828"):
             f'<div style="margin:6px 0 8px;">{rows}</div>'
             f'<div style="font-size:13px;color:#555;"><strong>Why it didn\'t post:</strong> {g["why"]}</div>'
             f'<div style="font-size:13px;color:#1565c0;margin-top:3px;"><strong>What to do:</strong> {g["todo"]}</div>'
-            f'</div>'
+            f'{caution}</div>'
         )
     return "".join(out)
 
@@ -607,9 +642,12 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS):
             sub = (f'The other {len(r["matched"])} of {r["csv_count"]} payments on this day&rsquo;s '
                    f'Square report posted automatically — nothing to do for those.')
         else:
-            # No rows in the export, so this list comes from the bot's own log.
-            sub = ('This day&rsquo;s Square report came through empty, so this list is from the '
-                   'bot&rsquo;s own record. Tell Travis if you expected payments that day.')
+            # No usable export, so this list is the bot's own record and can only
+            # show what it tried — not a payment it never saw.
+            sub = ('This day&rsquo;s Square report ' +
+                   ('didn&rsquo;t arrive' if r.get("no_csv") else 'was empty') +
+                   ', so this list is the bot&rsquo;s own record and may not be the whole story. '
+                   'Tell Travis if you expected more.')
         headline = (
             f'<div style="background:#fdecea;border-left:5px solid #c62828;padding:14px 16px;margin:16px 0;">'
             f'<div style="font-size:17px;font-weight:700;color:#c62828;">'
@@ -617,13 +655,14 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS):
             f'{"need" if n != 1 else "needs"} to be posted by hand in TherapyAppointment</div>'
             f'<div style="font-size:13px;color:#555;margin-top:5px;">{sub}</div></div>')
     elif r["csv_count"] == 0:
+        what = ("didn&rsquo;t arrive" if r.get("no_csv") else "came through with no payments on it")
         headline = (
             f'<div style="background:#fff8e1;border-left:5px solid #e65100;padding:14px 16px;margin:16px 0;">'
             f'<div style="font-size:17px;font-weight:700;color:#e65100;">'
-            f'No payments on this day&rsquo;s Square report.</div>'
-            f'<div style="font-size:13px;color:#555;margin-top:5px;">If the practice took card '
-            f'payments that day, the report didn&rsquo;t come through — tell Travis before assuming '
-            f'there&rsquo;s nothing to do.</div></div>')
+            f'This day&rsquo;s Square report {what}.</div>'
+            f'<div style="font-size:13px;color:#555;margin-top:5px;">Nothing failed in the bot&rsquo;s '
+            f'own record either, but it couldn&rsquo;t be checked against Square. If the practice took '
+            f'card payments that day, tell Travis before assuming there&rsquo;s nothing to do.</div></div>')
     else:
         headline = (
             f'<div style="background:#e8f5e9;border-left:5px solid #2e7d32;padding:14px 16px;margin:16px 0;">'
@@ -768,44 +807,64 @@ def main():
 
     # --clear / --clear-through are maintenance actions; do them and stop.
     if args.clear or args.clear_through:
+        # Validate before writing anything, so a typo can't half-apply the batch.
+        through = None
+        if args.clear_through:
+            through = _dt(args.clear_through)
+            if not through:
+                print(f"reconcile: --clear-through expects MM.DD.YYYY, got {args.clear_through}")
+                sys.exit(1)
         c = load_cleared()
         for k in args.clear:
             if k not in c["keys"]:
                 c["keys"].append(k)
                 print(f"  cleared: {k}")
-        if args.clear_through:
-            d = _dt(args.clear_through)
-            if not d:
-                print(f"reconcile: --clear-through expects MM.DD.YYYY, got {args.clear_through}")
-                sys.exit(1)
-            c["cleared_through"] = d.strftime("%m/%d/%Y")
-            print(f"  cleared everything through {c['cleared_through']}")
+        if through:
+            # Expand to the keys that are actually outstanding today rather than
+            # keeping a date watermark. A watermark would also swallow anything
+            # discovered later on those dates — exactly what happens when a late
+            # Square report is archived and reveals a payment nobody has seen.
+            # Anchored on today with a little slack: the morning report anchors
+            # on yesterday, so its window reaches one day further back than a
+            # today-anchored scan of the same length would.
+            today = datetime.now().strftime("%m/%d/%Y")
+            n = 0
+            for it in scan_backlog(today, args.backlog_days + 2, cleared=c):
+                if (_dt(it["date"]) or datetime.max) <= through:
+                    c["keys"].append(item_key(it["date"], it["name"], it["amount"]))
+                    n += 1
+            print(f"  cleared {n} outstanding payment(s) dated on or before "
+                  f"{through.strftime('%m/%d/%Y')}")
         save_cleared(c)
         sys.exit(0)
 
-    if args.csv:
-        csv_path = Path(args.csv)
-    else:
-        # Default to yesterday (what the morning launchd job reconciles).
-        date_dotted = args.date or (datetime.now() - timedelta(days=1)).strftime("%m.%d.%Y")
-        csv_path = find_csv(date_dotted)
+    # Default to yesterday (what the morning launchd job reconciles).
+    date_dotted = args.date or (datetime.now() - timedelta(days=1)).strftime("%m.%d.%Y")
+    csv_path = Path(args.csv) if args.csv else find_csv(date_dotted)
 
-    if not csv_path or not csv_path.exists():
-        target = args.csv or args.date or "yesterday"
-        print(f"reconcile: CSV not found for {target}")
-        if args.email:
-            # Plumbing failure, not a staff task — Travis only.
-            try:
-                bot.send_email(to=ADMIN_TO, cc=None,
-                               subject=f"PostIQ Daily Reconcile — {target} — CSV NOT FOUND",
-                               body=f"No Square CSV found to reconcile for {target}. "
-                                    f"No report was sent to staff.", html=False)
-            except Exception:
-                pass
+    if args.csv and not csv_path.exists():
+        print(f"reconcile: no such CSV: {args.csv}")
         sys.exit(1)
 
     all_heals, unreported_heals = load_unreported_heals()
-    r = reconcile(csv_path)
+    if csv_path and csv_path.exists():
+        r = reconcile(csv_path)
+    else:
+        # The Square report didn't arrive. Report from the ledger anyway — this
+        # is the only daily staff email, and its outstanding list doesn't depend
+        # on the CSV — and tell Travis the export is missing.
+        print(f"reconcile: no Square CSV for {date_dotted} — reporting from the poller ledger only.")
+        r = reconcile_ledger_only(date_dotted.replace(".", "/"))
+        if args.email:
+            try:
+                bot.send_email(to=ADMIN_TO, cc=None,
+                               subject=f"PostIQ — no Square report for {date_dotted}",
+                               body=f"No Square CSV was found for {date_dotted}, so this morning's "
+                                    f"staff report was built from the poller ledger alone and can't "
+                                    f"flag payments the poller never saw. Check the S3 sync.",
+                               html=False)
+            except Exception:
+                pass
     backlog = []
     if not args.no_backlog:
         try:
