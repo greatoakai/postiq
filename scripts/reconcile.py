@@ -503,6 +503,28 @@ def combine(results):
     }
     for k in ("matched", "gaps", "errors", "discrepancies", "extras", "missing_account"):
         out[k] = [x for r in results for x in r[k]]
+
+    # A payment can straddle the boundary between two daily Square reports:
+    # posted on one day, listed on the next. Over a multi-day span that surfaces
+    # as a GAP on one day and an EXTRA on the other — the same money appearing
+    # under both "post this" and "posted, not on the report". Cancel the pairs
+    # out; the payment is in TA and Square knows about it, so there is nothing
+    # to do. Same client, same amount: two unrelated payments would have to be
+    # one unlisted-but-posted and one listed-but-unposted inside the same span.
+    if len(results) > 1:
+        by_key = {}
+        for x in out["extras"]:
+            by_key.setdefault((_norm(x.get("name")), _amt(x.get("amount"))), []).append(x)
+        for g in list(out["gaps"]):
+            bucket = by_key.get((_norm(g["name"]), _amt(g["amount"])))
+            if not bucket:
+                continue
+            x = bucket.pop()
+            out["gaps"].remove(g)
+            out["extras"].remove(x)
+            out["matched"].append(g)
+            print(f"  reconcile: {g['name']} ${g['amount']} posted {x.get('date')} but listed "
+                  f"{g['date']} — one payment across two Square reports, not two.")
     return out
 
 
@@ -700,6 +722,9 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
     else:
         covers = "Yesterday&rsquo;s"
 
+    reports = "these days&rsquo; Square reports" if len(span) > 1 else "this day&rsquo;s Square report"
+    missing = r.get("no_csv_dates") or []
+
     bits = []
     if today_items:
         bits.append(f"{len(today_items)} to post")
@@ -707,22 +732,21 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
         bits.append(f"{len(backlog)} outstanding")
     if verify and not today_items:
         bits.append(f"{len(verify)} to verify")
+    if missing:
+        bits.append(f"{len(missing)} day{'s' if len(missing) != 1 else ''} unchecked")
     subject = f"PostIQ Daily Reconcile — {date} — " + (" · ".join(bits) if bits else "all caught up")
 
     # ── Headline ──
     if today_items:
         n = len(today_items)
-        reports = "these days&rsquo; Square reports" if len(span) > 1 else "this day&rsquo;s Square report"
         if r["csv_count"]:
             sub = (f'The other {len(r["matched"])} of {r["csv_count"]} payments on {reports} '
                    f'posted automatically — nothing to do for those.')
         else:
             # No usable export, so this list is the bot's own record and can only
             # show what it tried — not a payment it never saw.
-            sub = ('This day&rsquo;s Square report ' +
-                   ('didn&rsquo;t arrive' if r.get("no_csv") else 'was empty') +
-                   ', so this list is the bot&rsquo;s own record and may not be the whole story. '
-                   'Tell Travis if you expected more.')
+            sub = (f'No payments came through on {reports}, so this list is the bot&rsquo;s own '
+                   f'record and may not be the whole story. Tell Travis if you expected more.')
         headline = (
             f'<div style="background:#fdecea;border-left:5px solid #c62828;padding:14px 16px;margin:16px 0;">'
             f'<div style="font-size:17px;font-weight:700;color:#c62828;">'
@@ -730,32 +754,43 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
             f'{"need" if n != 1 else "needs"} to be posted by hand in TherapyAppointment</div>'
             f'<div style="font-size:13px;color:#555;margin-top:5px;">{sub}</div></div>')
     elif r["csv_count"] == 0:
-        what = ("didn&rsquo;t arrive" if r.get("no_csv") else "came through with no payments on it")
+        if r.get("no_csv"):
+            what = ("None of " + reports + " arrived.") if len(span) > 1 else "This day&rsquo;s Square report didn&rsquo;t arrive."
+        else:
+            what = f"No payments on {reports}."
         headline = (
             f'<div style="background:#fff8e1;border-left:5px solid #e65100;padding:14px 16px;margin:16px 0;">'
-            f'<div style="font-size:17px;font-weight:700;color:#e65100;">'
-            f'This day&rsquo;s Square report {what}.</div>'
+            f'<div style="font-size:17px;font-weight:700;color:#e65100;">{what}</div>'
             f'<div style="font-size:13px;color:#555;margin-top:5px;">Nothing failed in the bot&rsquo;s '
             f'own record either, but it couldn&rsquo;t be checked against Square. If the practice took '
-            f'card payments that day, tell Travis before assuming there&rsquo;s nothing to do.</div></div>')
+            f'card payments, tell Travis before assuming there&rsquo;s nothing to do.</div></div>')
     elif verify:
         headline = (
             f'<div style="background:#fff8e1;border-left:5px solid #6a1b9a;padding:14px 16px;margin:16px 0;">'
             f'<div style="font-size:17px;font-weight:700;color:#6a1b9a;">'
             f'Nothing new to post, but {len(verify)} payment'
             f'{"s" if len(verify) != 1 else ""} to check.</div>'
-            f'<div style="font-size:13px;color:#555;margin-top:5px;">The rest of this day&rsquo;s '
-            f'Square report posted automatically. See &ldquo;Check these&rdquo; below.</div></div>')
+            f'<div style="font-size:13px;color:#555;margin-top:5px;">The rest of {reports} '
+            f'posted automatically. See &ldquo;Check these&rdquo; below.</div></div>')
+    elif missing:
+        # Some days in the span were never checked against Square. "All caught
+        # up" would be a claim about days nobody looked at.
+        headline = (
+            f'<div style="background:#fff8e1;border-left:5px solid #e65100;padding:14px 16px;margin:16px 0;">'
+            f'<div style="font-size:17px;font-weight:700;color:#e65100;">'
+            f'Nothing to post from the reports that arrived — but '
+            f'{len(missing)} day{"s" if len(missing) != 1 else ""} couldn&rsquo;t be checked.</div>'
+            f'<div style="font-size:13px;color:#555;margin-top:5px;">See the note below.</div></div>')
     else:
         headline = (
             f'<div style="background:#e8f5e9;border-left:5px solid #2e7d32;padding:14px 16px;margin:16px 0;">'
             f'<div style="font-size:17px;font-weight:700;color:#2e7d32;">'
             f'Nothing new to post — all {r["csv_count"]} payment'
-            f'{"s" if r["csv_count"] != 1 else ""} on this day&rsquo;s Square report went into TA automatically.'
+            f'{"s" if r["csv_count"] != 1 else ""} on {reports} went into TA automatically.'
             f'</div></div>')
 
     parts = [headline]
-    partial = [d for d in (r.get("no_csv_dates") or []) if not r.get("no_csv")]
+    partial = [] if r.get("no_csv") else missing
     if partial:
         parts.append(
             f'<p style="background:#fff8e1;border-left:5px solid #e65100;padding:12px 14px;'
