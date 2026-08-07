@@ -85,6 +85,23 @@ def _account(raw):
     return bot.normalize_account(raw or "")
 
 
+_NAME_NOISE = {"iii", "the", "and"}
+
+
+def _shares_name_token(a, b):
+    """Do two spellings of a name share a distinctive word?
+
+    Used to decide whether a CSV row and an unmatched poller failure are the same
+    person under two spellings ("Cash Stone IV" / "William Stone IV" share
+    "stone") rather than two different clients who happened to pay the same
+    amount that day.
+    """
+    def toks(n):
+        return {t for t in re.split(r"[^a-z]+", _norm(n))
+                if len(t) >= 3 and t not in _NAME_NOISE}
+    return bool(toks(a) & toks(b))
+
+
 def _clean(name):
     """Display form of a client name — the CSV sometimes has doubled spaces."""
     return re.sub(r"\s+", " ", (name or "").strip())
@@ -281,9 +298,17 @@ def save_cleared(c):
     CLEARED_FILE.write_text(json.dumps(c, indent=2))
 
 
-def is_cleared(cleared, date, name, amount):
-    if item_key(date, name, amount) in cleared["keys"]:
-        return True
+def is_cleared(cleared, date, name, amount, *aliases):
+    """Has this payment been marked handled?
+
+    Checks every spelling we know for it: the display name flips between the
+    Square name and the CSV name depending on whether that day's CSV has been
+    archived yet, and a payment cleared under one shouldn't come back under the
+    other.
+    """
+    for n in (name, *aliases):
+        if n and item_key(date, n, amount) in cleared["keys"]:
+            return True
     through = _dt(cleared.get("cleared_through") or "")
     d = _dt(date)
     return bool(through and d and d <= through)
@@ -312,13 +337,15 @@ def reconcile(csv_path):
             continue
         e = next((x for x in cand if _amt(x.get("amount")) == camt), cand[0])
         used.add(id(e))
-        if _amt(e.get("amount")) != camt:
-            discrepancies.append({**c, "ledger_amount": _amt(e.get("amount")), "status": e.get("status")})
-        elif e.get("status") in POSTED_OK:
-            matched.append(c)
-        else:
+        if e.get("status") not in POSTED_OK:
+            # Nothing was posted, whatever the amounts say — this needs a human,
+            # not a "the bot posted the wrong amount, go correct it" note.
             errors.append({**c, "status": e.get("status"), "reason": e.get("reason", ""),
-                           "account": e.get("account", "")})
+                           "account": e.get("account", ""), "id": e.get("id")})
+        elif _amt(e.get("amount")) != camt:
+            discrepancies.append({**c, "ledger_amount": _amt(e.get("amount")), "status": e.get("status")})
+        else:
+            matched.append(c)
 
     # A CSV row lands in `gaps` whenever no ledger entry carries its name — but
     # that also happens when the poller DID handle the payment under a different
@@ -341,12 +368,31 @@ def reconcile(csv_path):
             continue
         m = next(e for e in leftover
                  if e.get("date") == g["date"] and _amt(e.get("amount")) == _amt(g["amount"]))
+        # An empty ledger name means the poller couldn't identify the payer at
+        # all, so anything at that date+amount is it. Otherwise the two names
+        # have to look like the same person.
+        led_name = (m.get("name") or "").strip()
+        if led_name and not _shares_name_token(led_name, g["name"]):
+            continue
         used.add(id(m))
         leftover.remove(m)
         gaps.remove(g)
         errors.append({**g, "status": m.get("status"), "reason": m.get("reason", ""),
-                       "account": m.get("account", ""),
+                       "account": m.get("account", ""), "id": m.get("id"),
                        "square_name": m.get("name", "")})
+
+    # Anything the poller tried and failed that no CSV row claimed — a payment
+    # missing from the export, a name too different to pair, an amount that
+    # didn't line up. It is money that isn't in TA, so it belongs on the list
+    # under whatever name Square had, rather than falling through the cracks.
+    for e in ledger:
+        if id(e) in used or e.get("status") in POSTED_OK or not e.get("status"):
+            continue
+        used.add(id(e))
+        errors.append({"name": _clean(e.get("name")) or "(unknown client)",
+                       "date": e.get("date") or txn_date, "amount": e.get("amount"),
+                       "status": e.get("status"), "reason": e.get("reason", ""),
+                       "account": e.get("account", ""), "id": e.get("id")})
 
     posted_ok = [e for e in ledger if e.get("status") in POSTED_OK]
     extras = [e for e in posted_ok if id(e) not in used]
@@ -375,26 +421,26 @@ def unposted_for_day(date_dotted, log_reasons):
     """
     date_slashed = date_dotted.replace(".", "/")
     csv_path = find_csv(date_dotted)
-    items, seen = [], set()
+    items = []
 
     if csv_path:
+        # reconcile() already folds in every ledger failure, matched or not, so
+        # its gaps + errors are the complete picture for that day.
         r = reconcile(csv_path)
         for it in r["gaps"]:
             items.append({**it, "status": "GAP", "reason": "", "account": ""})
         for it in r["errors"]:
             items.append(dict(it))
-        seen = {(_amt(i["amount"]), i["date"]) for i in items}
-
-    # Ledger-only pass: days whose CSV isn't archived, plus anything the CSV
-    # comparison didn't already surface.
-    for e in load_ledger_for_date(date_slashed):
-        if e.get("status") in POSTED_OK or not e.get("status"):
-            continue
-        if (_amt(e.get("amount")), e.get("date")) in seen:
-            continue
-        items.append({"name": e.get("name") or "(unknown client)", "date": e.get("date") or date_slashed,
-                      "amount": e.get("amount"), "status": e.get("status"),
-                      "reason": e.get("reason", ""), "account": e.get("account", "")})
+    else:
+        # No archived CSV for that day — the ledger is all we have, so gaps
+        # (payments the poller never saw) can't be detected for it.
+        for e in load_ledger_for_date(date_slashed):
+            if e.get("status") in POSTED_OK or not e.get("status"):
+                continue
+            items.append({"name": e.get("name") or "(unknown client)",
+                          "date": e.get("date") or date_slashed,
+                          "amount": e.get("amount"), "status": e.get("status"),
+                          "reason": e.get("reason", ""), "account": e.get("account", "")})
 
     for i in items:
         if not i.get("reason") and i.get("status") != "GAP":
@@ -424,7 +470,7 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
             print(f"  reconcile: skipped {day.strftime('%m/%d/%Y')} in backlog scan — {e}")
             continue
         for it in items:
-            if is_cleared(cleared, it["date"], it["name"], it["amount"]):
+            if is_cleared(cleared, it["date"], it["name"], it["amount"], it.get("square_name")):
                 continue
             out.append(it)
     out.sort(key=lambda i: (_dt(i["date"]) or datetime.min, i["name"]))
@@ -529,7 +575,7 @@ HOW_TO_POST = (
 )
 
 
-def build_report_html(r, heals=(), backlog=()):
+def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS):
     """Build (subject, html, clean) for the morning report. Pure — no send."""
     today_items = action_items(r)
     backlog = list(backlog)
@@ -556,14 +602,28 @@ def build_report_html(r, heals=(), backlog=()):
 
     # ── Headline ──
     if today_items:
+        n = len(today_items)
+        if r["csv_count"]:
+            sub = (f'The other {len(r["matched"])} of {r["csv_count"]} payments on this day&rsquo;s '
+                   f'Square report posted automatically — nothing to do for those.')
+        else:
+            # No rows in the export, so this list comes from the bot's own log.
+            sub = ('This day&rsquo;s Square report came through empty, so this list is from the '
+                   'bot&rsquo;s own record. Tell Travis if you expected payments that day.')
         headline = (
             f'<div style="background:#fdecea;border-left:5px solid #c62828;padding:14px 16px;margin:16px 0;">'
             f'<div style="font-size:17px;font-weight:700;color:#c62828;">'
-            f'{len(today_items)} payment{"s" if len(today_items) != 1 else ""} '
-            f'({_money(_total(today_items))}) need to be posted by hand in TherapyAppointment</div>'
-            f'<div style="font-size:13px;color:#555;margin-top:5px;">The other '
-            f'{len(r["matched"])} of {r["csv_count"]} payments on this day&rsquo;s Square report '
-            f'posted automatically — nothing to do for those.</div></div>')
+            f'{n} payment{"s" if n != 1 else ""} ({_money(_total(today_items))}) '
+            f'{"need" if n != 1 else "needs"} to be posted by hand in TherapyAppointment</div>'
+            f'<div style="font-size:13px;color:#555;margin-top:5px;">{sub}</div></div>')
+    elif r["csv_count"] == 0:
+        headline = (
+            f'<div style="background:#fff8e1;border-left:5px solid #e65100;padding:14px 16px;margin:16px 0;">'
+            f'<div style="font-size:17px;font-weight:700;color:#e65100;">'
+            f'No payments on this day&rsquo;s Square report.</div>'
+            f'<div style="font-size:13px;color:#555;margin-top:5px;">If the practice took card '
+            f'payments that day, the report didn&rsquo;t come through — tell Travis before assuming '
+            f'there&rsquo;s nothing to do.</div></div>')
     else:
         headline = (
             f'<div style="background:#e8f5e9;border-left:5px solid #2e7d32;padding:14px 16px;margin:16px 0;">'
@@ -581,7 +641,7 @@ def build_report_html(r, heals=(), backlog=()):
 
     # ── Rolling backlog ──
     if backlog:
-        parts.append(_h2(f"Still outstanding — last {BACKLOG_DAYS} days "
+        parts.append(_h2(f"Still outstanding — last {days} days "
                          f"({len(backlog)} payments, {_money(_total(backlog))})", "#e65100"))
         parts.append(
             '<p style="font-size:13px;color:#555;margin:8px 0 12px;">These never posted automatically. '
@@ -643,7 +703,7 @@ def build_report_html(r, heals=(), backlog=()):
     return subject, html, clean
 
 
-def print_report(r, heals=(), backlog=()):
+def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
     """Console view — same content, plus the raw reasons and clear-keys for Travis."""
     clean = not (r["gaps"] or r["errors"] or r["discrepancies"] or r["extras"])
     print(f"=== Reconciliation: {r['csv']} (txn {r['txn_date']}) ===")
@@ -668,7 +728,7 @@ def print_report(r, heals=(), backlog=()):
         print(f"  SELF-HEALED  {h.get('name')} {h.get('before')} -> {h.get('after')} "
               f"— auto-corrected in Square (please confirm)")
     if backlog:
-        print(f"\n--- Still outstanding, last {BACKLOG_DAYS} days ({len(backlog)} payments, "
+        print(f"\n--- Still outstanding, last {days} days ({len(backlog)} payments, "
               f"{_money(_total(backlog))}) ---")
         for b in backlog:
             print(f"  {b['date']}  {b['name']:<26} ${_amt(b['amount']):>8}  {b.get('status','')}"
@@ -677,13 +737,13 @@ def print_report(r, heals=(), backlog=()):
     return clean
 
 
-def email_report(r, heals=(), backlog=()):
+def email_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
     """Email the morning report to staff (Hannah) with Travis copied.
 
     Returns True only if it actually went out — the caller uses that to decide
     whether the self-heal confirmations can be retired.
     """
-    subject, html, clean = build_report_html(r, heals, backlog)
+    subject, html, clean = build_report_html(r, heals, backlog, days)
     sent = bot.send_email(to=STAFF_TO, cc=ADMIN_TO, subject=subject, body=html, html=True)
     if sent:
         print(f"  Emailed report to {STAFF_TO} (cc {ADMIN_TO}) — {'CLEAN' if clean else 'EXCEPTIONS'}")
@@ -752,11 +812,15 @@ def main():
             backlog = scan_backlog(r["txn_date"], args.backlog_days)
         except Exception as e:
             print(f"  reconcile: backlog scan failed ({e}) — sending the day's report without it.")
-    clean = print_report(r, unreported_heals, backlog)
+    clean = print_report(r, unreported_heals, backlog, args.backlog_days)
     if args.email:
-        sent = email_report(r, unreported_heals, backlog)
+        sent = email_report(r, unreported_heals, backlog, args.backlog_days)
         if sent and unreported_heals:
             mark_heals_reported(all_heals)  # exactly-once: don't re-report tomorrow
+        if not sent:
+            # This is the only daily staff email; a silent failure means nobody
+            # is told about money that still needs posting.
+            sys.exit(1)
     sys.exit(0 if clean else 2)
 
 
