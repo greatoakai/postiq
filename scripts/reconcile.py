@@ -531,6 +531,13 @@ def flag_already_posted(gaps, extras):
     # posting from two months ago count against a pairing a day apart.
     pairs = []
     for g in gaps:
+        # Only a gap can be the other half of a straddle. A poller failure is a
+        # distinct Square payment with its own id, and telling staff one of those
+        # was "already posted" is how a payment they still owe gets skipped.
+        # Enforced here rather than trusted to each caller. (Gaps built straight
+        # from a CSV row carry no status field yet.)
+        if g.get("status", "GAP") != "GAP":
+            continue
         gd = _dt(g.get("date"))
         if not gd:
             continue
@@ -615,7 +622,7 @@ def unposted_for_day(date_dotted, log_reasons):
     return items, extras
 
 
-def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None, extras_out=None):
+def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None, extras_out=None, cleared_out=None):
     """Payments from the `days` before `before_date` that still aren't posted.
 
     `before_date` is the earliest day this report covers (MM/DD/YYYY) — those
@@ -623,7 +630,9 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None, extras_out=None):
 
     `extras_out`, if given, collects the postings that had no matching row on
     their day's Square report, so the caller can run one already-posted check
-    across the whole email.
+    across the whole email. `cleared_out` collects the items filtered out as
+    already handled — invisible in the report, but they still hold their claim
+    on a posting, so clearing one payment can't hand its posting to another.
     """
     cleared = cleared or load_cleared()
     end = _dt(before_date)
@@ -645,7 +654,10 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None, extras_out=None):
         extras_out.extend(extras)
     out.sort(key=lambda i: (_dt(i["date"]) or datetime.min, i["name"]))
     key_items(out)
-    return [i for i in out if i["clear_key"] not in cleared["keys"]]
+    kept = [i for i in out if i["clear_key"] not in cleared["keys"]]
+    if cleared_out is not None:
+        cleared_out.extend(i for i in out if i["clear_key"] in cleared["keys"])
+    return kept
 
 
 # =============================================================================
@@ -1088,10 +1100,11 @@ def main():
             except Exception:
                 pass
     anchor = (r.get("txn_dates") or [r["txn_date"]])[0]
-    backlog, backlog_extras, backlog_failed = [], [], False
+    backlog, backlog_extras, backlog_cleared, backlog_failed = [], [], [], False
     if not args.no_backlog:
         try:
-            backlog = scan_backlog(anchor, args.backlog_days, extras_out=backlog_extras)
+            backlog = scan_backlog(anchor, args.backlog_days, extras_out=backlog_extras,
+                                   cleared_out=backlog_cleared)
         except Exception as e:
             backlog_failed = True
             print(f"  reconcile: backlog scan failed ({e}) — sending the day's report without it.")
@@ -1110,7 +1123,14 @@ def main():
             continue
         seen.add(k)
         pool.append(x)
-    flag_already_posted(r["gaps"] + backlog, pool)
+    # Only gaps can be the other half of a straddle: a poller failure is a
+    # distinct Square payment with its own id, so pairing one against a posting
+    # would tell staff a payment they still owe was already handled. Payments
+    # already cleared are included as claimants — they don't render, but they
+    # keep their hold on the posting they explain.
+    claimants = list(r["gaps"]) + [b for b in backlog + backlog_cleared
+                                   if b.get("status") == "GAP"]
+    flag_already_posted(claimants, pool)
     for g in r["gaps"] + backlog:
         if g.get("also_posted"):
             print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']}, bot posted that "
