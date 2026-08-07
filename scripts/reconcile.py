@@ -482,46 +482,47 @@ def _pretty(date_slashed):
 
 
 def day_extras(date_dotted):
-    """Payments the poller posted on one day that aren't on that day's report."""
-    csv_path = find_csv(date_dotted)
-    return [dict(x) for x in reconcile(csv_path)["extras"]] if csv_path else []
+    """Payments the poller posted on one day that aren't on that day's report.
 
-
-def cancel_straddles(gaps, extras):
-    """Cancel out a payment that straddles two daily Square reports.
-
-    Posted on one day, listed on the next: a GAP on one day and an EXTRA on the
-    other, the same money under both "post this in TA" and "posted, not on the
-    report". Only when the pairing is unambiguous — exactly one of each for that
-    client and amount, within a day or two of each other — the same shape of
-    guard reconcile() applies to its within-a-day pairing. Dropping a payment
-    off the to-do list on a guess is the one mistake this report can't afford.
-
-    Only real postings count: a shadow-era WOULD_POST never reached TA, so it
-    can't be the other half of a payment that did.
-
-    Mutates both lists; returns the (gap, extra) pairs it removed.
+    Best-effort: this is only ever used to add a cross-check to the report, so an
+    unreadable CSV costs the cross-check, never the email.
     """
-    def index(seq):
-        out = {}
-        for i in seq:
-            out.setdefault((_norm(i.get("name")), _amt(i.get("amount"))), []).append(i)
-        return out
+    try:
+        csv_path = find_csv(date_dotted)
+        return [dict(x) for x in reconcile(csv_path)["extras"]] if csv_path else []
+    except Exception as e:
+        print(f"  reconcile: couldn't read {date_dotted} for the already-posted check — {e}")
+        return []
 
-    posted = [x for x in extras if x.get("status", "OK") == "OK"]
-    by_gap, by_extra, paired = index(gaps), index(posted), []
-    for key, gs in by_gap.items():
-        xs = by_extra.get(key) or []
-        if len(gs) != 1 or len(xs) != 1:
+
+def flag_already_posted(gaps, extras):
+    """Mark a gap that the poller looks to have already posted a day either side.
+
+    A payment can straddle the boundary between two daily Square reports: posted
+    on one day, listed on the next. That surfaces as a GAP on one day and, on
+    the other, a posting with no matching report row.
+
+    This annotates rather than cancels. An earlier version removed the pair, and
+    its worst case — a wrong pairing — silently deleted a real unposted payment
+    from the to-do list, which is the one failure this report can't have. A note
+    costs the reader ten seconds in TA and cannot lose money. It's also safe to
+    apply from more than one place, where consuming a pairing is not.
+
+    Only real postings count: a shadow-era WOULD_POST never reached TA.
+    """
+    by_extra = {}
+    for x in extras:
+        if x.get("status", "OK") != "OK":
             continue
-        g, x = gs[0], xs[0]
-        gd, xd = _dt(g.get("date")), _dt(x.get("date"))
-        if not gd or not xd or abs((gd - xd).days) > 2:
-            continue
-        gaps.remove(g)
-        extras.remove(x)
-        paired.append((g, x))
-    return paired
+        by_extra.setdefault((_norm(x.get("name")), _amt(x.get("amount"))), []).append(x)
+
+    for g in gaps:
+        gd = _dt(g.get("date"))
+        for x in by_extra.get((_norm(g.get("name")), _amt(g.get("amount"))), []):
+            xd = _dt(x.get("date"))
+            if gd and xd and 0 < abs((gd - xd).days) <= 2:
+                g["also_posted"] = x.get("date")
+                break
 
 
 def combine(results):
@@ -549,16 +550,15 @@ def combine(results):
 
     # The other half of a straddle can sit on the day before the span, which this
     # report doesn't otherwise look at. (The day *after* can't be checked yet —
-    # its Square report hasn't arrived — so that direction resolves in a later
-    # morning's outstanding list.)
+    # its Square report hasn't arrived — so that direction gets picked up by a
+    # later morning's outstanding list.)
     before = _dt(dates[0]) - timedelta(days=1) if dates else None
-    pool = out["extras"] + (day_extras(before.strftime("%m.%d.%Y")) if before else [])
-    for g, x in cancel_straddles(out["gaps"], pool):
-        out["matched"].append(g)
-        if x in out["extras"]:
-            out["extras"].remove(x)
-        print(f"  reconcile: {g['name']} ${g['amount']} posted {x.get('date')} but listed "
-              f"{g['date']} — one payment across two Square reports, not two.")
+    flag_already_posted(out["gaps"],
+                        out["extras"] + (day_extras(before.strftime("%m.%d.%Y")) if before else []))
+    for g in out["gaps"]:
+        if g.get("also_posted"):
+            print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']} but the bot posted "
+                  f"that amount on {g['also_posted']} — may be one payment, not two.")
     return out
 
 
@@ -623,13 +623,11 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
             continue
         out.extend(items)
         extras.extend(posted_off_report)
-    # Same straddle pairing the day's own report does. Without it, a payment
-    # posted on one day and listed on the next comes back as outstanding every
-    # morning for the whole window, long after it was resolved. The anchor day
-    # sits just past the newest edge of the window, so its extras count too.
+    # Same already-posted check the day's own report does, so an old straddle
+    # carries its warning for as long as it stays on the list. The anchor day
+    # sits just past the newest edge of the window, so its postings count too.
     extras.extend(day_extras(end.strftime("%m.%d.%Y")))
-    for g, _x in cancel_straddles([i for i in out if i.get("status") == "GAP"], extras):
-        out.remove(g)
+    flag_already_posted([i for i in out if i.get("status") == "GAP"], extras)
     out.sort(key=lambda i: (_dt(i["date"]) or datetime.min, i["name"]))
     key_items(out)
     return [i for i in out if i["clear_key"] not in cleared["keys"]]
@@ -703,7 +701,13 @@ def _blocks_html(items, accent="#c62828"):
         rows = "".join(
             f'<div style="font-size:14px;color:#222;padding:3px 0 3px 4px;">'
             f'<span style="color:#888;">&#9744;</span> &nbsp;<strong>{esc(_money(p["amount"]))}</strong>'
-            f'<span style="color:#555;"> &nbsp;paid {esc(p["date"])}</span></div>'
+            f'<span style="color:#555;"> &nbsp;paid {esc(p["date"])}</span>'
+            + (f'<div style="font-size:12px;color:#e65100;padding:2px 0 4px 22px;">'
+               f'The bot already posted this amount for this client on '
+               f'{esc(p["also_posted"])} — likely the same payment showing up on the next '
+               f'day&rsquo;s report. Check TA before posting it again.</div>'
+               if p.get("also_posted") else "")
+            + '</div>'
             for p in sorted(g["payments"], key=lambda p: _dt(p["date"]) or datetime.min)
         )
         out.append(
@@ -935,7 +939,8 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
     else:
         print("RESULT: EXCEPTIONS")
         for g in r["gaps"]:
-            print(f"  GAP         {g['name']} ${g['amount']} on {g['date']} — poller never posted (manual)")
+            print(f"  GAP         {g['name']} ${g['amount']} on {g['date']} — poller never posted (manual)"
+                  f"{'  [but posted that amount on ' + g['also_posted'] + ']' if g.get('also_posted') else ''}")
         for e in r["errors"]:
             print(f"  ERROR       {e['name']} ${e['amount']} on {e['date']} — poller status {e['status']}"
                   f"{' — ' + e['reason'] if e.get('reason') else ''} (manual)")
@@ -954,7 +959,8 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
               f"{_money(_total(backlog))}) ---")
         for b in backlog:
             print(f"  {b['date']}  {b['name']:<26} ${_amt(b['amount']):>8}  {b.get('status','')}"
-                  f"{' — ' + b['reason'] if b.get('reason') else ''}")
+                  f"{' — ' + b['reason'] if b.get('reason') else ''}"
+                  f"{'  [bot posted this amount on ' + b['also_posted'] + ']' if b.get('also_posted') else ''}")
             print(f"      clear key: {b['clear_key']}")
     return clean
 
