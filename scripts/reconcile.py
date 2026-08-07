@@ -138,6 +138,17 @@ def load_ledger_for_date(mmddyyyy):
         return []
 
 
+def date_from_csv_name(name):
+    """MM/DD/YYYY out of 'MM.DD.YYYY_Daily.Square.Log.csv'.
+
+    The transaction date normally comes from the rows themselves; this is the
+    fallback for a CSV that parses to zero payments, so a bad export degrades to
+    "no payments found" instead of silently reporting an empty backlog.
+    """
+    m = re.match(r"(\d{2})\.(\d{2})\.(\d{4})", name or "")
+    return f"{m.group(1)}/{m.group(2)}/{m.group(3)}" if m else ""
+
+
 def find_csv(date_dotted):
     name = f"{date_dotted}_Daily.Square.Log.csv"
     for root in (bot.PROJECT_ROOT, LIVE_ROOT):
@@ -284,7 +295,7 @@ def is_cleared(cleared, date, name, amount):
 
 def reconcile(csv_path):
     csv_payments = bot.read_csv(csv_path)            # [{name, date, amount}]
-    txn_date = csv_payments[0]["date"] if csv_payments else ""
+    txn_date = csv_payments[0]["date"] if csv_payments else date_from_csv_name(csv_path.name)
     ledger = load_ledger_for_date(txn_date) if txn_date else []
 
     led_by_name = {}
@@ -309,21 +320,33 @@ def reconcile(csv_path):
             errors.append({**c, "status": e.get("status"), "reason": e.get("reason", ""),
                            "account": e.get("account", "")})
 
-    # A payment the poller couldn't name (no Square customer) sits in the ledger
-    # under an empty name, so the CSV row lands in `gaps`. Re-attach it by
-    # date+amount: "we saw it but couldn't tell whose it was" is a different job
-    # for staff than "we never saw it".
+    # A CSV row lands in `gaps` whenever no ledger entry carries its name — but
+    # that also happens when the poller DID handle the payment under a different
+    # name (Square has the client as "William Stone IV", the CSV as "Cash Stone
+    # IV") or under no name at all (no Square customer). Re-attach those by
+    # date+amount, because "we tried and failed" is a different job for staff
+    # than "we never saw it".
+    #
+    # Only when the pairing is unambiguous: exactly one unmatched gap and exactly
+    # one unmatched failure at that date+amount. Two clients who each failed for
+    # $25.00 that day stay separate rather than risk grafting one's reason,
+    # account #, and alias onto the other's payment.
     leftover = [e for e in ledger if id(e) not in used and e.get("status") not in POSTED_OK]
+
+    def _n(seq, date, amount):
+        return sum(1 for x in seq if x.get("date") == date and _amt(x.get("amount")) == _amt(amount))
+
     for g in list(gaps):
-        m = next((e for e in leftover
-                  if _amt(e.get("amount")) == _amt(g["amount"]) and e.get("date") == g["date"]), None)
-        if m:
-            used.add(id(m))
-            leftover.remove(m)
-            gaps.remove(g)
-            errors.append({**g, "status": m.get("status"), "reason": m.get("reason", ""),
-                           "account": m.get("account", ""),
-                           "square_name": m.get("name", "")})
+        if _n(gaps, g["date"], g["amount"]) != 1 or _n(leftover, g["date"], g["amount"]) != 1:
+            continue
+        m = next(e for e in leftover
+                 if e.get("date") == g["date"] and _amt(e.get("amount")) == _amt(g["amount"]))
+        used.add(id(m))
+        leftover.remove(m)
+        gaps.remove(g)
+        errors.append({**g, "status": m.get("status"), "reason": m.get("reason", ""),
+                       "account": m.get("account", ""),
+                       "square_name": m.get("name", "")})
 
     posted_ok = [e for e in ledger if e.get("status") in POSTED_OK]
     extras = [e for e in posted_ok if id(e) not in used]
@@ -374,7 +397,7 @@ def unposted_for_day(date_dotted, log_reasons):
                       "reason": e.get("reason", ""), "account": e.get("account", "")})
 
     for i in items:
-        if not i.get("reason"):
+        if not i.get("reason") and i.get("status") != "GAP":
             i["reason"] = log_reasons.get(_norm(i.get("square_name") or i["name"]), "")
         i["name"] = _clean(i["name"])
     return items
@@ -394,7 +417,13 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
     out = []
     for n in range(1, days + 1):
         day = end - timedelta(days=n)
-        for it in unposted_for_day(day.strftime("%m.%d.%Y"), log_reasons):
+        try:
+            items = unposted_for_day(day.strftime("%m.%d.%Y"), log_reasons)
+        except Exception as e:
+            # A single unreadable CSV or ledger costs that day, not the report.
+            print(f"  reconcile: skipped {day.strftime('%m/%d/%Y')} in backlog scan — {e}")
+            continue
+        for it in items:
             if is_cleared(cleared, it["date"], it["name"], it["amount"]):
                 continue
             out.append(it)
@@ -415,7 +444,7 @@ def action_items(r):
     for e in r["errors"]:
         items.append(dict(e))
     for i in items:
-        if not i.get("reason"):
+        if not i.get("reason") and i.get("status") != "GAP":
             i["reason"] = log_reasons.get(_norm(i.get("square_name") or i["name"]), "")
         i["name"] = _clean(i["name"])
     items.sort(key=lambda i: i["name"])
@@ -423,7 +452,13 @@ def action_items(r):
 
 
 def _total(items):
-    return sum(float(_amt(i["amount"])) for i in items if _amt(i["amount"]).replace(".", "").isdigit())
+    total = 0.0
+    for i in items:
+        try:
+            total += float(str(i["amount"]).replace("$", "").replace(",", ""))
+        except (TypeError, ValueError):
+            pass
+    return total
 
 
 def _group(items):
@@ -643,10 +678,18 @@ def print_report(r, heals=(), backlog=()):
 
 
 def email_report(r, heals=(), backlog=()):
-    """Email the morning report to staff (Hannah) with Travis copied."""
+    """Email the morning report to staff (Hannah) with Travis copied.
+
+    Returns True only if it actually went out — the caller uses that to decide
+    whether the self-heal confirmations can be retired.
+    """
     subject, html, clean = build_report_html(r, heals, backlog)
-    bot.send_email(to=STAFF_TO, cc=ADMIN_TO, subject=subject, body=html, html=True)
-    print(f"  Emailed report to {STAFF_TO} (cc {ADMIN_TO}) — {'CLEAN' if clean else 'EXCEPTIONS'}")
+    sent = bot.send_email(to=STAFF_TO, cc=ADMIN_TO, subject=subject, body=html, html=True)
+    if sent:
+        print(f"  Emailed report to {STAFF_TO} (cc {ADMIN_TO}) — {'CLEAN' if clean else 'EXCEPTIONS'}")
+    else:
+        print(f"  Report NOT sent to {STAFF_TO} — see the email error above.")
+    return sent
 
 
 def main():
@@ -703,11 +746,16 @@ def main():
 
     all_heals, unreported_heals = load_unreported_heals()
     r = reconcile(csv_path)
-    backlog = [] if args.no_backlog else scan_backlog(r["txn_date"], args.backlog_days)
+    backlog = []
+    if not args.no_backlog:
+        try:
+            backlog = scan_backlog(r["txn_date"], args.backlog_days)
+        except Exception as e:
+            print(f"  reconcile: backlog scan failed ({e}) — sending the day's report without it.")
     clean = print_report(r, unreported_heals, backlog)
     if args.email:
-        email_report(r, unreported_heals, backlog)
-        if unreported_heals:
+        sent = email_report(r, unreported_heals, backlog)
+        if sent and unreported_heals:
             mark_heals_reported(all_heals)  # exactly-once: don't re-report tomorrow
     sys.exit(0 if clean else 2)
 
