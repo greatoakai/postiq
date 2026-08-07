@@ -481,6 +481,39 @@ def _pretty(date_slashed):
     return f"{d.strftime('%a')} {d.strftime('%m/%d')}" if d else date_slashed
 
 
+def cancel_straddles(gaps, extras):
+    """Cancel out a payment that straddles two daily Square reports.
+
+    Posted on one day, listed on the next: a GAP on one day and an EXTRA on the
+    other, the same money under both "post this in TA" and "posted, not on the
+    report". Only when the pairing is unambiguous — exactly one of each for that
+    client and amount, on days next to each other — which is the same guard
+    reconcile() applies to its within-a-day pairing. Dropping a payment off the
+    to-do list on a guess is the one mistake this report can't afford.
+
+    Mutates both lists; returns the (gap, extra) pairs it removed.
+    """
+    def index(seq):
+        out = {}
+        for i in seq:
+            out.setdefault((_norm(i.get("name")), _amt(i.get("amount"))), []).append(i)
+        return out
+
+    by_gap, by_extra, paired = index(gaps), index(extras), []
+    for key, gs in by_gap.items():
+        xs = by_extra.get(key) or []
+        if len(gs) != 1 or len(xs) != 1:
+            continue
+        g, x = gs[0], xs[0]
+        gd, xd = _dt(g.get("date")), _dt(x.get("date"))
+        if not gd or not xd or abs((gd - xd).days) > 2:
+            continue
+        gaps.remove(g)
+        extras.remove(x)
+        paired.append((g, x))
+    return paired
+
+
 def combine(results):
     """Merge per-day reconciliations into one report payload.
 
@@ -504,24 +537,8 @@ def combine(results):
     for k in ("matched", "gaps", "errors", "discrepancies", "extras", "missing_account"):
         out[k] = [x for r in results for x in r[k]]
 
-    # A payment can straddle the boundary between two daily Square reports:
-    # posted on one day, listed on the next. Over a multi-day span that surfaces
-    # as a GAP on one day and an EXTRA on the other — the same money appearing
-    # under both "post this" and "posted, not on the report". Cancel the pairs
-    # out; the payment is in TA and Square knows about it, so there is nothing
-    # to do. Same client, same amount: two unrelated payments would have to be
-    # one unlisted-but-posted and one listed-but-unposted inside the same span.
     if len(results) > 1:
-        by_key = {}
-        for x in out["extras"]:
-            by_key.setdefault((_norm(x.get("name")), _amt(x.get("amount"))), []).append(x)
-        for g in list(out["gaps"]):
-            bucket = by_key.get((_norm(g["name"]), _amt(g["amount"])))
-            if not bucket:
-                continue
-            x = bucket.pop()
-            out["gaps"].remove(g)
-            out["extras"].remove(x)
+        for g, x in cancel_straddles(out["gaps"], out["extras"]):
             out["matched"].append(g)
             print(f"  reconcile: {g['name']} ${g['amount']} posted {x.get('date')} but listed "
                   f"{g['date']} — one payment across two Square reports, not two.")
@@ -537,7 +554,7 @@ def unposted_for_day(date_dotted, log_reasons):
     """
     date_slashed = date_dotted.replace(".", "/")
     csv_path = find_csv(date_dotted)
-    items = []
+    items, extras = [], []
 
     if csv_path:
         # reconcile() already folds in every ledger failure, matched or not, so
@@ -547,6 +564,7 @@ def unposted_for_day(date_dotted, log_reasons):
             items.append({**it, "status": "GAP", "reason": "", "account": ""})
         for it in r["errors"]:
             items.append(dict(it))
+        extras = [dict(x) for x in r["extras"]]
     else:
         # No archived CSV for that day — the ledger is all we have, so gaps
         # (payments the poller never saw) can't be detected for it.
@@ -563,7 +581,7 @@ def unposted_for_day(date_dotted, log_reasons):
         if not i.get("reason") and i.get("status") != "GAP":
             i["reason"] = log_reasons.get(_norm(i.get("square_name") or i["name"]), "")
         i["name"] = _clean(i["name"])
-    return items
+    return items, extras
 
 
 def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
@@ -577,16 +595,22 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
     if not end:
         return []
     log_reasons = reasons_from_logs()
-    out = []
+    out, extras = [], []
     for n in range(1, days + 1):
         day = end - timedelta(days=n)
         try:
-            items = unposted_for_day(day.strftime("%m.%d.%Y"), log_reasons)
+            items, day_extras = unposted_for_day(day.strftime("%m.%d.%Y"), log_reasons)
         except Exception as e:
             # A single unreadable CSV or ledger costs that day, not the report.
             print(f"  reconcile: skipped {day.strftime('%m/%d/%Y')} in backlog scan — {e}")
             continue
         out.extend(items)
+        extras.extend(day_extras)
+    # Same straddle pairing the day's own report does. Without it, a payment
+    # posted on one day and listed on the next comes back as outstanding every
+    # morning for the whole window, long after it was resolved.
+    for g, _x in cancel_straddles([i for i in out if i.get("status") == "GAP"], extras):
+        out.remove(g)
     out.sort(key=lambda i: (_dt(i["date"]) or datetime.min, i["name"]))
     key_items(out)
     return [i for i in out if i["clear_key"] not in cleared["keys"]]
@@ -744,8 +768,13 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
                    f'posted automatically — nothing to do for those.')
         else:
             # No usable export, so this list is the bot's own record and can only
-            # show what it tried — not a payment it never saw.
-            sub = (f'No payments came through on {reports}, so this list is the bot&rsquo;s own '
+            # show what it tried — not a payment it never saw. "Didn't arrive"
+            # and "arrived empty" are different problems; say which.
+            gone = ("None of " + reports + " arrived" if len(span) > 1
+                    else "This day&rsquo;s Square report didn&rsquo;t arrive")
+            sub = (f'{gone}, so this list is the bot&rsquo;s own record — a payment it never saw '
+                   f'wouldn&rsquo;t be here. Tell Travis.' if r.get("no_csv") else
+                   f'No payments came through on {reports}, so this list is the bot&rsquo;s own '
                    f'record and may not be the whole story. Tell Travis if you expected more.')
         headline = (
             f'<div style="background:#fdecea;border-left:5px solid #c62828;padding:14px 16px;margin:16px 0;">'
@@ -790,12 +819,15 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
             f'</div></div>')
 
     parts = [headline]
-    partial = [] if r.get("no_csv") else missing
-    if partial:
+    # Skip only when the headline already named the day — a single missing day
+    # with nothing to post. Every other case needs the days spelled out, including
+    # the one this exists for: no report arrived and there is work to do.
+    named_in_headline = bool(r.get("no_csv")) and len(span) <= 1 and not today_items
+    if missing and not named_in_headline:
         parts.append(
             f'<p style="background:#fff8e1;border-left:5px solid #e65100;padding:12px 14px;'
             f'margin:14px 0;font-size:13px;color:#555;">No Square report arrived for '
-            f'{esc(", ".join(partial))}, so {"that day is" if len(partial) == 1 else "those days are"} '
+            f'{esc(", ".join(missing))}, so {"that day is" if len(missing) == 1 else "those days are"} '
             f'covered from the bot&rsquo;s own record only — a payment it never saw wouldn&rsquo;t '
             f'show up here. Travis has been told.</p>')
 
@@ -959,12 +991,13 @@ def main():
             # keeping a date watermark. A watermark would also swallow anything
             # discovered later on those dates — exactly what happens when a late
             # Square report is archived and reveals a payment nobody has seen.
-            # Anchored on today with a little slack: the morning report anchors
-            # on yesterday, so its window reaches one day further back than a
-            # today-anchored scan of the same length would.
+            # Anchored on today, reaching far enough back to see everything the
+            # last report could have shown: Monday's report anchors on Friday
+            # (today-3) and scans backlog_days before that, so a today-anchored
+            # scan needs three extra days to cover the same ground.
             today = datetime.now().strftime("%m/%d/%Y")
             n = 0
-            for it in scan_backlog(today, args.backlog_days + 2, cleared=c):
+            for it in scan_backlog(today, args.backlog_days + 3, cleared=c):
                 if (_dt(it["date"]) or datetime.max) <= through:
                     c["keys"].append(it["clear_key"])
                     n += 1
