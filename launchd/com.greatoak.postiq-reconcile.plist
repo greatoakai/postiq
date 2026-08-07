@@ -3,11 +3,16 @@
 <!--
   com.greatoak.postiq-reconcile — THE daily PostIQ report.
 
-  Runs at 8:00 AM, after run_daily.sh (7:00) has synced and archived yesterday's
-  Square CSV. Reconciles yesterday's poller ledger against that CSV and emails
-  the result to Hannah (cc Travis): what still has to be posted by hand in TA,
-  plus the rolling 45-day list of payments that never posted automatically.
-  Posts nothing itself.
+  Runs at 8:00 AM, after run_daily.sh (7:00) has synced and archived the day's
+  Square CSV. Reconciles the poller ledger against that CSV and emails the
+  result to Hannah (cc Travis): what still has to be posted by hand in TA, plus
+  the rolling 45-day list of payments that never posted automatically. Posts
+  nothing itself.
+
+  Scheduled every day, but the script decides what to send: weekdays cover
+  yesterday, Monday covers Friday + Saturday + Sunday in one email, and the
+  Saturday and Sunday runs send nothing. Leave the schedule daily — moving the
+  weekend logic into launchd would split it across two places.
 
   Since the 2026-06-18 live cutover this is the only daily staff email — the
   batch no longer sends one. If this job stops running, nobody hears about

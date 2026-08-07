@@ -25,10 +25,14 @@ BACKLOG_DAYS days that never posted automatically and hasn't been marked
 cleared. Staff work that list in TA; Travis clears it with --clear-through once
 they confirm it's done.
 
+Weekdays cover yesterday. Monday covers Friday, Saturday and Sunday in one
+email; Saturday and Sunday send nothing, so the weekend's payments arrive as a
+single Monday to-do list instead of three reports nobody read.
+
 Usage:
   python3 scripts/reconcile.py --csv "Square Payment Archive/06.13.2026_Daily.Square.Log.csv"
   python3 scripts/reconcile.py --date 06.13.2026
-  python3 scripts/reconcile.py --email                     # yesterday, emailed to staff
+  python3 scripts/reconcile.py --email                     # the day(s) due today, to staff
   python3 scripts/reconcile.py --clear-through 07.31.2026  # backlog confirmed done through 7/31
   python3 scripts/reconcile.py --clear sq:rpo9hD8fXgFEtKJnXa0Rs5Co688YY
 """
@@ -449,6 +453,59 @@ def reconcile_ledger_only(date_slashed):
             "no_csv": True}
 
 
+def default_target_dates(now):
+    """The days this morning's report should cover, as MM.DD.YYYY.
+
+    Weekdays cover yesterday. Monday covers Friday, Saturday and Sunday in one
+    email — the office isn't reading mail over the weekend, and three separate
+    reports arriving Monday morning is three chances to work the wrong one.
+    Saturday and Sunday send nothing; their payments wait for Monday.
+    """
+    wd = now.weekday()                      # Mon=0 ... Sun=6
+    if wd >= 5:                             # Saturday, Sunday
+        return []
+    span = 3 if wd == 0 else 1              # Monday reaches back to Friday
+    return [(now - timedelta(days=n)).strftime("%m.%d.%Y") for n in range(span, 0, -1)]
+
+
+def result_for_date(date_dotted):
+    """Reconcile one day, from its Square report if we have it, else the ledger."""
+    csv_path = find_csv(date_dotted)
+    if csv_path:
+        return reconcile(csv_path)
+    return reconcile_ledger_only(date_dotted.replace(".", "/"))
+
+
+def _pretty(date_slashed):
+    d = _dt(date_slashed)
+    return f"{d.strftime('%a')} {d.strftime('%m/%d')}" if d else date_slashed
+
+
+def combine(results):
+    """Merge per-day reconciliations into one report payload.
+
+    Concatenated rather than sectioned by day: the reader wants one to-do list,
+    and a client who failed on both Friday and Sunday should appear once with
+    two dated payments, not in two places. Every payment block already carries
+    its own date.
+    """
+    dates = sorted((r["txn_date"] for r in results if r["txn_date"]),
+                   key=lambda d: _dt(d) or datetime.min)
+    out = {
+        "csv": ", ".join(r["csv"] for r in results),
+        "txn_date": dates[0] if len(dates) == 1 else f"{_pretty(dates[0])} – {_pretty(dates[-1])}"
+                    if dates else "",
+        "txn_dates": dates,
+        "csv_count": sum(r["csv_count"] for r in results),
+        "ledger_count": sum(r["ledger_count"] for r in results),
+        "no_csv": all(r.get("no_csv") for r in results),
+        "no_csv_dates": [r["txn_date"] for r in results if r.get("no_csv")],
+    }
+    for k in ("matched", "gaps", "errors", "discrepancies", "extras", "missing_account"):
+        out[k] = [x for r in results for x in r[k]]
+    return out
+
+
 def unposted_for_day(date_dotted, log_reasons):
     """Every payment on one past day that never posted automatically.
 
@@ -635,6 +692,14 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
     clean = not (r["gaps"] or r["errors"] or r["discrepancies"] or r["extras"])
     date = r["txn_date"] or r["csv"]
 
+    span = r.get("txn_dates") or []
+    if len(span) > 1:
+        first, last = (_dt(span[0]), _dt(span[-1]))
+        covers = (f"{first.strftime('%A')} through {last.strftime('%A')}&rsquo;s"
+                  if first and last else "These days&rsquo;")
+    else:
+        covers = "Yesterday&rsquo;s"
+
     bits = []
     if today_items:
         bits.append(f"{len(today_items)} to post")
@@ -647,9 +712,10 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
     # ── Headline ──
     if today_items:
         n = len(today_items)
+        reports = "these days&rsquo; Square reports" if len(span) > 1 else "this day&rsquo;s Square report"
         if r["csv_count"]:
-            sub = (f'The other {len(r["matched"])} of {r["csv_count"]} payments on this day&rsquo;s '
-                   f'Square report posted automatically — nothing to do for those.')
+            sub = (f'The other {len(r["matched"])} of {r["csv_count"]} payments on {reports} '
+                   f'posted automatically — nothing to do for those.')
         else:
             # No usable export, so this list is the bot's own record and can only
             # show what it tried — not a payment it never saw.
@@ -689,6 +755,14 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
             f'</div></div>')
 
     parts = [headline]
+    partial = [d for d in (r.get("no_csv_dates") or []) if not r.get("no_csv")]
+    if partial:
+        parts.append(
+            f'<p style="background:#fff8e1;border-left:5px solid #e65100;padding:12px 14px;'
+            f'margin:14px 0;font-size:13px;color:#555;">No Square report arrived for '
+            f'{esc(", ".join(partial))}, so {"that day is" if len(partial) == 1 else "those days are"} '
+            f'covered from the bot&rsquo;s own record only — a payment it never saw wouldn&rsquo;t '
+            f'show up here. Travis has been told.</p>')
 
     # ── Today's manual postings ──
     if today_items:
@@ -750,7 +824,7 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
         f'<div style="max-width:720px;margin:0 auto;background:#fff;padding:24px 28px;'
         f'font-family:Arial,Helvetica,sans-serif;color:#333;">'
         f'<h2 style="color:#346756;margin:0;">PostIQ Daily Reconcile — {esc(date)}</h2>'
-        f'<p style="color:#666;font-size:13px;margin:4px 0 0;">Yesterday&rsquo;s Square card payments '
+        f'<p style="color:#666;font-size:13px;margin:4px 0 0;">{covers} Square card payments '
         f'vs. what the bot actually posted in TherapyAppointment.</p>'
         f'{"".join(parts)}'
         f'<p style="color:#999;font-size:12px;margin-top:28px;border-top:1px solid #eee;padding-top:12px;">'
@@ -818,7 +892,9 @@ def main():
     ap = argparse.ArgumentParser(description="Daily poller-vs-CSV reconciliation + manual-posting report.")
     ap.add_argument("--csv", help="Path to the day's CSV.")
     ap.add_argument("--date", help="MM.DD.YYYY — find the CSV by date.")
-    ap.add_argument("--email", action="store_true", help="Email the report to staff.")
+    ap.add_argument("--email", action="store_true",
+                    help="Email the report to staff. With no --date/--csv this covers yesterday, "
+                         "or Friday+Saturday+Sunday when run on a Monday, and nothing on a weekend.")
     ap.add_argument("--backlog-days", type=int, default=BACKLOG_DAYS,
                     help=f"Look-back window for still-outstanding payments (default {BACKLOG_DAYS}).")
     ap.add_argument("--no-backlog", action="store_true", help="Skip the outstanding-payments scan.")
@@ -862,37 +938,50 @@ def main():
         save_cleared(c)
         sys.exit(0)
 
-    # Default to yesterday (what the morning launchd job reconciles).
-    date_dotted = args.date or (datetime.now() - timedelta(days=1)).strftime("%m.%d.%Y")
-    csv_path = Path(args.csv) if args.csv else find_csv(date_dotted)
-
-    if args.csv and not csv_path.exists():
-        print(f"reconcile: no such CSV: {args.csv}")
-        sys.exit(1)
+    if args.csv:
+        csv_path = Path(args.csv)
+        if not csv_path.exists():
+            print(f"reconcile: no such CSV: {args.csv}")
+            sys.exit(1)
+        results = [reconcile(csv_path)]
+    elif args.date:
+        results = [result_for_date(args.date)]
+    else:
+        targets = default_target_dates(datetime.now())
+        if not targets:
+            print("reconcile: Saturday/Sunday — no report today; these payments go out "
+                  "in Monday's email with Friday's.")
+            sys.exit(0)
+        print(f"reconcile: covering {', '.join(targets)}")
+        results = [result_for_date(d) for d in targets]
 
     all_heals, unreported_heals = load_unreported_heals()
-    if csv_path and csv_path.exists():
-        r = reconcile(csv_path)
-    else:
-        # The Square report didn't arrive. Report from the ledger anyway — this
-        # is the only daily staff email, and its outstanding list doesn't depend
-        # on the CSV — and tell Travis the export is missing.
-        print(f"reconcile: no Square CSV for {date_dotted} — reporting from the poller ledger only.")
-        r = reconcile_ledger_only(date_dotted.replace(".", "/"))
+    r = combine(results)
+
+    # A day whose Square report never arrived is still reported — from the
+    # ledger — because this is the only daily staff email and its outstanding
+    # list doesn't need the CSV. Travis hears about the missing export.
+    missing = r.get("no_csv_dates") or []
+    if missing:
+        print(f"reconcile: no Square CSV for {', '.join(missing)} — using the poller ledger for "
+              f"{'that day' if len(missing) == 1 else 'those days'}.")
         if args.email:
             try:
                 bot.send_email(to=ADMIN_TO, cc=None,
-                               subject=f"PostIQ — no Square report for {date_dotted}",
-                               body=f"No Square CSV was found for {date_dotted}, so this morning's "
-                                    f"staff report was built from the poller ledger alone and can't "
-                                    f"flag payments the poller never saw. Check the S3 sync.",
+                               subject=f"PostIQ — no Square report for {', '.join(missing)}",
+                               body=f"No Square CSV was found for {', '.join(missing)}, so this "
+                                    f"morning's staff report covers "
+                                    f"{'that day' if len(missing) == 1 else 'those days'} from the "
+                                    f"poller ledger alone and can't flag payments the poller never "
+                                    f"saw. Check the S3 sync.",
                                html=False)
             except Exception:
                 pass
     backlog, backlog_failed = [], False
     if not args.no_backlog:
         try:
-            backlog = scan_backlog(r["txn_date"], args.backlog_days)
+            anchor = (r.get("txn_dates") or [r["txn_date"]])[0]
+            backlog = scan_backlog(anchor, args.backlog_days)
         except Exception as e:
             backlog_failed = True
             print(f"  reconcile: backlog scan failed ({e}) — sending the day's report without it.")
