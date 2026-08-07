@@ -30,7 +30,7 @@ Usage:
   python3 scripts/reconcile.py --date 06.13.2026
   python3 scripts/reconcile.py --email                     # yesterday, emailed to staff
   python3 scripts/reconcile.py --clear-through 07.31.2026  # backlog confirmed done through 7/31
-  python3 scripts/reconcile.py --clear "07/29/2026|jayden akridge|25.00"
+  python3 scripts/reconcile.py --clear sq:rpo9hD8fXgFEtKJnXa0Rs5Co688YY
 """
 
 import argparse
@@ -280,8 +280,26 @@ def reasons_from_logs():
 # CLEARED LIST — payments staff have confirmed they posted by hand
 # =============================================================================
 
-def item_key(date, name, amount):
-    return f"{date}|{_norm(name)}|{_amt(amount)}"
+def key_items(items):
+    """Stamp each outstanding payment with the identity used by the cleared list.
+
+    The Square payment id when we have one: it doesn't change when the display
+    name flips between the Square and CSV spellings, and it tells two identical
+    payments apart (one client, one day, the same copay twice — clearing one of
+    those must not silently drop the other). Payments the poller never saw have
+    no id, so they fall back to date+name+amount plus an occurrence number.
+
+    Numbered over the unfiltered list so a key stays stable as items clear.
+    """
+    seen = {}
+    for i in items:
+        if i.get("id"):
+            i["clear_key"] = f"sq:{i['id']}"
+            continue
+        base = f"{i['date']}|{_norm(i['name'])}|{_amt(i['amount'])}"
+        seen[base] = seen.get(base, 0) + 1
+        i["clear_key"] = base if seen[base] == 1 else f"{base}#{seen[base]}"
+    return items
 
 
 def load_cleared():
@@ -308,15 +326,7 @@ def save_cleared(c):
     CLEARED_FILE.write_text(json.dumps({"keys": sorted(set(c["keys"]))}, indent=2))
 
 
-def is_cleared(cleared, date, name, amount, *aliases):
-    """Has this payment been marked handled?
 
-    Checks every spelling we know for it: the display name flips between the
-    Square name and the CSV name depending on whether that day's CSV has been
-    archived yet, and a payment cleared under one shouldn't come back under the
-    other.
-    """
-    return any(n and item_key(date, n, amount) in cleared["keys"] for n in (name, *aliases))
 
 
 # =============================================================================
@@ -467,7 +477,8 @@ def unposted_for_day(date_dotted, log_reasons):
             items.append({"name": e.get("name") or "(unknown client)",
                           "date": e.get("date") or date_slashed,
                           "amount": e.get("amount"), "status": e.get("status"),
-                          "reason": e.get("reason", ""), "account": e.get("account", "")})
+                          "reason": e.get("reason", ""), "account": e.get("account", ""),
+                          "id": e.get("id")})
 
     for i in items:
         if not i.get("reason") and i.get("status") != "GAP":
@@ -496,12 +507,10 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
             # A single unreadable CSV or ledger costs that day, not the report.
             print(f"  reconcile: skipped {day.strftime('%m/%d/%Y')} in backlog scan — {e}")
             continue
-        for it in items:
-            if is_cleared(cleared, it["date"], it["name"], it["amount"], it.get("square_name")):
-                continue
-            out.append(it)
+        out.extend(items)
     out.sort(key=lambda i: (_dt(i["date"]) or datetime.min, i["name"]))
-    return out
+    key_items(out)
+    return [i for i in out if i["clear_key"] not in cleared["keys"]]
 
 
 # =============================================================================
@@ -610,7 +619,7 @@ HOW_TO_POST = (
 )
 
 
-def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS):
+def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed=False):
     """Build (subject, html, clean) for the morning report. Pure — no send."""
     today_items = action_items(r)
     backlog = list(backlog)
@@ -663,6 +672,14 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS):
             f'<div style="font-size:13px;color:#555;margin-top:5px;">Nothing failed in the bot&rsquo;s '
             f'own record either, but it couldn&rsquo;t be checked against Square. If the practice took '
             f'card payments that day, tell Travis before assuming there&rsquo;s nothing to do.</div></div>')
+    elif verify:
+        headline = (
+            f'<div style="background:#fff8e1;border-left:5px solid #6a1b9a;padding:14px 16px;margin:16px 0;">'
+            f'<div style="font-size:17px;font-weight:700;color:#6a1b9a;">'
+            f'Nothing new to post, but {len(verify)} payment'
+            f'{"s" if len(verify) != 1 else ""} to check.</div>'
+            f'<div style="font-size:13px;color:#555;margin-top:5px;">The rest of this day&rsquo;s '
+            f'Square report posted automatically. See &ldquo;Check these&rdquo; below.</div></div>')
     else:
         headline = (
             f'<div style="background:#e8f5e9;border-left:5px solid #2e7d32;padding:14px 16px;margin:16px 0;">'
@@ -679,6 +696,12 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS):
         parts.append(_blocks_html(today_items))
 
     # ── Rolling backlog ──
+    if backlog_failed:
+        parts.append(
+            '<p style="background:#fff8e1;border-left:5px solid #e65100;padding:12px 14px;'
+            'margin:20px 0;font-size:13px;color:#555;"><strong>The list of older outstanding '
+            'payments couldn&rsquo;t be built this morning</strong>, so it isn&rsquo;t below — that '
+            'does not mean there are none. Travis has been told.</p>')
     if backlog:
         parts.append(_h2(f"Still outstanding — last {days} days "
                          f"({len(backlog)} payments, {_money(_total(backlog))})", "#e65100"))
@@ -772,17 +795,17 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
         for b in backlog:
             print(f"  {b['date']}  {b['name']:<26} ${_amt(b['amount']):>8}  {b.get('status','')}"
                   f"{' — ' + b['reason'] if b.get('reason') else ''}")
-            print(f"      clear key: {item_key(b['date'], b['name'], b['amount'])}")
+            print(f"      clear key: {b['clear_key']}")
     return clean
 
 
-def email_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
+def email_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed=False):
     """Email the morning report to staff (Hannah) with Travis copied.
 
     Returns True only if it actually went out — the caller uses that to decide
     whether the self-heal confirmations can be retired.
     """
-    subject, html, clean = build_report_html(r, heals, backlog, days)
+    subject, html, clean = build_report_html(r, heals, backlog, days, backlog_failed)
     sent = bot.send_email(to=STAFF_TO, cc=ADMIN_TO, subject=subject, body=html, html=True)
     if sent:
         print(f"  Emailed report to {STAFF_TO} (cc {ADMIN_TO}) — {'CLEAN' if clean else 'EXCEPTIONS'}")
@@ -800,7 +823,8 @@ def main():
                     help=f"Look-back window for still-outstanding payments (default {BACKLOG_DAYS}).")
     ap.add_argument("--no-backlog", action="store_true", help="Skip the outstanding-payments scan.")
     ap.add_argument("--clear", action="append", default=[], metavar="KEY",
-                    help="Mark one outstanding payment as handled (key printed by the console report).")
+                    help="Mark one outstanding payment as handled (the clear key printed "
+                         "beside it in the console report).")
     ap.add_argument("--clear-through", metavar="MM.DD.YYYY",
                     help="Mark everything on or before this date as handled.")
     args = ap.parse_args()
@@ -831,7 +855,7 @@ def main():
             n = 0
             for it in scan_backlog(today, args.backlog_days + 2, cleared=c):
                 if (_dt(it["date"]) or datetime.max) <= through:
-                    c["keys"].append(item_key(it["date"], it["name"], it["amount"]))
+                    c["keys"].append(it["clear_key"])
                     n += 1
             print(f"  cleared {n} outstanding payment(s) dated on or before "
                   f"{through.strftime('%m/%d/%Y')}")
@@ -865,15 +889,16 @@ def main():
                                html=False)
             except Exception:
                 pass
-    backlog = []
+    backlog, backlog_failed = [], False
     if not args.no_backlog:
         try:
             backlog = scan_backlog(r["txn_date"], args.backlog_days)
         except Exception as e:
+            backlog_failed = True
             print(f"  reconcile: backlog scan failed ({e}) — sending the day's report without it.")
     clean = print_report(r, unreported_heals, backlog, args.backlog_days)
     if args.email:
-        sent = email_report(r, unreported_heals, backlog, args.backlog_days)
+        sent = email_report(r, unreported_heals, backlog, args.backlog_days, backlog_failed)
         if sent and unreported_heals:
             mark_heals_reported(all_heals)  # exactly-once: don't re-report tomorrow
         if not sent:
