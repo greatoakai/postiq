@@ -1,18 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  com.greatoak.postiq-reconcile — daily emailed reconcile for the shadow proving window.
+  com.greatoak.postiq-reconcile — THE daily PostIQ report.
 
-  Runs at 8:00 AM (after the 7:00 batch), reconciles YESTERDAY's poller ledger
-  against yesterday's CSV, and emails the result (CLEAN or itemized exceptions)
-  to Travis. Posts nothing. Pairs with the shadow poller during the proving window.
+  Runs at 8:00 AM, after run_daily.sh (7:00) has synced and archived yesterday's
+  Square CSV. Reconciles yesterday's poller ledger against that CSV and emails
+  the result to Hannah (cc Travis): what still has to be posted by hand in TA,
+  plus the rolling 45-day list of payments that never posted automatically.
+  Posts nothing itself.
+
+  Since the 2026-06-18 live cutover this is the only daily staff email — the
+  batch no longer sends one. If this job stops running, nobody hears about
+  failed postings.
 
   Install:
     cp launchd/com.greatoak.postiq-reconcile.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/com.greatoak.postiq-reconcile.plist
-  Remove after the proving window (before cutover wires reconcile into the batch):
-    launchctl unload ~/Library/LaunchAgents/com.greatoak.postiq-reconcile.plist
-    rm ~/Library/LaunchAgents/com.greatoak.postiq-reconcile.plist
+  Once staff confirm they've worked the outstanding list:
+    python3 scripts/reconcile.py --clear-through MM.DD.YYYY
 -->
 <plist version="1.0">
 <dict>

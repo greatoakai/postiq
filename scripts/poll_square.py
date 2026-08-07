@@ -96,15 +96,17 @@ def save_state(state):
 LEDGER_DIR = bot.DATA_DIR / "poll_ledger"
 
 
-def record_ledger(payment_id, name, date, amount, status, account=""):
+def record_ledger(payment_id, name, date, amount, status, account="", reason=""):
     """Append/update a payment in the per-transaction-date ledger (idempotent by id).
 
     The ledger is the poller's record of what it did (or, in shadow mode, would
     do) each day — it's what the daily reconciliation diffs against the full CSV.
     `date` is MM/DD/YYYY (the Square transaction date). status is one of:
-    OK / FAILED / ERROR / SKIPPED_NO_NAME / WOULD_POST (shadow).
+    OK / FAILED / FLAGGED / ERROR / SKIPPED_NO_NAME / WOULD_POST (shadow).
     `account` is the Square customer reference_id == TA "Account Number"
     (C#########) used as the deterministic TA match key; "" if Square has none.
+    `reason` is the failure text for non-OK outcomes — reconcile.py turns it into
+    the plain-language "why it didn't post" staff see in the morning report.
     """
     if not date:
         return
@@ -118,7 +120,8 @@ def record_ledger(payment_id, name, date, amount, status, account=""):
             entries = []
     entries = [e for e in entries if e.get("id") != payment_id]
     entries.append({"id": payment_id, "name": name, "date": date,
-                    "amount": amount, "status": status, "account": account})
+                    "amount": amount, "status": status, "account": account,
+                    "reason": reason})
     path.write_text(json.dumps(entries, indent=2))
 
 
@@ -528,7 +531,7 @@ def main():
                 f"[acct {item['account'] or 'NONE'}]")
         for u in unresolved:
             record_ledger(u["id"], u["name"], u["date"], u["amount"],
-                          "SKIPPED_NO_NAME", u["account"])
+                          "SKIPPED_NO_NAME", u["account"], "Square payment has no customer attached — payer unknown")
             log(f"  SKIP (no name) ${u['amount']} on {u['date']} (sq:{u['id']})")
         state.update(last_polled_at=next_cursor, last_action_at=now.isoformat())
         save_state(state)
@@ -538,12 +541,12 @@ def main():
     # --- LIVE: post for real, record outcomes to the ledger ---
     for u in unresolved:
         record_ledger(u["id"], u["name"], u["date"], u["amount"],
-                      "SKIPPED_NO_NAME", u["account"])
+                      "SKIPPED_NO_NAME", u["account"], "Square payment has no customer attached — payer unknown")
         log(f"  SKIP (no name resolved) ${u['amount']} on {u['date']} (sq:{u['id']}) — needs manual posting")
     results = post_new_payments(to_post, posted_ids)
     for r in results:
         record_ledger(r["id"], r["name"], r["date"], r["amount"],
-                      r["status"], r.get("account", ""))
+                      r["status"], r.get("account", ""), r.get("error", ""))
     state.update(
         posted_payment_ids=sorted(posted_ids),
         last_polled_at=next_cursor,
