@@ -41,7 +41,7 @@ import argparse
 import json
 import re
 import sys
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import datetime, timedelta
 from html import escape as esc
 from pathlib import Path
@@ -520,22 +520,34 @@ def flag_already_posted(gaps, extras):
 
     Only real postings count: a shadow-era WOULD_POST never reached TA.
     """
-    def index(seq, keep=lambda i: True):
-        out = {}
-        for i in seq:
-            if keep(i):
-                out.setdefault((_norm(i.get("name")), _amt(i.get("amount"))), []).append(i)
-        return out
+    by_extra = {}
+    for x in extras:
+        if x.get("status", "OK") == "OK":
+            by_extra.setdefault((_norm(x.get("name")), _amt(x.get("amount"))), []).append(x)
 
-    by_gap = index(gaps)
-    by_extra = index(extras, keep=lambda x: x.get("status", "OK") == "OK")
-    for key, gs in by_gap.items():
-        xs = by_extra.get(key) or []
-        if len(gs) != 1 or len(xs) != 1:
+    # Candidate pairs first, then keep only the mutually exclusive ones. Counting
+    # over the whole list instead would let a client's five weekly $75 charges
+    # suppress the note for the one real straddle among them, and would let a
+    # posting from two months ago count against a pairing a day apart.
+    pairs = []
+    for g in gaps:
+        gd = _dt(g.get("date"))
+        if not gd:
             continue
-        gd, xd = _dt(gs[0].get("date")), _dt(xs[0].get("date"))
-        if gd and xd and 0 < abs((gd - xd).days) <= 2:
-            gs[0]["also_posted"] = xs[0].get("date")
+        for x in by_extra.get((_norm(g.get("name")), _amt(g.get("amount"))), []):
+            xd = _dt(x.get("date"))
+            if xd and abs((gd - xd).days) <= 2:
+                pairs.append((g, x, (gd - xd).days))
+
+    # Same-day pairs count as a competing claim on the posting but are never
+    # flagged themselves — reconcile() resolves same-day matches by name before
+    # anything reaches here, so a same-day pair means something we don't
+    # understand, and the safe reading of that is "no note".
+    g_uses = Counter(id(g) for g, _, _ in pairs)
+    x_uses = Counter(id(x) for _, x, _ in pairs)
+    for g, x, delta in pairs:
+        if delta and g_uses[id(g)] == 1 and x_uses[id(x)] == 1:
+            g["also_posted"] = x.get("date")
 
 
 def combine(results):
@@ -561,17 +573,6 @@ def combine(results):
     for k in ("matched", "gaps", "errors", "discrepancies", "extras", "missing_account"):
         out[k] = [x for r in results for x in r[k]]
 
-    # The other half of a straddle can sit on the day before the span, which this
-    # report doesn't otherwise look at. (The day *after* can't be checked yet —
-    # its Square report hasn't arrived — so that direction gets picked up by a
-    # later morning's outstanding list.)
-    before = _dt(dates[0]) - timedelta(days=1) if dates else None
-    flag_already_posted(out["gaps"],
-                        out["extras"] + (day_extras(before.strftime("%m.%d.%Y")) if before else []))
-    for g in out["gaps"]:
-        if g.get("also_posted"):
-            print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']}, bot posted that "
-                  f"amount on {g['also_posted']} — may be one payment on two reports.")
     return out
 
 
@@ -614,11 +615,15 @@ def unposted_for_day(date_dotted, log_reasons):
     return items, extras
 
 
-def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
+def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None, extras_out=None):
     """Payments from the `days` before `before_date` that still aren't posted.
 
-    `before_date` is the day this report covers (MM/DD/YYYY) — that day's own
-    misses are listed separately, so the backlog starts the day before it.
+    `before_date` is the earliest day this report covers (MM/DD/YYYY) — those
+    days' own misses are listed separately, so the backlog starts the day before.
+
+    `extras_out`, if given, collects the postings that had no matching row on
+    their day's Square report, so the caller can run one already-posted check
+    across the whole email.
     """
     cleared = cleared or load_cleared()
     end = _dt(before_date)
@@ -636,11 +641,8 @@ def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None):
             continue
         out.extend(items)
         extras.extend(posted_off_report)
-    # Same already-posted check the day's own report does, so an old straddle
-    # carries its warning for as long as it stays on the list. The anchor day
-    # sits just past the newest edge of the window, so its postings count too.
-    extras.extend(day_extras(end.strftime("%m.%d.%Y")))
-    flag_already_posted([i for i in out if i.get("status") == "GAP"], extras)
+    if extras_out is not None:
+        extras_out.extend(extras)
     out.sort(key=lambda i: (_dt(i["date"]) or datetime.min, i["name"]))
     key_items(out)
     return [i for i in out if i["clear_key"] not in cleared["keys"]]
@@ -1085,14 +1087,34 @@ def main():
                                html=False)
             except Exception:
                 pass
-    backlog, backlog_failed = [], False
+    anchor = (r.get("txn_dates") or [r["txn_date"]])[0]
+    backlog, backlog_extras, backlog_failed = [], [], False
     if not args.no_backlog:
         try:
-            anchor = (r.get("txn_dates") or [r["txn_date"]])[0]
-            backlog = scan_backlog(anchor, args.backlog_days)
+            backlog = scan_backlog(anchor, args.backlog_days, extras_out=backlog_extras)
         except Exception as e:
             backlog_failed = True
             print(f"  reconcile: backlog scan failed ({e}) — sending the day's report without it.")
+
+    # One already-posted check across everything this email will show, over one
+    # shared pool of postings. Run per-section instead and each section could
+    # spend the same posting on a different payment, telling the reader two were
+    # handled when one was. Deduped by payment id for the same reason: the day's
+    # own postings and the backlog's overlap at the edge.
+    pool, seen = [], set()
+    before = _dt(anchor)
+    for x in (list(r["extras"]) + backlog_extras
+              + (day_extras((before - timedelta(days=1)).strftime("%m.%d.%Y")) if before else [])):
+        k = x.get("id") or (_norm(x.get("name")), _amt(x.get("amount")), x.get("date"))
+        if k in seen:
+            continue
+        seen.add(k)
+        pool.append(x)
+    flag_already_posted(r["gaps"] + backlog, pool)
+    for g in r["gaps"] + backlog:
+        if g.get("also_posted"):
+            print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']}, bot posted that "
+                  f"amount on {g['also_posted']} — may be one payment on two reports.")
     clean = print_report(r, unreported_heals, backlog, args.backlog_days)
     if args.email:
         sent = email_report(r, unreported_heals, backlog, args.backlog_days, backlog_failed)
