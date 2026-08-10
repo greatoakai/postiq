@@ -1111,8 +1111,13 @@ def click_appointment_by_date(page, date_str, name):
     (MM/DD/YYYY) before searching.
 
     Resolution order:
-      1. Exact date match on the transaction date
-      2. If no exact match, scan visible appointment links within
+      1. Exact date match on the transaction date, among rows that are valid
+         posting targets. If rows exist on the date but none is a valid target
+         (all rescheduled or cancelled), FLAG for manual review — we know the
+         session moved but not where to, and neither the nearby-date scan (past
+         dates only) nor V1 (allocates by outstanding charge, not by date) can
+         settle that without risking a misallocation.
+      2. If no rows at all on the date, scan visible appointment links within
          APPT_MATCH_LOOKBACK_DAYS prior, keep only valid posting targets
          (_appt_target_eligible — Active / chargeable cancellation, never a
          rescheduled or plainly-cancelled slot), then pick the closest.
@@ -1139,26 +1144,40 @@ def click_appointment_by_date(page, date_str, name):
     # --- Step 1: Try exact date match ---
     date_links = page.locator(f"a:has-text('{ta_date}')").all()
 
-    if len(date_links) == 1:
-        print(f"  Found appointment: {date_links[0].text_content().strip()}")
-        date_links[0].click()
+    # Filter for valid posting targets BEFORE branching on the count, so a lone
+    # row on the date gets the same status check the multi-row case gets — a
+    # single "Rescheduled to ..." row on the payment date is not a target.
+    eligible = [l for l in date_links if _appt_target_eligible(l)]
+
+    if len(eligible) == 1:
+        print(f"  Found appointment: {eligible[0].text_content().strip()}")
+        eligible[0].click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
         return None  # exact match, no note needed
 
-    if len(date_links) > 1:
-        # Multiple rows on the same date — keep only valid posting targets
-        # (Active or chargeable cancellation; drop Rescheduled / plain Cancelled).
-        eligible = [l for l in date_links if _appt_target_eligible(l)]
-        if len(eligible) == 1:
-            print(f"  Multiple rows on {ta_date}, picking the eligible appointment")
-            eligible[0].click()
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1000)
-            return None  # resolved via status
-
+    if len(eligible) > 1:
         raise Exception(
             f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review"
+        )
+
+    if date_links:
+        # Rows exist on the date but every one was rescheduled or plainly
+        # cancelled, so we know the session moved but not where to.
+        #
+        # Neither automatic path can finish this safely. The nearby-date scan
+        # only looks at dates BEFORE the payment, so a session moved to a LATER
+        # date is unfindable there. V1 doesn't use the date at all — it lets TA
+        # allocate to an outstanding charge, and per cb13f95 returns "Posted ✓"
+        # rather than a date because that allocation is unreliable, so a
+        # misallocation would leave no record of where the money went.
+        #
+        # FLAG stops both (post_payment short-circuits on it) and puts the
+        # payment on the morning report, where reconcile explains it in staff
+        # terms. A person can see where the appointment moved in two clicks.
+        raise Exception(
+            f"FLAG: every appointment on {ta_date} for {name} is rescheduled or cancelled "
+            f"— needs manual review"
         )
 
     # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---
@@ -1256,7 +1275,11 @@ def _scrape_due_now(page):
         raw = (loc.first.input_value() or "").replace("$", "").replace(",", "").strip()
         if not raw:
             return None
-        m = re.search(r"\d+(?:\.\d{1,2})?", raw)
+        # Keep the sign: a client who is already in credit reads as a NEGATIVE
+        # balance, and dropping the minus would turn "owes nothing, holds a
+        # credit" into "owes money" — the open-balance path decides what to say
+        # to staff off this number.
+        m = re.search(r"-?\d+(?:\.\d{1,2})?", raw)
         return f"{float(m.group(0)):.2f}" if m else None
     except Exception as e:
         print(f"  WARNING: could not scrape Due From Client Now: {e}")
@@ -1291,14 +1314,13 @@ def click_accept_payment(page, name):
     except Exception:
         clicked = False
     if not clicked:
-        # Fallback to Playwright click if the JS lookup itself failed. Short
-        # timeout: a genuinely absent button is the common case here (a
-        # cancelled appointment, or one carrying no client charge), and the
-        # caller can still post to the client's open balance instead — so fail
-        # fast with a marker it can recognize rather than burning 30s and then
-        # crashing further down on a payment form that never loaded.
+        # Fallback to Playwright click if the JS lookup itself failed or found
+        # nothing. Long enough to outlast a slow render — calling the button
+        # absent is what reroutes the money to the open balance, so it must mean
+        # absent, not "not painted yet" — but short of the 30s default, which
+        # would only end in a crash further down on a form that never loaded.
         try:
-            page.click("text=Accept Payment", timeout=5000)
+            page.click("text=Accept Payment", timeout=10000)
         except Exception:
             raise Exception(
                 f"NO_ACCEPT_PAYMENT: the appointment matched for {name} offers no "
@@ -1910,6 +1932,19 @@ def post_payment_v1(page, name, amount, dry_run=False):
 # MAIN LOGIC: Try V2, fallback to V1, then fail
 # =============================================================================
 
+# Appears in the flag for a payment that reached TA's payment form before
+# failing. The poller keys off it to stop re-feeding that payment next cycle:
+# retrying money that may already be in TA is how a client gets charged twice.
+MAY_HAVE_POSTED_MARKER = "may already have posted"
+
+
+def _may_have_posted_flag(name, detail):
+    """The flag for a payment that got as far as submitting and then went dark."""
+    return (f"FLAG: the payment for {name} reached TA's payment form before failing, so it "
+            f"{MAY_HAVE_POSTED_MARKER} — not trying another route. Check the client's ledger "
+            f"in TA and post by hand only if it isn't there. ({detail})")
+
+
 # Shown in the reports' "Actual date posted" column for payments that went to
 # the open balance: there is no single date of service to name.
 BALANCE_POSTED_LABEL = "Open balance (oldest charge first)"
@@ -1956,17 +1991,20 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         v2_error = str(e)
         if "FLAG" in v2_error:
             return False, "FLAGGED", v2_error, None, None, None, None
+        if "AT_PAYMENT_FORM" in v2_error:
+            # Continue/Save were clicked and then the page went away. Retrying —
+            # by any route, including a plain V2 retry that would just fill the
+            # form again — risks posting the same money twice.
+            return False, "FLAGGED", _may_have_posted_flag(name, v2_error), None, None, None, None
         print(f"  V2 failed: {v2_error}")
 
     # --- Attempt 2: Retry V2 with fresh navigation ---
-    # --- Attempt 2: retry V2, this time allowed to fall back to the open
-    # balance — unless attempt 1 got as far as submitting, in which case a
-    # second post could duplicate money that already landed. ---
+    # --- Attempt 2: retry V2. This one may fall back to the open balance: a
+    # second miss means there really is no appointment, not a slow render. ---
     print(f"  Retrying V2...")
-    allow_balance = "AT_PAYMENT_FORM" not in v2_error
     try:
         ok, note, balance_amount, method = post_payment_v2(
-            page, name, date, amount, dry_run, account=account, allow_balance=allow_balance)
+            page, name, date, amount, dry_run, account=account, allow_balance=True)
         if not ok:
             raise Exception("V2-retry returned ok=False")
         posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
@@ -1975,21 +2013,14 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         v2_retry_error = str(e)
         if "FLAG" in v2_retry_error:
             return False, "FLAGGED", v2_retry_error, None, None, None, None
+        if "AT_PAYMENT_FORM" in v2_retry_error:
+            return False, "FLAGGED", _may_have_posted_flag(
+                name, f"V2: {v2_error}; V2-retry: {v2_retry_error}"), None, None, None, None
         print(f"  V2 retry failed: {v2_retry_error}")
         print(f"  Falling back to V1...")
 
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
-
-    # If either attempt reached the payment form, the money may already be in TA.
-    # Posting it again through V1 would duplicate it — flag for a human instead.
-    if "AT_PAYMENT_FORM" in combined_v2_error:
-        return False, "FLAGGED", (
-            f"FLAG: the payment for {name} reached TA's payment form before failing, "
-            f"so it may already have posted — not trying another route. Check the "
-            f"client's ledger in TA and post by hand only if it isn't there. "
-            f"({combined_v2_error})"
-        ), None, None, None, None
 
     # --- Attempt 3: V1 fallback ---
     try:

@@ -224,6 +224,25 @@ def load_ledger_for_date(mmddyyyy):
         return []
 
 
+# bot_v2 stamps this into a payment's note when the money (or part of it) had no
+# open charge to land on and TA parked it as an Unapplied Payment.
+CREDIT_MARKER = "posted as an unapplied credit"
+
+
+def credit_posts(entries):
+    """Ledger entries that posted, but wholly or partly as an unapplied credit.
+
+    A client paying more than they've been charged is worth a look — usually the
+    charge amount is wrong, not the payment — so these go on the check list even
+    though the money is safely in TA.
+    """
+    out = []
+    for e in entries:
+        if CREDIT_MARKER in (e.get("note") or ""):
+            out.append({**e, "kind": "credit", "name": _clean(e.get("name"))})
+    return out
+
+
 def date_from_csv_name(name):
     """MM/DD/YYYY out of 'MM.DD.YYYY_Daily.Square.Log.csv'.
 
@@ -288,6 +307,11 @@ def explain(status, reason, name):
                 "bot couldn't tell which session the payment belongs to.",
                 "Find where the appointment moved to and post the payment there — or to the "
                 "client's open balance if the session didn't happen.")
+    if "reached ta's payment form before failing" in r:
+        return ("The bot filled TA's payment form and then lost the page, so this one may "
+                "or may not have saved. It deliberately didn't try again.",
+                "Open the client's ledger in TA. Post the payment only if it isn't already "
+                "there — don't assume either way.")
     if "multiple appointments" in r:
         return ("The client had more than one appointment that day, so the bot wouldn't guess which one.",
                 "Pick the right appointment in TA and post the payment there.")
@@ -500,6 +524,7 @@ def reconcile(csv_path):
         "matched": matched, "gaps": gaps, "errors": errors,
         "discrepancies": discrepancies, "extras": extras,
         "missing_account": missing_account,
+        "credits": credit_posts(posted_ok),
     }
 
 
@@ -521,6 +546,7 @@ def reconcile_ledger_only(date_slashed):
             "csv_count": 0, "ledger_count": len(ledger), "matched": [], "gaps": [],
             "errors": errors, "discrepancies": [], "extras": [],
             "missing_account": [e for e in posted_ok if not (e.get("account") or "").strip()],
+            "credits": credit_posts(posted_ok),
             "no_csv": True}
 
 
@@ -687,7 +713,8 @@ def combine(results):
         "no_csv": all(r.get("no_csv") for r in results),
         "no_csv_dates": [r["txn_date"] for r in results if r.get("no_csv")],
     }
-    for k in ("matched", "gaps", "errors", "discrepancies", "extras", "missing_account"):
+    for k in ("matched", "gaps", "errors", "discrepancies", "extras",
+              "missing_account", "credits"):
         out[k] = [x for r in results for x in r[k]]
 
     return out
@@ -709,6 +736,7 @@ def review_items(r):
     for x in r["extras"]:
         x.setdefault("kind", "extra")
         x["name"] = _clean(x.get("name"))
+    out.extend(r.get("credits", []))
     return out
 
 
@@ -902,6 +930,13 @@ def _review_html(items):
             what = (f'Square says <strong>{_money(i["amount"])}</strong>, but the bot posted '
                     f'<strong>{_money(i["ledger_amount"])}</strong> on {esc(i["date"])}.')
             todo = "Open the client&rsquo;s ledger in TA and correct the amount."
+        elif i.get("kind") == "credit":
+            what = (f'<strong>{_money(i["amount"])}</strong> posted {esc(i["date"])}, but the client '
+                    f'owed less than that, so the extra sits in TA as an <strong>unapplied '
+                    f'credit</strong> waiting for their next charge.')
+            todo = ('The money is posted &mdash; nothing to re-post. Work out why they are paying '
+                    'more than they are charged: usually the charge amount is wrong, or a session '
+                    'note hasn&rsquo;t been finalized. Fix the charge and the credit will absorb it.')
         else:
             what = (f'<strong>{_money(i["amount"])}</strong> posted {esc(i["date"])}, but it '
                     f'isn&rsquo;t on that day&rsquo;s Square report.')
@@ -1163,6 +1198,9 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, review=()):
             if v.get("kind") == "amount":
                 print(f"  {v['date']}  {v['name']:<26} CSV ${_amt(v['amount'])} vs posted "
                       f"${_amt(v['ledger_amount'])}")
+            elif v.get("kind") == "credit":
+                print(f"  {v['date']}  {v['name']:<26} ${_amt(v['amount'])} posted as an unapplied "
+                      f"credit — client owed less than they paid (check the charge amount)")
             else:
                 print(f"  {v['date']}  {v['name']:<26} ${_amt(v['amount'])} posted, not on that "
                       f"day's report"

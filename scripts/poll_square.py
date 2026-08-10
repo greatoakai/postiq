@@ -325,6 +325,15 @@ def post_new_payments(to_post, posted_ids):
                     else:
                         results.append({**item, "status": method or "FAILED", "error": error})
                         log(f"  NOT POSTED {item['name']}: {error}")
+                        # A payment that reached TA's payment form before failing
+                        # may already be in TA. The poll cursor keeps a 5-minute
+                        # overlap and re-feeds anything not in posted_ids, so
+                        # leaving it out would have the next cycle post it again.
+                        # Retire the id; the ledger still carries the flag, so it
+                        # shows up on the morning report for a person to settle.
+                        if bot.MAY_HAVE_POSTED_MARKER in (error or ""):
+                            posted_ids.add(item["id"])
+                            log(f"  (not retrying {item['name']} — it may already be in TA)")
                         bot.recover_to_dashboard(page)
                 except Exception as e:
                     results.append({**item, "status": "ERROR", "error": str(e)})
