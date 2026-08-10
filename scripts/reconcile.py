@@ -362,7 +362,8 @@ def reconcile(csv_path):
             errors.append({**c, "status": e.get("status"), "reason": e.get("reason", ""),
                            "account": e.get("account", ""), "id": e.get("id")})
         elif _amt(e.get("amount")) != camt:
-            discrepancies.append({**c, "ledger_amount": _amt(e.get("amount")), "status": e.get("status")})
+            discrepancies.append({**c, "ledger_amount": _amt(e.get("amount")),
+                                  "status": e.get("status"), "id": e.get("id")})
         else:
             matched.append(c)
 
@@ -508,10 +509,14 @@ def flag_already_posted(gaps, extras):
     costs the reader ten seconds in TA and cannot lose money. It's also safe to
     apply from more than one place, where consuming a pairing is not.
 
-    Flagged only on a one-to-one match — one unlisted payment, one unposted row
-    for that client and amount. Two gaps pointing at a single posting would tell
-    the reader both were handled when only one was, which is the same money loss
-    by a different route.
+    Two ways that happens: the same client's payment a day or two either side
+    (one payment on two daily reports), or the same amount on the same day under
+    a different client name (the poller posted it for the wrong person).
+
+    Flagged only on a one-to-one match — one unlisted payment, one unexplained
+    posting. Two gaps pointing at a single posting would tell the reader both
+    were handled when only one was, which is the same money loss by a different
+    route.
 
     Not cancelled, and the straddle therefore keeps appearing until someone
     confirms it: the payment really is on Square's report and really isn't in
@@ -520,18 +525,19 @@ def flag_already_posted(gaps, extras):
 
     Only real postings count: a shadow-era WOULD_POST never reached TA.
     """
-    by_extra = {}
-    for x in extras:
-        if x.get("status", "OK") == "OK":
-            by_extra.setdefault((_norm(x.get("name")), _amt(x.get("amount"))), []).append(x)
+    posted = [x for x in extras if x.get("status", "OK") == "OK"]
+    by_client, by_amount = {}, {}
+    for x in posted:
+        by_client.setdefault((_norm(x.get("name")), _amt(x.get("amount"))), []).append(x)
+        by_amount.setdefault((_amt(x.get("amount")), x.get("date")), []).append(x)
 
     # Candidate pairs first, then keep only the mutually exclusive ones. Counting
     # over the whole list instead would let a client's five weekly $75 charges
     # suppress the note for the one real straddle among them, and would let a
     # posting from two months ago count against a pairing a day apart.
-    pairs = []
+    pairs, seen = [], set()
     for g in gaps:
-        # Only a gap can be the other half of a straddle. A poller failure is a
+        # Only a gap can be the other half of one of these. A poller failure is a
         # distinct Square payment with its own id, and telling staff one of those
         # was "already posted" is how a payment they still owe gets skipped.
         # Enforced here rather than trusted to each caller. (Gaps built straight
@@ -541,20 +547,36 @@ def flag_already_posted(gaps, extras):
         gd = _dt(g.get("date"))
         if not gd:
             continue
-        for x in by_extra.get((_norm(g.get("name")), _amt(g.get("amount"))), []):
-            xd = _dt(x.get("date"))
-            if xd and abs((gd - xd).days) <= 2:
-                pairs.append((g, x, (gd - xd).days))
 
-    # Same-day pairs count as a competing claim on the posting but are never
-    # flagged themselves — reconcile() resolves same-day matches by name before
-    # anything reaches here, so a same-day pair means something we don't
-    # understand, and the safe reading of that is "no note".
+        # Same client and amount, a day or two apart: one payment landing on two
+        # daily Square reports.
+        for x in by_client.get((_norm(g.get("name")), _amt(g.get("amount"))), []):
+            xd = _dt(x.get("date"))
+            if xd and 0 < abs((gd - xd).days) <= 2:
+                pairs.append((g, x, "straddle"))
+
+        # Same amount, same day, different client: the poller posted it under
+        # another name. Real case — the Square report lists "Zachary Hahs" for
+        # $95.00 on 07/17 while the bot posted $95.00 that day for "Iliana Hahs",
+        # a sibling. Nothing pairs those by name, so without this the report tells
+        # staff to post a payment that is already in TA.
+        for x in by_amount.get((_amt(g.get("amount")), g.get("date")), []):
+            if _norm(x.get("name")) != _norm(g.get("name")):
+                pairs.append((g, x, "other-name"))
+
+    pairs = [pr for pr in pairs
+             if (id(pr[0]), id(pr[1])) not in seen and not seen.add((id(pr[0]), id(pr[1])))]
     g_uses = Counter(id(g) for g, _, _ in pairs)
     x_uses = Counter(id(x) for _, x, _ in pairs)
-    for g, x, delta in pairs:
-        if delta and g_uses[id(g)] == 1 and x_uses[id(x)] == 1:
-            g["also_posted"] = x.get("date")
+    for g, x, kind in pairs:
+        if g_uses[id(g)] != 1 or x_uses[id(x)] != 1:
+            continue
+        g["also_posted"] = x.get("date")
+        g["also_posted_kind"] = kind
+        g["also_posted_name"] = _clean(x.get("name"))
+        # Mirror it, so the posting doesn't read as an unexplained puzzle on the
+        # check list while its counterpart sits on the to-do list.
+        x["also_listed"] = {"name": _clean(g.get("name")), "date": g.get("date")}
 
 
 def combine(results):
@@ -583,16 +605,34 @@ def combine(results):
     return out
 
 
-def unposted_for_day(date_dotted, log_reasons):
-    """Every payment on one past day that never posted automatically.
+def review_items(r):
+    """The day's payments that need checking rather than posting.
 
-    Uses the CSV when it's archived (catches payments the poller never saw) and
-    always uses the ledger (catches the ones it tried and failed). Returns a list
-    of dicts shaped like the daily action items.
+    Wrong amounts and postings that aren't on Square's report for their day.
+    Separate from the to-do list on purpose: telling someone to "post this" when
+    the money is already in TA is how a client gets charged twice.
+    """
+    out = [{"kind": "amount", "name": _clean(d["name"]), "date": d["date"],
+            "amount": d["amount"], "ledger_amount": d["ledger_amount"], "id": d.get("id")}
+           for d in r["discrepancies"]]
+    # Extras are passed through by identity, not copied: flag_already_posted
+    # annotates them with the payment they explain, and that has to survive.
+    out.extend(r["extras"])
+    for x in r["extras"]:
+        x.setdefault("kind", "extra")
+        x["name"] = _clean(x.get("name"))
+    return out
+
+
+def history_for_day(date_dotted, log_reasons):
+    """One past day, split into what needs posting and what needs checking.
+
+    Returns (unposted, review). Uses the CSV when it's archived (catches payments
+    the poller never saw) and falls back to the ledger alone when it isn't.
     """
     date_slashed = date_dotted.replace(".", "/")
     csv_path = find_csv(date_dotted)
-    items, extras = [], []
+    items, review = [], []
 
     if csv_path:
         # reconcile() already folds in every ledger failure, matched or not, so
@@ -602,7 +642,7 @@ def unposted_for_day(date_dotted, log_reasons):
             items.append({**it, "status": "GAP", "reason": "", "account": ""})
         for it in r["errors"]:
             items.append(dict(it))
-        extras = [dict(x) for x in r["extras"]]
+        review = review_items(r)
     else:
         # No archived CSV for that day — the ledger is all we have, so gaps
         # (payments the poller never saw) can't be detected for it.
@@ -619,45 +659,56 @@ def unposted_for_day(date_dotted, log_reasons):
         if not i.get("reason") and i.get("status") != "GAP":
             i["reason"] = log_reasons.get(_norm(i.get("square_name") or i["name"]), "")
         i["name"] = _clean(i["name"])
-    return items, extras
+    return items, review
 
 
-def scan_backlog(before_date, days=BACKLOG_DAYS, cleared=None, extras_out=None, cleared_out=None):
-    """Payments from the `days` before `before_date` that still aren't posted.
+EMPTY_HISTORY = {"unposted": [], "review": [], "postings": [], "cleared": []}
+
+
+def scan_history(before_date, days=BACKLOG_DAYS, cleared=None):
+    """Everything from the `days` before `before_date` that still needs a person.
 
     `before_date` is the earliest day this report covers (MM/DD/YYYY) — those
-    days' own misses are listed separately, so the backlog starts the day before.
+    days' own exceptions are listed separately, so the history starts the day
+    before. Returns a dict:
 
-    `extras_out`, if given, collects the postings that had no matching row on
-    their day's Square report, so the caller can run one already-posted check
-    across the whole email. `cleared_out` collects the items filtered out as
-    already handled — invisible in the report, but they still hold their claim
-    on a posting, so clearing one payment can't hand its posting to another.
+      unposted  payments that never reached TA — the to-do list
+      review    wrong amounts and postings Square doesn't list — the check list
+      postings  every unexplained posting in the window, for the caller's single
+                already-posted check
+      cleared   items filtered out as handled. Invisible in the report, but they
+                keep their claim on a posting, so clearing one payment can't hand
+                its posting to another.
     """
     cleared = cleared or load_cleared()
     end = _dt(before_date)
     if not end:
-        return []
+        return dict(EMPTY_HISTORY)
     log_reasons = reasons_from_logs()
-    out, extras = [], []
+    unposted, review = [], []
     for n in range(1, days + 1):
         day = end - timedelta(days=n)
         try:
-            items, posted_off_report = unposted_for_day(day.strftime("%m.%d.%Y"), log_reasons)
+            items, day_review = history_for_day(day.strftime("%m.%d.%Y"), log_reasons)
         except Exception as e:
             # A single unreadable CSV or ledger costs that day, not the report.
-            print(f"  reconcile: skipped {day.strftime('%m/%d/%Y')} in backlog scan — {e}")
+            print(f"  reconcile: skipped {day.strftime('%m/%d/%Y')} in history scan — {e}")
             continue
-        out.extend(items)
-        extras.extend(posted_off_report)
-    if extras_out is not None:
-        extras_out.extend(extras)
-    out.sort(key=lambda i: (_dt(i["date"]) or datetime.min, i["name"]))
-    key_items(out)
-    kept = [i for i in out if i["clear_key"] not in cleared["keys"]]
-    if cleared_out is not None:
-        cleared_out.extend(i for i in out if i["clear_key"] in cleared["keys"])
-    return kept
+        unposted.extend(items)
+        review.extend(day_review)
+
+    by_date = lambda i: (_dt(i["date"]) or datetime.min, i.get("name") or "")
+    unposted.sort(key=by_date)
+    review.sort(key=by_date)
+    key_items(unposted)
+    key_items(review)
+    done = cleared["keys"]
+    return {
+        "unposted": [i for i in unposted if i["clear_key"] not in done],
+        "review": [i for i in review if i["clear_key"] not in done],
+        "postings": [x for x in review if x.get("kind") == "extra"],
+        "cleared": [i for i in unposted + review if i["clear_key"] in done],
+    }
 
 
 # =============================================================================
@@ -730,9 +781,13 @@ def _blocks_html(items, accent="#c62828"):
             f'<span style="color:#888;">&#9744;</span> &nbsp;<strong>{esc(_money(p["amount"]))}</strong>'
             f'<span style="color:#555;"> &nbsp;paid {esc(p["date"])}</span>'
             + (f'<div style="font-size:12px;color:#e65100;padding:2px 0 4px 22px;">'
-               f'The bot posted this same amount for this client on {esc(p["also_posted"])} — '
-               f'probably one payment landing on two different daily reports. Check TA before '
-               f'posting it again.</div>'
+               + (f'The bot posted this same amount on {esc(p["also_posted"])} under the name '
+                  f'<strong>{esc(p.get("also_posted_name") or "")}</strong> — possibly this same '
+                  f'payment, put on the wrong client.'
+                  if p.get("also_posted_kind") == "other-name" else
+                  f'The bot posted this same amount for this client on {esc(p["also_posted"])} — '
+                  f'probably one payment landing on two different daily reports.')
+               + ' Check TA before posting it again.</div>'
                if p.get("also_posted") else "")
             + '</div>'
             for p in sorted(g["payments"], key=lambda p: _dt(p["date"]) or datetime.min)
@@ -746,6 +801,35 @@ def _blocks_html(items, accent="#c62828"):
             f'<div style="font-size:13px;color:#1565c0;margin-top:3px;"><strong>What to do:</strong> {g["todo"]}</div>'
             f'{caution}</div>'
         )
+    return "".join(out)
+
+
+def _review_html(items):
+    """Render check-these items — never with a 'post it' instruction."""
+    out = []
+    for i in items:
+        if i.get("kind") == "amount":
+            what = (f'Square says <strong>{_money(i["amount"])}</strong>, but the bot posted '
+                    f'<strong>{_money(i["ledger_amount"])}</strong> on {esc(i["date"])}.')
+            todo = "Open the client&rsquo;s ledger in TA and correct the amount."
+        else:
+            what = (f'<strong>{_money(i["amount"])}</strong> posted {esc(i["date"])}, but it '
+                    f'isn&rsquo;t on that day&rsquo;s Square report.')
+            todo = ('Check Square. Usually it just landed on the next day&rsquo;s report and there '
+                    'is nothing to do — only remove it in TA if it isn&rsquo;t a real payment.')
+        link = ""
+        if i.get("also_listed"):
+            link = (f'<div style="font-size:12px;color:#e65100;margin-top:4px;">This looks like the '
+                    f'same payment as <strong>{esc(i["also_listed"]["name"])}</strong> on '
+                    f'{esc(i["also_listed"]["date"])} in the list above — sort the two out together, '
+                    f'and don&rsquo;t post it twice.</div>')
+        out.append(
+            f'<div style="border:1px solid #e0e0e0;border-left:4px solid #6a1b9a;border-radius:3px;'
+            f'padding:12px 14px;margin:0 0 10px;">'
+            f'<div style="font-size:15px;font-weight:700;color:#222;">{esc(i["name"])}</div>'
+            f'<div style="font-size:13px;color:#555;margin-top:5px;">{what}</div>'
+            f'<div style="font-size:13px;color:#1565c0;margin-top:3px;">'
+            f'<strong>What to do:</strong> {todo}</div>{link}</div>')
     return "".join(out)
 
 
@@ -772,19 +856,13 @@ HOW_TO_POST = (
 )
 
 
-def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed=False):
+def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed=False,
+                      review=()):
     """Build (subject, html, clean) for the morning report. Pure — no send."""
     today_items = action_items(r)
     backlog = list(backlog)
-    verify = [("Amount doesn't match",
-               f'{esc(d["name"])} — Square says {_money(d["amount"])}, the bot posted '
-               f'{_money(d["ledger_amount"])}. Check the client&rsquo;s ledger in TA and correct it.')
-              for d in r["discrepancies"]]
-    verify += [("Posted, but not on the Square report",
-                f'{esc(x.get("name"))} — {_money(x.get("amount"))} on {esc(x.get("date"))}. The bot posted this '
-                f'in TA but it isn&rsquo;t on that day&rsquo;s Square report. Usually it just landed on the next '
-                f'day&rsquo;s report — check Square, and remove it in TA only if it isn&rsquo;t a real payment.')
-               for x in r["extras"]]
+    verify = review_items(r)
+    review = list(review)
     clean = not (r["gaps"] or r["errors"] or r["discrepancies"] or r["extras"])
     date = r["txn_date"] or r["csv"]
 
@@ -804,8 +882,8 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
         bits.append(f"{len(today_items)} to post")
     if backlog:
         bits.append(f"{len(backlog)} outstanding")
-    if verify and not today_items:
-        bits.append(f"{len(verify)} to verify")
+    if verify or review:
+        bits.append(f"{len(verify) + len(review)} to check")
     if missing:
         bits.append(f"{len(missing)} day{'s' if len(missing) != 1 else ''} unchecked")
     subject = f"PostIQ Daily Reconcile — {date} — " + (" · ".join(bits) if bits else "all caught up")
@@ -908,12 +986,20 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
         parts.append(_h2("How to post one of these in TA", "#1565c0"))
         parts.append(HOW_TO_POST)
 
-    # ── Verify, don't post ──
+    # ── Check, don't post ──
     if verify:
-        parts.append(_h2("Check these — don't post them", "#6a1b9a"))
-        parts.append('<ul style="font-size:13px;color:#333;line-height:1.6;margin:8px 0 0;">'
-                     + "".join(f'<li><strong>{esc(t)}:</strong> {body}</li>' for t, body in verify)
-                     + '</ul>')
+        parts.append(_h2(f"Check these — {date}", "#6a1b9a"))
+        parts.append('<p style="font-size:13px;color:#555;margin:8px 0 12px;">These are already in '
+                     'TA, or may be. <strong>Don&rsquo;t post them</strong> — check and correct.</p>')
+        parts.append(_review_html(verify))
+
+    if review:
+        parts.append(_h2(f"Still to check — last {days} days ({len(review)})", "#6a1b9a"))
+        parts.append('<p style="font-size:13px;color:#555;margin:8px 0 12px;">Older amounts that '
+                     'don&rsquo;t match and payments Square doesn&rsquo;t list. Same rule — '
+                     '<strong>don&rsquo;t post these</strong>. Reply when they&rsquo;re settled and '
+                     'Travis will clear them off.</p>')
+        parts.append(_review_html(review))
 
     # ── Housekeeping (admin) ──
     house = []
@@ -956,7 +1042,7 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
     return subject, html, clean
 
 
-def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
+def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, review=()):
     """Console view — same content, plus the raw reasons and clear-keys for Travis."""
     clean = not (r["gaps"] or r["errors"] or r["discrepancies"] or r["extras"])
     print(f"=== Reconciliation: {r['csv']} (txn {r['txn_date']}) ===")
@@ -967,7 +1053,7 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
         print("RESULT: EXCEPTIONS")
         for g in r["gaps"]:
             print(f"  GAP         {g['name']} ${g['amount']} on {g['date']} — poller never posted (manual)"
-                  f"{'  [but posted that amount on ' + g['also_posted'] + ']' if g.get('also_posted') else ''}")
+                  f"{'  [but posted that amount on ' + g['also_posted'] + (' as ' + g['also_posted_name'] if g.get('also_posted_kind') == 'other-name' else '') + ']' if g.get('also_posted') else ''}")
         for e in r["errors"]:
             print(f"  ERROR       {e['name']} ${e['amount']} on {e['date']} — poller status {e['status']}"
                   f"{' — ' + e['reason'] if e.get('reason') else ''} (manual)")
@@ -981,24 +1067,36 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS):
     for h in heals:
         print(f"  SELF-HEALED  {h.get('name')} {h.get('before')} -> {h.get('after')} "
               f"— auto-corrected in Square (please confirm)")
+    if review:
+        print(f"\n--- Still to check, last {days} days ({len(review)}) ---")
+        for v in review:
+            if v.get("kind") == "amount":
+                print(f"  {v['date']}  {v['name']:<26} CSV ${_amt(v['amount'])} vs posted "
+                      f"${_amt(v['ledger_amount'])}")
+            else:
+                print(f"  {v['date']}  {v['name']:<26} ${_amt(v['amount'])} posted, not on that "
+                      f"day's report"
+                      f"{'  [pairs with ' + v['also_listed']['name'] + ' ' + v['also_listed']['date'] + ']' if v.get('also_listed') else ''}")
+            print(f"      clear key: {v['clear_key']}")
     if backlog:
         print(f"\n--- Still outstanding, last {days} days ({len(backlog)} payments, "
               f"{_money(_total(backlog))}) ---")
         for b in backlog:
             print(f"  {b['date']}  {b['name']:<26} ${_amt(b['amount']):>8}  {b.get('status','')}"
                   f"{' — ' + b['reason'] if b.get('reason') else ''}"
-                  f"{'  [bot posted this amount on ' + b['also_posted'] + ']' if b.get('also_posted') else ''}")
+                  f"{'  [bot posted this amount on ' + b['also_posted'] + (' as ' + b['also_posted_name'] if b.get('also_posted_kind') == 'other-name' else '') + ']' if b.get('also_posted') else ''}")
             print(f"      clear key: {b['clear_key']}")
     return clean
 
 
-def email_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed=False):
+def email_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed=False,
+                 review=()):
     """Email the morning report to staff (Hannah) with Travis copied.
 
     Returns True only if it actually went out — the caller uses that to decide
     whether the self-heal confirmations can be retired.
     """
-    subject, html, clean = build_report_html(r, heals, backlog, days, backlog_failed)
+    subject, html, clean = build_report_html(r, heals, backlog, days, backlog_failed, review)
     sent = bot.send_email(to=STAFF_TO, cc=ADMIN_TO, subject=subject, body=html, html=True)
     if sent:
         print(f"  Emailed report to {STAFF_TO} (cc {ADMIN_TO}) — {'CLEAN' if clean else 'EXCEPTIONS'}")
@@ -1051,7 +1149,8 @@ def main():
             # the oldest listed payments impossible to clear.
             today = datetime.now().strftime("%m/%d/%Y")
             n = 0
-            for it in scan_backlog(today, args.backlog_days + 10, cleared=c):
+            older = scan_history(today, args.backlog_days + 10, cleared=c)
+            for it in older["unposted"] + older["review"]:
                 if (_dt(it["date"]) or datetime.max) <= through:
                     c["keys"].append(it["clear_key"])
                     n += 1
@@ -1100,14 +1199,14 @@ def main():
             except Exception:
                 pass
     anchor = (r.get("txn_dates") or [r["txn_date"]])[0]
-    backlog, backlog_extras, backlog_cleared, backlog_failed = [], [], [], False
+    hist, backlog_failed = dict(EMPTY_HISTORY), False
     if not args.no_backlog:
         try:
-            backlog = scan_backlog(anchor, args.backlog_days, extras_out=backlog_extras,
-                                   cleared_out=backlog_cleared)
+            hist = scan_history(anchor, args.backlog_days)
         except Exception as e:
             backlog_failed = True
-            print(f"  reconcile: backlog scan failed ({e}) — sending the day's report without it.")
+            print(f"  reconcile: history scan failed ({e}) — sending the day's report without it.")
+    backlog, review = hist["unposted"], hist["review"]
 
     # One already-posted check across everything this email will show, over one
     # shared pool of postings. Run per-section instead and each section could
@@ -1116,7 +1215,7 @@ def main():
     # own postings and the backlog's overlap at the edge.
     pool, seen = [], set()
     before = _dt(anchor)
-    for x in (list(r["extras"]) + backlog_extras
+    for x in (list(r["extras"]) + hist["postings"]
               + (day_extras((before - timedelta(days=1)).strftime("%m.%d.%Y")) if before else [])):
         k = x.get("id") or (_norm(x.get("name")), _amt(x.get("amount")), x.get("date"))
         if k in seen:
@@ -1128,16 +1227,18 @@ def main():
     # would tell staff a payment they still owe was already handled. Payments
     # already cleared are included as claimants — they don't render, but they
     # keep their hold on the posting they explain.
-    claimants = list(r["gaps"]) + [b for b in backlog + backlog_cleared
+    claimants = list(r["gaps"]) + [b for b in backlog + hist["cleared"]
                                    if b.get("status") == "GAP"]
     flag_already_posted(claimants, pool)
     for g in r["gaps"] + backlog:
         if g.get("also_posted"):
+            how = (f"under the name {g.get('also_posted_name')}"
+                   if g.get("also_posted_kind") == "other-name" else "for this client")
             print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']}, bot posted that "
-                  f"amount on {g['also_posted']} — may be one payment on two reports.")
-    clean = print_report(r, unreported_heals, backlog, args.backlog_days)
+                  f"amount on {g['also_posted']} {how} — may be the same payment.")
+    clean = print_report(r, unreported_heals, backlog, args.backlog_days, review)
     if args.email:
-        sent = email_report(r, unreported_heals, backlog, args.backlog_days, backlog_failed)
+        sent = email_report(r, unreported_heals, backlog, args.backlog_days, backlog_failed, review)
         if sent and unreported_heals:
             mark_heals_reported(all_heals)  # exactly-once: don't re-report tomorrow
         if not sent:

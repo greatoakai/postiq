@@ -1109,27 +1109,29 @@ def click_appointment_by_date(page, date_str, name):
     # --- Step 1: Try exact date match ---
     date_links = page.locator(f"a:has-text('{ta_date}')").all()
 
-    if len(date_links) == 1:
-        print(f"  Found appointment: {date_links[0].text_content().strip()}")
-        date_links[0].click()
+    # Filter for valid posting targets BEFORE branching on the count, so a lone
+    # row on the date still gets the status check, and a date whose rows are all
+    # rescheduled/cancelled falls through to the nearby-date scan instead of
+    # flagging. Same fix 12be0de made to the nearby-date path below.
+    eligible = [l for l in date_links if _appt_target_eligible(l)]
+
+    if len(eligible) == 1:
+        print(f"  Found appointment: {eligible[0].text_content().strip()}")
+        eligible[0].click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
         return None  # exact match, no note needed
 
-    if len(date_links) > 1:
-        # Multiple rows on the same date — keep only valid posting targets
-        # (Active or chargeable cancellation; drop Rescheduled / plain Cancelled).
-        eligible = [l for l in date_links if _appt_target_eligible(l)]
-        if len(eligible) == 1:
-            print(f"  Multiple rows on {ta_date}, picking the eligible appointment")
-            eligible[0].click()
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1000)
-            return None  # resolved via status
-
+    if len(eligible) > 1:
         raise Exception(
             f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review"
         )
+
+    if date_links:
+        # Rows exist on the date but every one was rescheduled or plainly
+        # cancelled — the real appointment is elsewhere. Step 2 only looks at
+        # dates strictly before the target, so these can't be re-picked.
+        print(f"  {len(date_links)} row(s) on {ta_date}, none eligible — searching nearby dates")
 
     # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---
     if target_dt is None:
