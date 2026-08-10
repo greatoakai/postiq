@@ -16,6 +16,12 @@ Two sources:
 
 Slow — a browser round trip per client, so a full outstanding list takes a
 while. It posts nothing and changes nothing.
+
+The verdicts are evidence, not proof. The ledger scrape reads the first
+money-shaped figure in a row, which is the payment amount in the layouts seen so
+far but is not guaranteed, and a same-amount payment inside the three-week
+window can belong to a different session. Read each verdict before running the
+--clear command it prints.
 """
 import argparse
 import sys
@@ -66,8 +72,8 @@ def scrape_client_payments(page):
                 const t=(tr.textContent||'').replace(/\\s+/g,' ').trim();
                 if(!/client payment/i.test(t)) continue;
                 const dm=t.match(/(\\d{1,2}\\/\\d{1,2}\\/\\d{2,4})/);
-                const am=[...t.matchAll(/([\\d,]+\\.\\d{2})/g)].map(m=>m[1].replace(/,/g,''));
-                out.push({date:dm?dm[1]:'', amounts:am});
+                const am=t.match(/([\\d,]+\\.\\d{2})/);
+                out.push({date:dm?dm[1]:'', amount:am?am[1].replace(/,/g,''):''});
             }
             return out;
         }"""
@@ -88,9 +94,7 @@ def check(page, name, amt, date):
     near = []
     same_amt = 0
     for r in rows:
-        # A payment row carries several figures (amount, charge, running
-        # balance); match on any of them rather than whichever came first.
-        if target_amt not in r["amounts"]:
+        if r["amount"] != target_amt:
             continue
         same_amt += 1
         rdt = parse_date(r["date"])

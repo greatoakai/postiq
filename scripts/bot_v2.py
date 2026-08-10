@@ -1081,8 +1081,11 @@ def click_appointment_by_date(page, date_str, name):
     (MM/DD/YYYY) before searching.
 
     Resolution order:
-      1. Exact date match on the transaction date
-      2. If no exact match, scan visible appointment links within
+      1. Exact date match on the transaction date, among rows that are valid
+         posting targets. If rows exist on the date but none is a valid target
+         (all rescheduled or cancelled), give up on the date rather than guess —
+         post_payment's V1 fallback handles it by outstanding charge instead.
+      2. If no rows at all on the date, scan visible appointment links within
          APPT_MATCH_LOOKBACK_DAYS prior, keep only valid posting targets
          (_appt_target_eligible — Active / chargeable cancellation, never a
          rescheduled or plainly-cancelled slot), then pick the closest.
@@ -1110,9 +1113,8 @@ def click_appointment_by_date(page, date_str, name):
     date_links = page.locator(f"a:has-text('{ta_date}')").all()
 
     # Filter for valid posting targets BEFORE branching on the count, so a lone
-    # row on the date still gets the status check, and a date whose rows are all
-    # rescheduled/cancelled falls through to the nearby-date scan instead of
-    # flagging. Same fix 12be0de made to the nearby-date path below.
+    # row on the date gets the same status check the multi-row case gets — a
+    # single "Rescheduled to ..." row on the payment date is not a target.
     eligible = [l for l in date_links if _appt_target_eligible(l)]
 
     if len(eligible) == 1:
@@ -1129,13 +1131,16 @@ def click_appointment_by_date(page, date_str, name):
 
     if date_links:
         # Rows exist on the date but every one was rescheduled or plainly
-        # cancelled. Don't fall through to the nearby-date scan: that only looks
-        # at dates BEFORE the payment, so an appointment moved to a LATER date is
+        # cancelled. Don't fall through to the nearby-date scan: it only looks at
+        # dates BEFORE the payment, so an appointment moved to a LATER date is
         # unfindable there and the payment would land on an unrelated earlier
-        # session. A human can see where it went in two clicks; the bot can't.
+        # session. Raise a plain error rather than a FLAG, though — FLAG short
+        # circuits post_payment straight to FLAGGED, and V1 (Billing > Take
+        # Payment, which matches outstanding charges by name instead of by
+        # appointment date) is exactly the right fallback for a session that
+        # moved. V1 has its own guard against posting as a prepayment.
         raise Exception(
-            f"FLAG: every appointment on {ta_date} for {name} is rescheduled or cancelled "
-            f"— needs manual review"
+            f"Every appointment on {ta_date} for {name} is rescheduled or cancelled"
         )
 
     # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---

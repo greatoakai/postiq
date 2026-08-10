@@ -516,7 +516,9 @@ def flag_already_posted(gaps, extras):
 
     Two ways that happens: the same client's payment a day or two either side
     (one payment on two daily reports), or the same amount on the same day under
-    a different client name (the poller posted it for the wrong person).
+    a different client name (the poller posted it for the wrong person). The
+    second is worded by confidence — a shared surname makes it near-certain,
+    without one it might be two clients who paid the same copay.
 
     Flagged only on a one-to-one match — one unlisted payment, one unexplained
     posting. Two gaps pointing at a single posting would tell the reader both
@@ -572,16 +574,21 @@ def flag_already_posted(gaps, extras):
         for x in by_amount.get((_amt(g.get("amount")), g.get("date")), []):
             if _norm(x.get("name")) == _norm(g.get("name")):
                 continue
-            # The names still have to look like the same household — the same
-            # guard reconcile() puts on its own cross-name matching. Without it,
-            # two unrelated clients with the same copay on the same day get told
-            # they're one payment, and one of them never gets posted.
-            if _shares_name_token(x.get("name"), g.get("name")):
-                pairs.append((g, x, "other-name"))
+            # A shared surname makes it near-certain (the Hahs case); without one
+            # it may well be two unrelated clients who paid the same copay that
+            # day. Both are worth mentioning — a household can have two surnames
+            # — so pair either way and let the wording carry the confidence.
+            pairs.append((g, x, "other-name"
+                          if _shares_name_token(x.get("name"), g.get("name"))
+                          else "other-name-maybe"))
 
     pairs = [pr for pr in pairs
              if (id(pr[0]), id(pr[1])) not in seen and not seen.add((id(pr[0]), id(pr[1])))]
-    g_uses = Counter(id(g) for g, _, _ in pairs)
+    # A same-day pair is a claim on the posting, not on the gap: it must stop
+    # another client taking that posting, but must not silence this gap's own
+    # straddle a day either side. (Ledger files are keyed by the poller's run
+    # day while entries keep their Square date, so the collision is reachable.)
+    g_uses = Counter(id(g) for g, _, k in pairs if k != "same-day")
     x_uses = Counter(id(x) for _, x, _ in pairs)
     for g, x, kind in pairs:
         if kind == "same-day" or g_uses[id(g)] != 1 or x_uses[id(x)] != 1:
@@ -800,8 +807,12 @@ def _blocks_html(items, accent="#c62828"):
             + (f'<div style="font-size:12px;color:#e65100;padding:2px 0 4px 22px;">'
                + (f'The bot posted this same amount on {esc(p["also_posted"])} under the name '
                   f'<strong>{esc(p.get("also_posted_name") or "")}</strong> — possibly this same '
-                  f'payment, put on the wrong client.'
+                  f'payment, put on a family member.'
                   if p.get("also_posted_kind") == "other-name" else
+                  f'The bot also posted this amount on {esc(p["also_posted"])} for '
+                  f'<strong>{esc(p.get("also_posted_name") or "")}</strong>. That may be a '
+                  f'different client who paid the same amount that day.'
+                  if p.get("also_posted_kind") == "other-name-maybe" else
                   f'The bot posted this same amount for this client on {esc(p["also_posted"])} — '
                   f'probably one payment landing on two different daily reports.')
                + ' Check TA before posting it again.</div>'
@@ -1070,7 +1081,7 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, review=()):
         print("RESULT: EXCEPTIONS")
         for g in r["gaps"]:
             print(f"  GAP         {g['name']} ${g['amount']} on {g['date']} — poller never posted (manual)"
-                  f"{'  [but posted that amount on ' + g['also_posted'] + (' as ' + g['also_posted_name'] if g.get('also_posted_kind') == 'other-name' else '') + ']' if g.get('also_posted') else ''}")
+                  f"{'  [but posted that amount on ' + g['also_posted'] + (' as ' + g['also_posted_name'] if str(g.get('also_posted_kind')).startswith('other-name') else '') + ']' if g.get('also_posted') else ''}")
         for e in r["errors"]:
             print(f"  ERROR       {e['name']} ${e['amount']} on {e['date']} — poller status {e['status']}"
                   f"{' — ' + e['reason'] if e.get('reason') else ''} (manual)")
@@ -1101,7 +1112,7 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, review=()):
         for b in backlog:
             print(f"  {b['date']}  {b['name']:<26} ${_amt(b['amount']):>8}  {b.get('status','')}"
                   f"{' — ' + b['reason'] if b.get('reason') else ''}"
-                  f"{'  [bot posted this amount on ' + b['also_posted'] + (' as ' + b['also_posted_name'] if b.get('also_posted_kind') == 'other-name' else '') + ']' if b.get('also_posted') else ''}")
+                  f"{'  [bot posted this amount on ' + b['also_posted'] + (' as ' + b['also_posted_name'] if str(b.get('also_posted_kind')).startswith('other-name') else '') + ']' if b.get('also_posted') else ''}")
             print(f"      clear key: {b['clear_key']}")
     return clean
 
@@ -1250,7 +1261,8 @@ def main():
     for g in r["gaps"] + backlog:
         if g.get("also_posted"):
             how = (f"under the name {g.get('also_posted_name')}"
-                   if g.get("also_posted_kind") == "other-name" else "for this client")
+                   if str(g.get("also_posted_kind")).startswith("other-name")
+                   else "for this client")
             print(f"  reconcile: {g['name']} ${g['amount']} listed {g['date']}, bot posted that "
                   f"amount on {g['also_posted']} {how} — may be the same payment.")
     clean = print_report(r, unreported_heals, backlog, args.backlog_days, review)
