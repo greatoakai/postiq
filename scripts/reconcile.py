@@ -89,28 +89,44 @@ def _account(raw):
     return bot.normalize_account(raw or "")
 
 
-_NAME_NOISE = {"iii", "the", "and"}
+# Name particles carried by unrelated families — shared, they're not evidence.
+_NAME_NOISE = {"iii", "the", "and", "van", "von", "der", "den", "del", "dos",
+               "das", "los", "las", "mac", "bin"}
 
 
-_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+# NFKD decomposes combining accents but leaves stroke and ligature letters
+# whole, so ł/ø/đ/æ survive an a-z split as fragments — "Adam Łoś" and "Ewa
+# Kłos" would both reduce to "os" and read as family. Transliterate them first.
+_LETTER_FOLD = str.maketrans({
+    "ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ħ": "h",
+    "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss", "þ": "th", "ð": "d",
+})
+
+# Trailing words that are not the family name. "do" is left out on purpose —
+# it's a real Vietnamese surname.
+# "2nd" splits to "nd" on a non-letter boundary, hence the bare ordinal tails.
+# "do" is deliberately absent — it's a real Vietnamese surname.
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "vi", "md", "phd", "lcsw",
+                  "lpc", "esq", "st", "nd", "rd", "th"}
+
+
+def _fold(name):
+    """Name reduced to lowercase ASCII words, accents and ligatures resolved."""
+    return _norm(bot.normalize_name((name or "").translate(_LETTER_FOLD)))
 
 
 def _surname(name):
     """Last real word of a name, ignoring generational suffixes.
 
-    Accents are folded first (bot_v2.normalize_name, which also repairs the
-    mojibake the Square export produces). Splitting raw on [^a-z]+ would turn
-    "Garcia" with an accent into fragments and leave a one-letter tail, so two
-    unrelated accented names would both reduce to the same stub and read as
-    family. The length floor is the second guard on that.
+    Folded first (see _fold): splitting raw on [^a-z]+ turns an accented name
+    into fragments and leaves a stub tail, so two unrelated names would reduce
+    to the same thing and read as family.
     """
-    folded = _norm(bot.normalize_name(name or ""))
     # Two letters, not three: Le, Ng, Wu, Vo and Li are real surnames, and a
     # floor of three both matched them to each other through the first name and
     # stopped matching them to their own family. One letter is an initial or a
-    # stray fragment, never a surname. Accent folding above is what handles
-    # fragmentation now, so the floor doesn't have to.
-    toks = [t for t in re.split(r"[^a-z]+", folded)
+    # stray fragment, never a surname.
+    toks = [t for t in re.split(r"[^a-z]+", _fold(name))
             if len(t) >= 2 and t not in _NAME_SUFFIXES]
     return toks[-1] if toks else ""
 
@@ -131,12 +147,14 @@ def _shares_name_token(a, b):
     amount that day.
     """
     def toks(n):
-        # Folded the same way as _surname — comparing raw text splits an accented
-        # name into fragments, so "Jose Pena" and "José Peña" wouldn't match and
-        # the pairing would carry a permanent "identification uncertain" caveat.
-        return {t for t in re.split(r"[^a-z]+", _norm(bot.normalize_name(n or "")))
+        return {t for t in re.split(r"[^a-z]+", _fold(n))
                 if len(t) >= 3 and t not in _NAME_NOISE}
-    return bool(toks(a) & toks(b))
+    # A matching surname counts even when it's below this function's own floor —
+    # otherwise "Thanh Le" and "T. Le" are family by _shares_surname and
+    # strangers here, and the pairing carries an "uncertain" caveat it hasn't
+    # earned. Keeping the floor at three otherwise: "van", "de", "la" are not
+    # evidence of anything.
+    return bool(toks(a) & toks(b)) or _shares_surname(a, b)
 
 
 def _clean(name):
