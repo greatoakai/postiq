@@ -218,6 +218,11 @@ def explain(status, reason, name):
         return ("The client is in TA, but had no appointment on the date of the payment.",
                 "Post the payment to the correct appointment, or to the client's open balance "
                 "if there isn't one for that day.")
+    if "rescheduled or cancelled" in r:
+        return ("Every appointment the client had that day was rescheduled or cancelled, so the "
+                "bot couldn't tell which session the payment belongs to.",
+                "Find where the appointment moved to and post the payment there — or to the "
+                "client's open balance if the session didn't happen.")
     if "multiple appointments" in r:
         return ("The client had more than one appointment that day, so the bot wouldn't guess which one.",
                 "Pick the right appointment in TA and post the payment there.")
@@ -552,8 +557,12 @@ def flag_already_posted(gaps, extras):
         # daily Square reports.
         for x in by_client.get((_norm(g.get("name")), _amt(g.get("amount"))), []):
             xd = _dt(x.get("date"))
-            if xd and 0 < abs((gd - xd).days) <= 2:
-                pairs.append((g, x, "straddle"))
+            if xd and abs((gd - xd).days) <= 2:
+                # Δ=0 is kept as a competing claim but never flagged below:
+                # reconcile() settles same-day same-client matches by name long
+                # before this, so one arriving here is unmodelled — but it must
+                # still stop another client's gap claiming that posting.
+                pairs.append((g, x, "straddle" if (gd - xd).days else "same-day"))
 
         # Same amount, same day, different client: the poller posted it under
         # another name. Real case — the Square report lists "Zachary Hahs" for
@@ -561,7 +570,13 @@ def flag_already_posted(gaps, extras):
         # a sibling. Nothing pairs those by name, so without this the report tells
         # staff to post a payment that is already in TA.
         for x in by_amount.get((_amt(g.get("amount")), g.get("date")), []):
-            if _norm(x.get("name")) != _norm(g.get("name")):
+            if _norm(x.get("name")) == _norm(g.get("name")):
+                continue
+            # The names still have to look like the same household — the same
+            # guard reconcile() puts on its own cross-name matching. Without it,
+            # two unrelated clients with the same copay on the same day get told
+            # they're one payment, and one of them never gets posted.
+            if _shares_name_token(x.get("name"), g.get("name")):
                 pairs.append((g, x, "other-name"))
 
     pairs = [pr for pr in pairs
@@ -569,7 +584,7 @@ def flag_already_posted(gaps, extras):
     g_uses = Counter(id(g) for g, _, _ in pairs)
     x_uses = Counter(id(x) for _, x, _ in pairs)
     for g, x, kind in pairs:
-        if g_uses[id(g)] != 1 or x_uses[id(x)] != 1:
+        if kind == "same-day" or g_uses[id(g)] != 1 or x_uses[id(x)] != 1:
             continue
         g["also_posted"] = x.get("date")
         g["also_posted_kind"] = kind
@@ -662,7 +677,9 @@ def history_for_day(date_dotted, log_reasons):
     return items, review
 
 
-EMPTY_HISTORY = {"unposted": [], "review": [], "postings": [], "cleared": []}
+def empty_history():
+    """A history with nothing in it — fresh lists, never shared."""
+    return {"unposted": [], "review": [], "postings": [], "cleared": []}
 
 
 def scan_history(before_date, days=BACKLOG_DAYS, cleared=None):
@@ -683,7 +700,7 @@ def scan_history(before_date, days=BACKLOG_DAYS, cleared=None):
     cleared = cleared or load_cleared()
     end = _dt(before_date)
     if not end:
-        return dict(EMPTY_HISTORY)
+        return empty_history()
     log_reasons = reasons_from_logs()
     unposted, review = [], []
     for n in range(1, days + 1):
@@ -1199,7 +1216,7 @@ def main():
             except Exception:
                 pass
     anchor = (r.get("txn_dates") or [r["txn_date"]])[0]
-    hist, backlog_failed = dict(EMPTY_HISTORY), False
+    hist, backlog_failed = empty_history(), False
     if not args.no_backlog:
         try:
             hist = scan_history(anchor, args.backlog_days)

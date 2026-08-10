@@ -1129,9 +1129,14 @@ def click_appointment_by_date(page, date_str, name):
 
     if date_links:
         # Rows exist on the date but every one was rescheduled or plainly
-        # cancelled — the real appointment is elsewhere. Step 2 only looks at
-        # dates strictly before the target, so these can't be re-picked.
-        print(f"  {len(date_links)} row(s) on {ta_date}, none eligible — searching nearby dates")
+        # cancelled. Don't fall through to the nearby-date scan: that only looks
+        # at dates BEFORE the payment, so an appointment moved to a LATER date is
+        # unfindable there and the payment would land on an unrelated earlier
+        # session. A human can see where it went in two clicks; the bot can't.
+        raise Exception(
+            f"FLAG: every appointment on {ta_date} for {name} is rescheduled or cancelled "
+            f"— needs manual review"
+        )
 
     # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---
     if target_dt is None:

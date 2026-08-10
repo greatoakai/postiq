@@ -66,8 +66,8 @@ def scrape_client_payments(page):
                 const t=(tr.textContent||'').replace(/\\s+/g,' ').trim();
                 if(!/client payment/i.test(t)) continue;
                 const dm=t.match(/(\\d{1,2}\\/\\d{1,2}\\/\\d{2,4})/);
-                const am=t.match(/([\\d,]+\\.\\d{2})/);
-                out.push({date:dm?dm[1]:'', amount:am?am[1].replace(/,/g,''):''});
+                const am=[...t.matchAll(/([\\d,]+\\.\\d{2})/g)].map(m=>m[1].replace(/,/g,''));
+                out.push({date:dm?dm[1]:'', amounts:am});
             }
             return out;
         }"""
@@ -88,7 +88,9 @@ def check(page, name, amt, date):
     near = []
     same_amt = 0
     for r in rows:
-        if r["amount"] != target_amt:
+        # A payment row carries several figures (amount, charge, running
+        # balance); match on any of them rather than whichever came first.
+        if target_amt not in r["amounts"]:
             continue
         same_amt += 1
         rdt = parse_date(r["date"])
