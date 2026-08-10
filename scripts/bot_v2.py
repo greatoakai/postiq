@@ -820,20 +820,50 @@ def search_client_by_account(page, account):
 
 
 # TA Account # token: 'C' + 9 digits (the Clients search field caps at 10 chars).
-_ACCOUNT_RE = re.compile(r"\bC\d{9}\b")
+# _CELL matches a cell that holds nothing but the account; _LOOSE scans joined
+# text and refuses a token glued to other digits, so it can never half-match a
+# longer number.
+_ACCOUNT_RE_CELL = re.compile(r"C\d{9}")
+_ACCOUNT_RE_LOOSE = re.compile(r"(?<!\d)C\d{9}(?!\d)")
+
+
+def _row_cell_texts(row):
+    """The row's cells as trimmed strings — one round-trip, boundaries intact."""
+    try:
+        return row.evaluate(
+            "e => Array.from(e.children).map(c => (c.textContent || '').trim())"
+        ) or []
+    except Exception:
+        return []
 
 
 def _account_from_row(row):
     """Return the TA Account # (C#########) from a Clients results row, or ''.
 
-    Matched against the row's concatenated cell text. Returns a value ONLY when
-    exactly one account-shaped token is present — if zero or more than one match
-    (e.g. another 'C#########' token slipped into the row), return '' so callers
-    fail safe (fall back to name search / skip the backfill) rather than act on a
-    guessed number.
+    Read out of the row's own Account Number CELL, never the row's flattened
+    text. TA's client list renders the cells with no whitespace between them, so
+    the Date-Of-Birth and Therapist columns run straight into the account —
+    "...07/13/2012C006648931Great Oak Counseling" — and a word-boundary match on
+    that joined string finds nothing. That is what silently killed every
+    account-number match from 2026-07-28 on (100% hit rate before, 0% after);
+    every payment since fell back to name search. Going cell by cell keeps the
+    boundaries the markup already provides.
+
+    Returns a value ONLY when exactly one account-shaped cell is present — with
+    zero or several, return '' so callers fail safe (fall back to name search /
+    skip the backfill) rather than act on a guessed number.
     """
-    found = set(_ACCOUNT_RE.findall(row.text_content() or ""))
-    return found.pop() if len(found) == 1 else ""
+    found = {t for t in _row_cell_texts(row) if _ACCOUNT_RE_CELL.fullmatch(t)}
+    if found:
+        return found.pop() if len(found) == 1 else ""
+
+    # Fallback for markup that does separate its cells (other TA views, and the
+    # pre-2026-07-28 client list).
+    try:
+        loose = set(_ACCOUNT_RE_LOOSE.findall(row.text_content() or ""))
+    except Exception:
+        return ""
+    return loose.pop() if len(loose) == 1 else ""
 
 
 def _rows_matching_account(rows, account):
@@ -1081,13 +1111,8 @@ def click_appointment_by_date(page, date_str, name):
     (MM/DD/YYYY) before searching.
 
     Resolution order:
-      1. Exact date match on the transaction date, among rows that are valid
-         posting targets. If rows exist on the date but none is a valid target
-         (all rescheduled or cancelled), FLAG for manual review — we know the
-         session moved but not where to, and neither the nearby-date scan (past
-         dates only) nor V1 (allocates by outstanding charge, not by date) can
-         settle that without risking a misallocation.
-      2. If no rows at all on the date, scan visible appointment links within
+      1. Exact date match on the transaction date
+      2. If no exact match, scan visible appointment links within
          APPT_MATCH_LOOKBACK_DAYS prior, keep only valid posting targets
          (_appt_target_eligible — Active / chargeable cancellation, never a
          rescheduled or plainly-cancelled slot), then pick the closest.
@@ -1114,40 +1139,26 @@ def click_appointment_by_date(page, date_str, name):
     # --- Step 1: Try exact date match ---
     date_links = page.locator(f"a:has-text('{ta_date}')").all()
 
-    # Filter for valid posting targets BEFORE branching on the count, so a lone
-    # row on the date gets the same status check the multi-row case gets — a
-    # single "Rescheduled to ..." row on the payment date is not a target.
-    eligible = [l for l in date_links if _appt_target_eligible(l)]
-
-    if len(eligible) == 1:
-        print(f"  Found appointment: {eligible[0].text_content().strip()}")
-        eligible[0].click()
+    if len(date_links) == 1:
+        print(f"  Found appointment: {date_links[0].text_content().strip()}")
+        date_links[0].click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
         return None  # exact match, no note needed
 
-    if len(eligible) > 1:
+    if len(date_links) > 1:
+        # Multiple rows on the same date — keep only valid posting targets
+        # (Active or chargeable cancellation; drop Rescheduled / plain Cancelled).
+        eligible = [l for l in date_links if _appt_target_eligible(l)]
+        if len(eligible) == 1:
+            print(f"  Multiple rows on {ta_date}, picking the eligible appointment")
+            eligible[0].click()
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1000)
+            return None  # resolved via status
+
         raise Exception(
             f"FLAG: Multiple appointments on {ta_date} for {name} — needs manual review"
-        )
-
-    if date_links:
-        # Rows exist on the date but every one was rescheduled or plainly
-        # cancelled, so we know the session moved but not where to.
-        #
-        # Neither automatic path can finish this safely. The nearby-date scan
-        # only looks at dates BEFORE the payment, so a session moved to a LATER
-        # date is unfindable there. V1 doesn't use the date at all — it lets TA
-        # allocate to an outstanding charge, and per cb13f95 returns "Posted ✓"
-        # rather than a date because that allocation is unreliable, so a
-        # misallocation would leave no record of where the money went.
-        #
-        # FLAG stops both (post_payment short-circuits on it) and puts the
-        # payment on the morning report, where reconcile explains it in staff
-        # terms. A person can see where the appointment moved in two clicks.
-        raise Exception(
-            f"FLAG: every appointment on {ta_date} for {name} is rescheduled or cancelled "
-            f"— needs manual review"
         )
 
     # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---
@@ -1267,18 +1278,32 @@ def click_accept_payment(page, name):
     # Use JS click as primary — Playwright's normal click fails ~10% of the time
     # because TA has overlays (Beacon iframe, notification banners, etc.) that
     # intercept pointer events even after suppression. JS click bypasses all of that.
+    clicked = False
     try:
-        page.evaluate("""
+        clicked = bool(page.evaluate("""
             () => {
                 const links = [...document.querySelectorAll('a, button')];
                 const btn = links.find(el => el.textContent.trim().includes('Accept Payment'));
                 if (btn) { btn.click(); return true; }
                 return false;
             }
-        """)
+        """))
     except Exception:
-        # Fallback to Playwright click if JS fails
-        page.click("text=Accept Payment")
+        clicked = False
+    if not clicked:
+        # Fallback to Playwright click if the JS lookup itself failed. Short
+        # timeout: a genuinely absent button is the common case here (a
+        # cancelled appointment, or one carrying no client charge), and the
+        # caller can still post to the client's open balance instead — so fail
+        # fast with a marker it can recognize rather than burning 30s and then
+        # crashing further down on a payment form that never loaded.
+        try:
+            page.click("text=Accept Payment", timeout=5000)
+        except Exception:
+            raise Exception(
+                f"NO_ACCEPT_PAYMENT: the appointment matched for {name} offers no "
+                f"Accept Payment button (cancelled, or no client charge on it)"
+            )
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(2000)
 
@@ -1450,21 +1475,202 @@ def submit_payment(page, name, dry_run=False):
     return True
 
 
-def post_payment_v2(page, name, date, amount, dry_run=False, account=None):
+# Appointment-leg failures that mean "there is no date of service to pin this
+# payment to". The payment itself is fine — it just has to go to the client's
+# open balance instead. Anything else (a FLAG, a form or navigation error) is a
+# real failure and must not be silently rerouted.
+_NO_APPOINTMENT_MARKERS = (
+    "no appointment found",
+    "no active appointment",
+    "no_accept_payment",
+)
+
+
+# Appears in the note of any payment that landed (wholly or partly) as an
+# unapplied credit because the client owed less than they paid. Staff triage
+# these: it usually means the charge amount is wrong, not the payment.
+CREDIT_NOTE_MARKER = "posted as an unapplied credit"
+
+
+def _is_no_appointment_error(err):
+    """True when `err` means the payment simply has no appointment to land on."""
+    text = str(err).lower()
+    return any(marker in text for marker in _NO_APPOINTMENT_MARKERS)
+
+
+def navigate_to_client_billing(page, profile_url):
+    """Open the Billing tab on the CLIENT PROFILE (not the Billing dashboard).
+
+    Returns to `profile_url` first: after an appointment has been opened the
+    page carries its own Summary/Scheduling/Chart/Billing tab strip, and a bare
+    'Billing' tab lookup there would land on the appointment's billing view
+    rather than the client's account history.
+    """
+    print("  Opening the client's Billing tab...")
+    if profile_url:
+        page.goto(profile_url)
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1500)
+    dismiss_popups(page)
+    try:
+        page.get_by_role("tab", name="Billing").first.click()
+    except Exception:
+        # Never fall back to a bare text=Billing click: it also matches the
+        # sidebar's practice-wide Billing dashboard, a different (client-less)
+        # page. Click the tab element itself, or give up.
+        opened = page.evaluate("""
+            () => {
+                const tab = [...document.querySelectorAll('[role="tab"], .v-tab')]
+                    .find(e => (e.textContent || '').trim() === 'Billing');
+                if (tab) { tab.click(); return true; }
+                return false;
+            }
+        """)
+        if not opened:
+            raise Exception("Could not open the client's Billing tab")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(2500)
+
+
+def post_payment_to_balance(page, name, amount, dry_run=False, profile_url=None, date=None):
+    """Post to the client's OPEN BALANCE, oldest charge first — no appointment.
+
+    The fallback for payments that can't be pinned to a date of service: clients
+    on a payment plan paying weekly with no session that day, and appointments
+    that carry a charge but offer no Accept Payment (cancelled / already paid).
+
+    Runs from the client profile the caller already opened — by Account Number
+    when Square has one — so it also reaches DISCHARGED (inactive) clients. That
+    matters: the V1 fallback selects its client from the Billing dashboard's
+    autocomplete, which lists active clients only, so a discharged client on a
+    payment plan had no working path at all (Jayden Akridge, C007566848: five
+    weekly $25 payments unposted through July 2026).
+
+    Client profile > Billing > Take Payment opens TA's account payment form with
+    every open charge listed oldest-first; TA distributes the amount down that
+    list, so the money lands on the most outdated balance first.
+
+    Returns (True, note, due_now). When the client owes nothing (or owes less
+    than they paid), the payment still posts — TA parks the excess as an
+    Unapplied Payment and applies it to their next charge — and the note carries
+    CREDIT_NOTE_MARKER so the morning report can put it in front of staff. A
+    client who keeps paying more than they are charged usually means the charge
+    amount itself is wrong, which is worth catching early.
+    """
+    print(f"  [BALANCE] Client > Billing > Take Payment (oldest charge first)")
+    navigate_to_client_billing(page, profile_url)
+
+    print("  Clicking Take Payment...")
+    suppress_beacon_widget(page)
+    dismiss_popups(page)
+    clicked = False
+    try:
+        clicked = bool(page.evaluate("""
+            () => {
+                const els = [...document.querySelectorAll('a, button')];
+                const btn = els.find(el => el.textContent.trim().includes('Take Payment'));
+                if (btn) { btn.click(); return true; }
+                return false;
+            }
+        """))
+    except Exception:
+        clicked = False
+    if not clicked:
+        raise Exception(f"No Take Payment button on the Billing tab for {name}")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(2500)
+    screenshot(page, f"payment_{name.replace(' ', '_')}_bal_01_form")
+
+    if _resolve_payment_amount_input(page) is None:
+        raise Exception(f"Take Payment form did not load for {name}")
+
+    # 'Due From Client Now' is the client-RESPONSIBLE open balance — what TA will
+    # distribute this payment across, oldest charge first. A charge with a
+    # balance but $0 client responsibility (insurance still pending) is not a
+    # target, so it doesn't count here.
+    due_now = _scrape_due_now(page)
+    try:
+        due_value = float(due_now) if due_now is not None else None
+    except ValueError:
+        due_value = None
+    print(f"  Open balance (Due From Client Now): "
+          f"{'unreadable' if due_value is None else '$' + due_now}")
+
+    fill_payment_form(page, amount)
+    screenshot(page, f"payment_{name.replace(' ', '_')}_bal_02_filled")
+
+    try:
+        submitted = submit_payment(page, name, dry_run)
+    except Exception as e:
+        raise Exception(f"AT_PAYMENT_FORM: {e}")
+    if not submitted:
+        raise Exception("AT_PAYMENT_FORM: balance-post submit_payment returned failure")
+
+    when = f"the {date} payment" if date else "this payment"
+    try:
+        paid = float(amount)
+    except ValueError:
+        paid = None
+
+    if due_value is None:
+        note = (f"No appointment matched {when} — posted to the client's open "
+                f"balance, oldest charge first; balance due could not be read, "
+                f"so please confirm where it landed")
+    elif due_value <= 0:
+        note = (f"No appointment matched {when} and {name} owed nothing — "
+                f"{CREDIT_NOTE_MARKER}, which TA applies to their next charge. "
+                f"Worth checking whether they are being charged the right amount")
+    else:
+        note = (f"No appointment matched {when} — posted to the client's open "
+                f"balance, oldest charge first (balance due was ${due_now})")
+        if paid is not None and paid > due_value:
+            note += (f"; ${paid - due_value:.2f} of it {CREDIT_NOTE_MARKER}, so "
+                     f"check whether the charge amount is right")
+    return True, note, due_now
+
+
+def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
+                    allow_balance=True):
     """V2 flow: Clients > Appointments > Accept Payment.
 
-    Returns (success: bool, note: str or None). Raises on hard failure
-    so the caller can fall back to V1. `account` is the TA Account Number
-    (Square reference_id) used for deterministic client matching when present.
+    When no appointment can take the payment — none on or near the transaction
+    date, or the one that matched offers no Accept Payment — and `allow_balance`
+    is set, falls back to post_payment_to_balance() and applies it to the
+    client's oldest open charge instead. Anything else still raises, so the
+    caller can fall back to V1.
+
+    `allow_balance` is off for the first attempt (see post_payment): TA's
+    appointment list sometimes hasn't rendered yet, and a transient "no
+    appointment found" must not send the money to the oldest charge when a plain
+    retry would have found the right appointment.
+
+    Returns (success: bool, note: str or None, balance_amount, method), where
+    method is 'V2' or 'V2-balance'. `account` is the TA Account Number (Square
+    reference_id) used for deterministic client matching when present.
     """
     print(f"  [V2] Clients > Appointments > Accept Payment")
 
     # search_client() handles its own navigation to the Clients page
     _ok, name_note = search_client(page, name, account=account)
+    profile_url = page.url  # captured before any appointment navigation
     navigate_to_appointments(page)
     ensure_date_filters(page)
-    date_note = click_appointment_by_date(page, date, name)
-    balance_note, balance_amount = click_accept_payment(page, name)
+
+    try:
+        date_note = click_appointment_by_date(page, date, name)
+        balance_note, balance_amount = click_accept_payment(page, name)
+    except Exception as e:
+        if "FLAG" in str(e) or not _is_no_appointment_error(e):
+            raise
+        if not allow_balance:
+            raise
+        print(f"  {e}")
+        print("  No date of service for this payment — applying it to the open balance...")
+        ok, bal_note, due_now = post_payment_to_balance(
+            page, name, amount, dry_run, profile_url=profile_url, date=date)
+        notes = [n for n in (name_note, bal_note) if n]
+        return ok, ("; ".join(notes) if notes else None), due_now, "V2-balance"
+
     screenshot(page, f"payment_{name.replace(' ', '_')}_01_form")
 
     # Combine notes (middle name + date mismatch + outstanding balance)
@@ -1474,12 +1680,17 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None):
     fill_payment_form(page, amount)
     screenshot(page, f"payment_{name.replace(' ', '_')}_02_filled")
 
-    # submit_payment may return False if Save Payment didn't take.
-    # Treat that as a hard failure so the caller can fall back.
-    if not submit_payment(page, name, dry_run):
-        raise Exception("V2 submit_payment returned failure")
+    # Past this point Continue/Save have been clicked and the money may already
+    # be in TA. Tag the failure so the caller never routes it to a second
+    # posting — submit_payment returning False means the same thing.
+    try:
+        submitted = submit_payment(page, name, dry_run)
+    except Exception as e:
+        raise Exception(f"AT_PAYMENT_FORM: {e}")
+    if not submitted:
+        raise Exception("AT_PAYMENT_FORM: V2 submit_payment returned failure")
 
-    return True, note, balance_amount
+    return True, note, balance_amount, "V2"
 
 
 # =============================================================================
@@ -1699,31 +1910,48 @@ def post_payment_v1(page, name, amount, dry_run=False):
 # MAIN LOGIC: Try V2, fallback to V1, then fail
 # =============================================================================
 
+# Shown in the reports' "Actual date posted" column for payments that went to
+# the open balance: there is no single date of service to name.
+BALANCE_POSTED_LABEL = "Open balance (oldest charge first)"
+
+
+def _is_balance_method(method):
+    """True for the open-balance posting methods ('V2-balance', + '-retry')."""
+    return (method or "").startswith("V2-balance")
+
+
 def post_payment(page, name, date, amount, dry_run=False, account=None):
     """
     Post a payment with retry and fallback logic:
-    1. Try V2 (Clients > Appointments > Accept Payment)
+    1. Try V2 (Clients > Appointments > Accept Payment). When no appointment can
+       take the payment, V2 itself applies it to the client's open balance,
+       oldest charge first, and reports back as 'V2-balance'.
     2. If V2 fails (not flagged), retry V2 once with fresh navigation
     3. If V2 retry fails, try V1 (Billing > Take Payment > Search Charges)
     4. If all fail, mark as FAILED
     Returns (success, method, error, note, posted_date, v2_error, balance_amount)
-    - posted_date: the appointment date TA allocated the V1 payment to (V1 only)
+    - posted_date: the appointment date TA allocated the V1 payment to (V1), or
+      BALANCE_POSTED_LABEL for an open-balance post; None otherwise
     - v2_error: why V2 failed, so the report can show it (V1 only)
     - balance_amount: 'Due From Client Now' for the report's Amount-due column
-      (V2 outstanding-balance clients only; None otherwise)
+      (V2 outstanding-balance clients and open-balance posts; None otherwise)
     `account` is the TA Account Number (Square reference_id); when present, V2
     matches the client by it deterministically and only falls back to name on a
     miss. V1 (the billing-autocomplete fallback) remains name-based.
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
 
-    # --- Attempt 1: V2 flow ---
+    # --- Attempt 1: V2 flow. No open-balance fallback yet — a "no appointment
+    # found" here can just be TA's appointment list not having rendered, and a
+    # retry usually finds it. Only a second miss means there really isn't one. ---
     v2_error = None
     try:
-        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run, account=account)
+        ok, note, balance_amount, method = post_payment_v2(
+            page, name, date, amount, dry_run, account=account, allow_balance=False)
         if not ok:
             raise Exception("V2 returned ok=False")
-        return True, "V2", None, note, None, None, balance_amount
+        posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
+        return True, method, None, note, posted, None, balance_amount
     except Exception as e:
         v2_error = str(e)
         if "FLAG" in v2_error:
@@ -1731,12 +1959,18 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         print(f"  V2 failed: {v2_error}")
 
     # --- Attempt 2: Retry V2 with fresh navigation ---
+    # --- Attempt 2: retry V2, this time allowed to fall back to the open
+    # balance — unless attempt 1 got as far as submitting, in which case a
+    # second post could duplicate money that already landed. ---
     print(f"  Retrying V2...")
+    allow_balance = "AT_PAYMENT_FORM" not in v2_error
     try:
-        ok, note, balance_amount = post_payment_v2(page, name, date, amount, dry_run, account=account)
+        ok, note, balance_amount, method = post_payment_v2(
+            page, name, date, amount, dry_run, account=account, allow_balance=allow_balance)
         if not ok:
             raise Exception("V2-retry returned ok=False")
-        return True, "V2-retry", None, note, None, None, balance_amount
+        posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
+        return True, f"{method}-retry", None, note, posted, None, balance_amount
     except Exception as e:
         v2_retry_error = str(e)
         if "FLAG" in v2_retry_error:
@@ -1746,6 +1980,16 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
 
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
+
+    # If either attempt reached the payment form, the money may already be in TA.
+    # Posting it again through V1 would duplicate it — flag for a human instead.
+    if "AT_PAYMENT_FORM" in combined_v2_error:
+        return False, "FLAGGED", (
+            f"FLAG: the payment for {name} reached TA's payment form before failing, "
+            f"so it may already have posted — not trying another route. Check the "
+            f"client's ledger in TA and post by hand only if it isn't there. "
+            f"({combined_v2_error})"
+        ), None, None, None, None
 
     # --- Attempt 3: V1 fallback ---
     try:
@@ -1846,7 +2090,8 @@ def generate_report(payloads, dry_run=False):
     flagged = [r for r in results if r["status"] == "FLAGGED"]
     timed_out = [r for r in results if r["status"] == "TIMEOUT"]
     manual = failed + flagged + timed_out
-    v1_clients = [r for r in succeeded if r.get("method") == "V1"]
+    v1_clients = [r for r in succeeded
+                  if r.get("method") == "V1" or _is_balance_method(r.get("method"))]
     date_mismatch = [r for r in results if r.get("note") and "Date mismatch" in r["note"]]
     balance_clients = [r for r in results if r.get("note") and "outstanding balance" in r["note"]]
     name_noted = [r for r in results if r.get("note") and "Middle/extra name" in r["note"]]
@@ -2010,8 +2255,10 @@ def generate_report(payloads, dry_run=False):
         </td></tr>
         <tr><td style="padding:0 32px 24px;font-size:13px;">
           <p style="color:#666;margin:8px 0;">These payments were posted via an alternate method because
-          the Square transaction date did not match an appointment on the same day. Please verify in TherapyAppointment
-          that each payment is allocated to the correct appointment.</p>
+          the Square transaction date did not match an appointment on the same day. Rows reading
+          &ldquo;Open balance&rdquo; were applied to the client&rsquo;s oldest outstanding charge
+          (payment plans, and clients with no session that day). Please verify in TherapyAppointment
+          that each payment landed where you would expect.</p>
           <table width="100%" cellpadding="8" cellspacing="0" style="font-size:13px;border-collapse:collapse;">
             <tr style="background:#e67e22;color:#fff;">
               <th style="text-align:left;padding:10px 12px;">Client</th>
@@ -2157,6 +2404,12 @@ def _classify_issue(reason):
                 "A popup (often the Beacon chat widget) was covering the page. "
                 "The dismiss_popups() helper should catch this — if it persists, "
                 "add the new selector to dismiss_popups().")
+    if "reached ta's payment form before failing" in r:
+        return ("May already have posted — verify before re-posting",
+                "The bot filled TA's payment form and then lost the page, so the "
+                "payment may or may not have saved. It deliberately did not try "
+                "another route. Check the client's ledger and post by hand only if "
+                "the payment isn't already there.")
     if "no appointment found" in r:
         return ("Appointment not found on date",
                 "Client exists in TA but has no appointment matching the Square "
@@ -2204,8 +2457,9 @@ def generate_tech_report(payloads):
     # Categorize results
     failed = [r for r in results if r["status"] in ("FAILED", "TIMEOUT")]
     flagged = [r for r in results if r["status"] == "FLAGGED"]
-    v1_fallbacks = [r for r in results if r.get("method") == "V1"]
-    v2_retries = [r for r in results if r.get("method") == "V2-retry"]
+    v1_fallbacks = [r for r in results
+                    if r.get("method") == "V1" or _is_balance_method(r.get("method"))]
+    v2_retries = [r for r in results if (r.get("method") or "").endswith("-retry")]
     name_notes = [r for r in results if r.get("note") and "Middle/extra name" in (r.get("note") or "")]
     auto_corrected = [r for r in results
                       if r.get("note") and ("auto-corrected" in (r.get("note") or "")
@@ -2252,7 +2506,7 @@ def generate_tech_report(payloads):
   <tr><td style="padding:20px 0;">
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
       {_stat_box(total_issues, "Hard Issues", "#c62828" if total_issues else "#999")}
-      {_stat_box(len(v1_fallbacks), "V1 Fallbacks", "#7b1fa2" if v1_fallbacks else "#999")}
+      {_stat_box(len(v1_fallbacks), "Alt-path Posts", "#7b1fa2" if v1_fallbacks else "#999")}
       {_stat_box(len(v2_retries), "V2 Retries", "#e65100" if v2_retries else "#999")}
       {_stat_box(len(auto_corrected) + len(aliased), "Name Fixes", "#1565c0" if (auto_corrected or aliased) else "#999")}
     </tr></table>
@@ -2297,11 +2551,12 @@ def generate_tech_report(payloads):
     if v1_fallbacks:
         h.append(f'''<tr><td style="padding:16px 32px 8px;">
           <div style="font-size:14px;font-weight:700;color:#7b1fa2;border-bottom:1px solid #7b1fa2;padding-bottom:4px;">
-            V1 Fallbacks ({len(v1_fallbacks)})
+            Alternate-path postings ({len(v1_fallbacks)})
           </div>
           <div style="font-size:12px;color:#666;margin-top:6px;">
-            These succeeded via the V1 fallback path — they did NOT match an appointment date and need manual verification.
-            Frequent V1 fallbacks suggest the appointment-date matching logic needs attention.
+            These posted without matching an appointment date — either through the V1 billing fallback, or
+            (&ldquo;Open balance&rdquo;) applied to the client&rsquo;s oldest open charge. Expected for payment-plan
+            clients; a rise among everyone else suggests the appointment-date matching needs attention.
           </div>
         </td></tr>
         <tr><td style="padding:0 32px 16px;">

@@ -96,39 +96,53 @@ _NAME_NOISE = {"iii", "the", "and", "van", "von", "der", "den", "del", "dos",
 
 # NFKD decomposes combining accents but leaves stroke and ligature letters
 # whole, so ł/ø/đ/æ survive an a-z split as fragments — "Adam Łoś" and "Ewa
-# Kłos" would both reduce to "os" and read as family. Transliterate them first.
+# Kłos" would both reduce to "os" and read as family. Transliterate them, but
+# only AFTER normalize_name has repaired the mojibake the Square export
+# produces: those characters don't exist until that round-trip runs, and Ø is a
+# UTF-8 lead byte, so folding first both misses every real case and corrupts
+# non-Latin names on the way past.
 _LETTER_FOLD = str.maketrans({
-    "ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ħ": "h",
-    "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss", "þ": "th", "ð": "d",
+    "ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D",
+    "ħ": "h", "Ħ": "H", "þ": "th", "Þ": "Th", "ð": "d", "Ð": "D",
+    "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss",
 })
 
-# Trailing words that are not the family name. "do" is left out on purpose —
-# it's a real Vietnamese surname.
-# "2nd" splits to "nd" on a non-letter boundary, hence the bare ordinal tails.
-# "do" is deliberately absent — it's a real Vietnamese surname.
-_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "vi", "md", "phd", "lcsw",
-                  "lpc", "esq", "st", "nd", "rd", "th"}
+# Trailing words that aren't the family name. "2nd" loses its digit to the
+# a-z split, hence the bare ordinal tails. Neither "do" nor "vi" is here —
+# both are real surnames.
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "md", "phd", "lcsw", "lpc",
+                  "esq", "st", "nd", "rd", "th"}
+
+# Words two unrelated families can share: particles and credentials. Sharing one
+# is not evidence they're the same household.
+_NAME_NOISE = {"iii", "the", "and", "van", "von", "der", "den", "del", "dos",
+               "das", "mac", "bin", "phd", "lcsw", "lpc", "esq"}
 
 
 def _fold(name):
     """Name reduced to lowercase ASCII words, accents and ligatures resolved."""
-    return _norm(bot.normalize_name((name or "").translate(_LETTER_FOLD)))
+    return _norm(bot.normalize_name(name or "").translate(_LETTER_FOLD))
 
 
 def _surname(name):
-    """Last real word of a name, ignoring generational suffixes.
+    """Last real word of a name, or "" when we can't tell which word that is.
 
     Folded first (see _fold): splitting raw on [^a-z]+ turns an accented name
     into fragments and leaves a stub tail, so two unrelated names would reduce
     to the same thing and read as family.
+
+    Two letters, not three: Le, Ng, Wu, Vo and Li are real surnames, and a floor
+    of three both matched them to each other through the first name and stopped
+    matching them to their own family. One letter is an initial.
+
+    A name ending in a particle ("Maria Del") gets "" rather than a guess — two
+    of those sharing "del" would otherwise read as one family.
     """
-    # Two letters, not three: Le, Ng, Wu, Vo and Li are real surnames, and a
-    # floor of three both matched them to each other through the first name and
-    # stopped matching them to their own family. One letter is an initial or a
-    # stray fragment, never a surname.
     toks = [t for t in re.split(r"[^a-z]+", _fold(name))
             if len(t) >= 2 and t not in _NAME_SUFFIXES]
-    return toks[-1] if toks else ""
+    if not toks or toks[-1] in _NAME_NOISE:
+        return ""
+    return toks[-1]
 
 
 def _shares_surname(a, b):

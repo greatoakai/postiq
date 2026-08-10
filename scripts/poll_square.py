@@ -96,7 +96,8 @@ def save_state(state):
 LEDGER_DIR = bot.DATA_DIR / "poll_ledger"
 
 
-def record_ledger(payment_id, name, date, amount, status, account="", reason=""):
+def record_ledger(payment_id, name, date, amount, status, account="", reason="",
+                  method="", note=""):
     """Append/update a payment in the per-transaction-date ledger (idempotent by id).
 
     The ledger is the poller's record of what it did (or, in shadow mode, would
@@ -107,6 +108,10 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="")
     (C#########) used as the deterministic TA match key; "" if Square has none.
     `reason` is the failure text for non-OK outcomes — reconcile.py turns it into
     the plain-language "why it didn't post" staff see in the morning report.
+    `method` is how it posted (V2, V2-balance, V1, ...) and `note` is bot_v2's
+    per-payment note; together they let the report say a payment went to the
+    client's open balance rather than to a date of service, and flag the ones
+    that landed as an unapplied credit.
     """
     if not date:
         return
@@ -121,7 +126,7 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="")
     entries = [e for e in entries if e.get("id") != payment_id]
     entries.append({"id": payment_id, "name": name, "date": date,
                     "amount": amount, "status": status, "account": account,
-                    "reason": reason})
+                    "reason": reason, "method": method, "note": note})
     path.write_text(json.dumps(entries, indent=2))
 
 
@@ -308,12 +313,13 @@ def post_new_payments(to_post, posted_ids):
             bot.login(page)
             for item in to_post:
                 try:
-                    success, method, error, *_ = bot.post_payment(
+                    success, method, error, note, *_ = bot.post_payment(
                         page, item["name"], item["date"], item["amount"],
                         account=item.get("account"))
                     if success:
                         posted_ids.add(item["id"])
-                        results.append({**item, "status": "OK", "method": method})
+                        results.append({**item, "status": "OK", "method": method,
+                                        "note": note or ""})
                         log(f"  POSTED {item['name']} ${item['amount']} ({method})")
                         _self_heal_account(item.get("customer_id"), item.get("account"), item["name"])
                     else:
@@ -546,7 +552,8 @@ def main():
     results = post_new_payments(to_post, posted_ids)
     for r in results:
         record_ledger(r["id"], r["name"], r["date"], r["amount"],
-                      r["status"], r.get("account", ""), r.get("error", ""))
+                      r["status"], r.get("account", ""), r.get("error", ""),
+                      r.get("method", ""), r.get("note", ""))
     state.update(
         posted_payment_ids=sorted(posted_ids),
         last_polled_at=next_cursor,
