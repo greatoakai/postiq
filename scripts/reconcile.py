@@ -105,8 +105,13 @@ def _surname(name):
     family. The length floor is the second guard on that.
     """
     folded = _norm(bot.normalize_name(name or ""))
+    # Two letters, not three: Le, Ng, Wu, Vo and Li are real surnames, and a
+    # floor of three both matched them to each other through the first name and
+    # stopped matching them to their own family. One letter is an initial or a
+    # stray fragment, never a surname. Accent folding above is what handles
+    # fragmentation now, so the floor doesn't have to.
     toks = [t for t in re.split(r"[^a-z]+", folded)
-            if len(t) >= 3 and t not in _NAME_SUFFIXES]
+            if len(t) >= 2 and t not in _NAME_SUFFIXES]
     return toks[-1] if toks else ""
 
 
@@ -126,7 +131,10 @@ def _shares_name_token(a, b):
     amount that day.
     """
     def toks(n):
-        return {t for t in re.split(r"[^a-z]+", _norm(n))
+        # Folded the same way as _surname — comparing raw text splits an accented
+        # name into fragments, so "Jose Pena" and "José Peña" wouldn't match and
+        # the pairing would carry a permanent "identification uncertain" caveat.
+        return {t for t in re.split(r"[^a-z]+", _norm(bot.normalize_name(n or "")))
                 if len(t) >= 3 and t not in _NAME_NOISE}
     return bool(toks(a) & toks(b))
 
