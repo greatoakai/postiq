@@ -92,6 +92,22 @@ def _account(raw):
 _NAME_NOISE = {"iii", "the", "and"}
 
 
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def _surname(name):
+    """Last real word of a name, ignoring generational suffixes."""
+    toks = [t for t in re.split(r"[^a-z]+", _norm(name)) if t and t not in _NAME_SUFFIXES]
+    return toks[-1] if toks else ""
+
+
+def _shares_surname(a, b):
+    """Same last name — the test for "this is a family member", where a shared
+    first name ("Sarah Jones" / "Sarah Miller") plainly isn't."""
+    sa, sb = _surname(a), _surname(b)
+    return bool(sa) and sa == sb
+
+
 def _shares_name_token(a, b):
     """Do two spellings of a name share a distinctive word?
 
@@ -516,9 +532,8 @@ def flag_already_posted(gaps, extras):
 
     Two ways that happens: the same client's payment a day or two either side
     (one payment on two daily reports), or the same amount on the same day under
-    a different client name (the poller posted it for the wrong person). The
-    second is worded by confidence — a shared surname makes it near-certain,
-    without one it might be two clients who paid the same copay.
+    a different client name (the poller posted it for the wrong person, which
+    needs the same surname — a shared first name is not a family member).
 
     Flagged only on a one-to-one match — one unlisted payment, one unexplained
     posting. Two gaps pointing at a single posting would tell the reader both
@@ -574,13 +589,15 @@ def flag_already_posted(gaps, extras):
         for x in by_amount.get((_amt(g.get("amount")), g.get("date")), []):
             if _norm(x.get("name")) == _norm(g.get("name")):
                 continue
-            # A shared surname makes it near-certain (the Hahs case); without one
-            # it may well be two unrelated clients who paid the same copay that
-            # day. Both are worth mentioning — a household can have two surnames
-            # — so pair either way and let the wording carry the confidence.
-            pairs.append((g, x, "other-name"
-                          if _shares_name_token(x.get("name"), g.get("name"))
-                          else "other-name-maybe"))
+            # Same surname only. Pairing on amount and date alone would let every
+            # same-amount posting that day become a candidate, and since a note
+            # needs a one-to-one match, those extra candidates cancel the real
+            # ones — the Hahs case stops firing the moment a third client pays
+            # $95 that day. A household paying under two surnames is missed;
+            # that payment just stays on the list unannotated, which is the safe
+            # direction.
+            if _shares_surname(x.get("name"), g.get("name")):
+                pairs.append((g, x, "other-name"))
 
     pairs = [pr for pr in pairs
              if (id(pr[0]), id(pr[1])) not in seen and not seen.add((id(pr[0]), id(pr[1])))]
@@ -809,10 +826,6 @@ def _blocks_html(items, accent="#c62828"):
                   f'<strong>{esc(p.get("also_posted_name") or "")}</strong> — possibly this same '
                   f'payment, put on a family member.'
                   if p.get("also_posted_kind") == "other-name" else
-                  f'The bot also posted this amount on {esc(p["also_posted"])} for '
-                  f'<strong>{esc(p.get("also_posted_name") or "")}</strong>. That may be a '
-                  f'different client who paid the same amount that day.'
-                  if p.get("also_posted_kind") == "other-name-maybe" else
                   f'The bot posted this same amount for this client on {esc(p["also_posted"])} — '
                   f'probably one payment landing on two different daily reports.')
                + ' Check TA before posting it again.</div>'

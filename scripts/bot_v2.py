@@ -1131,16 +1131,21 @@ def click_appointment_by_date(page, date_str, name):
 
     if date_links:
         # Rows exist on the date but every one was rescheduled or plainly
-        # cancelled. Don't fall through to the nearby-date scan: it only looks at
-        # dates BEFORE the payment, so an appointment moved to a LATER date is
-        # unfindable there and the payment would land on an unrelated earlier
-        # session. Raise a plain error rather than a FLAG, though — FLAG short
-        # circuits post_payment straight to FLAGGED, and V1 (Billing > Take
-        # Payment, which matches outstanding charges by name instead of by
-        # appointment date) is exactly the right fallback for a session that
-        # moved. V1 has its own guard against posting as a prepayment.
+        # cancelled, so we know the session moved but not where to.
+        #
+        # Neither automatic path can finish this safely. The nearby-date scan
+        # only looks at dates BEFORE the payment, so a session moved to a LATER
+        # date is unfindable there. V1 doesn't use the date at all — it lets TA
+        # allocate to an outstanding charge, and per cb13f95 returns "Posted ✓"
+        # rather than a date because that allocation is unreliable, so a
+        # misallocation would leave no record of where the money went.
+        #
+        # FLAG stops both (post_payment short-circuits on it) and puts the
+        # payment on the morning report, where reconcile explains it in staff
+        # terms. A person can see where the appointment moved in two clicks.
         raise Exception(
-            f"Every appointment on {ta_date} for {name} is rescheduled or cancelled"
+            f"FLAG: every appointment on {ta_date} for {name} is rescheduled or cancelled "
+            f"— needs manual review"
         )
 
     # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---
