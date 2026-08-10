@@ -96,8 +96,17 @@ _NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
 
 def _surname(name):
-    """Last real word of a name, ignoring generational suffixes."""
-    toks = [t for t in re.split(r"[^a-z]+", _norm(name)) if t and t not in _NAME_SUFFIXES]
+    """Last real word of a name, ignoring generational suffixes.
+
+    Accents are folded first (bot_v2.normalize_name, which also repairs the
+    mojibake the Square export produces). Splitting raw on [^a-z]+ would turn
+    "Garcia" with an accent into fragments and leave a one-letter tail, so two
+    unrelated accented names would both reduce to the same stub and read as
+    family. The length floor is the second guard on that.
+    """
+    folded = _norm(bot.normalize_name(name or ""))
+    toks = [t for t in re.split(r"[^a-z]+", folded)
+            if len(t) >= 3 and t not in _NAME_SUFFIXES]
     return toks[-1] if toks else ""
 
 

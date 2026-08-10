@@ -1083,8 +1083,10 @@ def click_appointment_by_date(page, date_str, name):
     Resolution order:
       1. Exact date match on the transaction date, among rows that are valid
          posting targets. If rows exist on the date but none is a valid target
-         (all rescheduled or cancelled), give up on the date rather than guess —
-         post_payment's V1 fallback handles it by outstanding charge instead.
+         (all rescheduled or cancelled), FLAG for manual review — we know the
+         session moved but not where to, and neither the nearby-date scan (past
+         dates only) nor V1 (allocates by outstanding charge, not by date) can
+         settle that without risking a misallocation.
       2. If no rows at all on the date, scan visible appointment links within
          APPT_MATCH_LOOKBACK_DAYS prior, keep only valid posting targets
          (_appt_target_eligible — Active / chargeable cancellation, never a
