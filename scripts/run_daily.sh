@@ -34,12 +34,17 @@ EOF
 
 log "=== PostIQ Daily Run ==="
 
-# ── Step 0: Sync from S3 ──
-# The Square Daily Report bot uploads new CSVs to S3 each morning at 6:00 AM.
-# This step downloads them into the local inbox and deletes them from S3.
-log "Syncing new CSVs from S3..."
-SYNC_OUTPUT=$(/usr/bin/python3 "$PROJECT_ROOT/scripts/sync_inbox.py" 2>&1) || true
-echo "$SYNC_OUTPUT" >> "$LOGFILE"
+# ── Step 0 REMOVED 2026-08-28: the S3 sync is gone ──
+# The Square Daily Report bot used to upload the CSV to
+# s3://greatoak-square-reports/uploads/ and this step downloaded it an hour
+# later. Both ends run on the SAME Mac mini, so the round-trip cost an S3
+# bucket, an IAM user and a long-lived access key to move a file between two
+# local directories (#491). The bot now writes straight into drive-inbox/ —
+# verified in its own log: "PostIQ hand-off OK ... (2341 bytes)", 2026-08-28.
+#
+# The sync call was wrapped in `|| true`, so once the bucket is deleted it
+# would have failed every morning while this job still reported success.
+# scripts/sync_inbox.py is now unreferenced and can be deleted with the bucket.
 
 # Find CSV files matching the Daily.Square.Log pattern
 shopt -s nullglob
