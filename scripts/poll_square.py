@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
 """
-poll_square.py — near-real-time payment posting (DEV / dev-test branch only).
+poll_square.py — near-real-time payment posting. THIS RUNS IN PRODUCTION.
 
 Polls the Square Payments API for newly COMPLETED payments and posts each one to
 TherapyAppointment using the existing bot_v2 logic — instead of the once-a-day
 CSV batch. Intended to run on a schedule and post within the cadence window.
 
-STATUS: v1, dev-test only. NOT wired into production. Before this can run / merge:
-  1. SQUARE_ACCESS_TOKEN must be in .env. The daily-CSV flow doesn't use a Square
+STATUS: LIVE. Wired into production as the launchd job `com.greatoak.postiq-poll-live`
+on Minute 0 and Minute 30 — it posts real client payments to TherapyAppointment every
+half hour. Verified 2026-08-28 from logs/poll_live_stdout.log: successful Square polls
+at 09:00 and 09:30.
+
+This header read "DEV / dev-test branch only. NOT wired into production" until
+2026-08-28, while the job had been posting payments on the half hour. The three
+preconditions below were all met and the status line was never updated — so the file
+described itself as inert while it was the money path. Anyone reading it to decide
+whether a change here was safe would have concluded it was.
+
+It also runs from the `feat/refid-account-match` branch, not main. That is simply the
+state of the working tree launchd executes, not a release process — so a `git checkout`
+in this directory changes what posts payments.
+
+Preconditions below are all SATISFIED; kept for the requirements they record.
+  1. SQUARE_ACCESS_TOKEN is in .env and authenticating. The daily-CSV flow doesn't use a Square
      API token, so one must be created in the Square Developer Dashboard
      (scope: PAYMENTS_READ). Until then this script exits cleanly.
   2. SQUARE_ACCESS_TOKEN needs PAYMENTS_READ + CUSTOMERS_READ (plus CUSTOMERS_WRITE
