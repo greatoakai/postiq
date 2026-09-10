@@ -25,7 +25,7 @@ Preconditions below are all SATISFIED; kept for the requirements they record.
   1. SQUARE_ACCESS_TOKEN is in .env and authenticating. The daily-CSV flow doesn't use a Square
      API token, so one must be created in the Square Developer Dashboard
      (scope: PAYMENTS_READ). Until then this script exits cleanly.
-  2. SQUARE_ACCESS_TOKEN needs PAYMENTS_READ + CUSTOMERS_READ (plus CUSTOMERS_WRITE
+  2. SQUARE_ACCESS_TOKEN needs PAYMENTS_READ + CUSTOMERS_READ + ORDERS_READ (plus CUSTOMERS_WRITE
      for --backfill-missing). The payer name is the linked customer's given_name +
      family_name (validated 2026-06-15 against the 6/13 CSV — matches "Full Name",
      NOT the cardholder name, which can be a parent/payer). The posted amount is the
