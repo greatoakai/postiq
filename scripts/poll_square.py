@@ -293,21 +293,90 @@ def resolve_customer(customer_id):
     return dict(info)
 
 
+_order_cache = {}
+
+# The fee line IP writes onto both plan invoices and AR invoices
+# (config/billing -> "Card processing fee (3%)"). Matched case-insensitively on the
+# prefix so a rate change ("(2.9%)") does not silently stop matching.
+FEE_LINE_PREFIX = "card processing fee"
+
+
+def order_fee_split(order_id):
+    """(principal_cents, fee_cents) for an ORDER, or None when it cannot be read.
+
+    This is the WHOLE order's split, not one payment's. An installment plan is a single
+    order carrying every installment plus one fee line, so the caller applies the ratio
+    to the payment amount rather than subtracting this fee directly.
+    """
+    if not order_id:
+        return None
+    if order_id in _order_cache:
+        return _order_cache[order_id]
+    try:
+        order = square_get(f"/v2/orders/{order_id}").get("order", {})
+    except Exception as e:
+        log(f"  WARNING: could not read order {order_id}: {e}")
+        return None  # NOT cached — a transient failure should be retried next cycle
+    principal = fee = 0
+    for li in order.get("line_items", []) or []:
+        amt = ((li.get("total_money") or li.get("base_price_money") or {}).get("amount") or 0)
+        if (li.get("name") or "").strip().lower().startswith(FEE_LINE_PREFIX):
+            fee += amt
+        else:
+            principal += amt
+    split = (principal, fee)
+    _order_cache[order_id] = split
+    return split
+
+
+def payment_base_cents(total_cents, order_id):
+    """The amount to apply to the client's TA balance, or None if undeterminable.
+
+    WHY THIS IS NOT `total / 1.03`. That form assumed EVERY Square payment carries the 3%
+    surcharge. A payment that does not — a Square-native plan installment created before the
+    fee was wired in, or any payment taken outside the AR invoice path — was then posted at
+    97.09% of its value, under-crediting the client by ~2.91% silently, because both figures
+    look plausible.
+
+    The rule, from Travis: when no fee is captured, the FULL amount posts to TA.
+
+    So the split is read from the invoice's own fee line instead of assumed. With a fee, the
+    payment is apportioned by the order's principal:fee ratio, which is exact for a whole
+    installment and pro-rata for a partial one. With no fee line, the whole payment is
+    principal.
+
+    Returns None rather than guessing when the order cannot be read — the caller leaves the
+    payment unposted for the next cycle, which is the safe direction on a money path: a
+    delayed posting is recoverable, a wrong balance is not.
+    """
+    split = order_fee_split(order_id)
+    if split is None:
+        return None
+    principal, fee = split
+    if fee <= 0:
+        return total_cents           # no fee captured -> the whole payment is principal
+    if principal <= 0:
+        return None                  # a fee with no principal is not a shape we understand
+    return round(total_cents * principal / (principal + fee))
+
+
 def extract_payment_fields(p):
     """Map a Square payment -> (name, date, amount, account).
 
     name    : the linked customer's given_name + family_name (the client), which
               matches the daily CSV exporter's "Full Name" — NOT the cardholder
               name (validated 2026-06-15 against the 6/13 CSV).
-    amount  : the BASE applied to the client's balance = total / 1.03 (the client
-              pays a 3% card surcharge on top; that fee is not a payment toward
-              their therapy balance — matches the CSV "Base Amount" column).
+    amount  : the BASE applied to the client's balance, derived from the invoice's own
+              fee line rather than assumed (see payment_base_cents). A payment carrying
+              the 3% surcharge posts its principal; a payment with NO fee posts in full.
+              "" when the split could not be determined — the caller must not post it.
     date    : the payment's local (Central) transaction date, MM/DD/YYYY.
     account : the customer's reference_id == TA "Account Number" (C#########), the
               deterministic match key. "" when Square has no reference_id set.
     """
     total_cents = (p.get("amount_money") or {}).get("amount", 0)
-    amount = f"{round(total_cents / 100 / 1.03, 2):.2f}"
+    base_cents = payment_base_cents(total_cents, p.get("order_id", ""))
+    amount = "" if base_cents is None else f"{base_cents / 100:.2f}"
     created = p.get("created_at", "")
     try:
         date = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone().strftime("%m/%d/%Y")
@@ -540,7 +609,15 @@ def main():
         name, date, amount, account = extract_payment_fields(p)
         rec = {"id": p["id"], "name": name, "date": date, "amount": amount,
                "account": account, "customer_id": p.get("customer_id", "")}
-        (to_post if name else unresolved).append(rec)
+        # An empty amount means the principal/fee split could not be established (the order
+        # was unreadable). Posting anyway would guess at a client's balance, so it goes to
+        # `unresolved` and stays unposted. The poll's 5-minute overlap re-feeds it next cycle,
+        # so a transient Square failure self-heals rather than dropping the payment.
+        if not amount:
+            log(f"  SKIP (fee split undeterminable) {name or '(no name)'} (sq:{p['id']})")
+            unresolved.append(rec)
+        else:
+            (to_post if name else unresolved).append(rec)
     # --- DRY RUN: preview only, no side effects ---
     if args.dry_run:
         log("DRY RUN — would post:")
@@ -548,7 +625,8 @@ def main():
             log(f"  {item['name']} — ${item['amount']} on {item['date']} "
                 f"[acct {item['account'] or 'NONE'}] (sq:{item['id']})")
         for u in unresolved:
-            log(f"  SKIP (no name) ${u['amount']} on {u['date']} (sq:{u['id']})")
+            why = "no name" if not u["name"] else "fee split undeterminable"
+            log(f"  SKIP ({why}) ${u['amount'] or '?'} on {u['date']} (sq:{u['id']})")
         return
 
     # --- SHADOW: record would-post to the ledger for reconciliation; post nothing ---
