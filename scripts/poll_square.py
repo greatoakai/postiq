@@ -301,12 +301,24 @@ _order_cache = {}
 FEE_LINE_PREFIX = "card processing fee"
 
 
-def order_fee_split(order_id):
-    """(principal_cents, fee_cents) for an ORDER, or None when it cannot be read.
+# Orders CREATED BY IP's invoice path. Only these are itemised well enough to prove whether a
+# fee was charged: IP writes an explicit "Card processing fee" line when there is one, so the
+# ABSENCE of that line on an IP order is meaningful — it means no fee was taken.
+#
+# Everything else (Keragon check-in charges, receivables-bot charges) is a direct card charge
+# whose order is a single unnamed line item at the already-surcharged amount. Square records
+# nothing to distinguish it: total_card_surcharge_money is 0 and there is no fee line. For those
+# the historical `total / 1.03` is correct and stays — verified against 13 live payments, every
+# one of which divides to a round figure ($164.80 -> $160.00, $97.85 -> $95.00).
+IP_ORDER_SOURCE_PREFIX = "oakley"
 
-    This is the WHOLE order's split, not one payment's. An installment plan is a single
-    order carrying every installment plus one fee line, so the caller applies the ratio
-    to the payment amount rather than subtracting this fee directly.
+
+def order_fee_facts(order_id):
+    """(is_ip_invoice, principal_cents, fee_cents) for an ORDER, or None if unreadable.
+
+    The split is the WHOLE order's, not one payment's — an installment plan is a single order
+    carrying every installment plus one fee line, so the caller applies the ratio rather than
+    subtracting this fee directly.
     """
     if not order_id:
         return None
@@ -316,7 +328,9 @@ def order_fee_split(order_id):
         order = square_get(f"/v2/orders/{order_id}").get("order", {})
     except Exception as e:
         log(f"  WARNING: could not read order {order_id}: {e}")
-        return None  # NOT cached — a transient failure should be retried next cycle
+        return None  # NOT cached — a transient failure should retry next cycle
+    src = ((order.get("source") or {}).get("name") or "").strip().lower()
+    is_ip = src.startswith(IP_ORDER_SOURCE_PREFIX)
     principal = fee = 0
     for li in order.get("line_items", []) or []:
         amt = ((li.get("total_money") or li.get("base_price_money") or {}).get("amount") or 0)
@@ -324,40 +338,45 @@ def order_fee_split(order_id):
             fee += amt
         else:
             principal += amt
-    split = (principal, fee)
-    _order_cache[order_id] = split
-    return split
+    facts = (is_ip, principal, fee)
+    _order_cache[order_id] = facts
+    return facts
 
 
 def payment_base_cents(total_cents, order_id):
     """The amount to apply to the client's TA balance, or None if undeterminable.
 
-    WHY THIS IS NOT `total / 1.03`. That form assumed EVERY Square payment carries the 3%
-    surcharge. A payment that does not — a Square-native plan installment created before the
-    fee was wired in, or any payment taken outside the AR invoice path — was then posted at
-    97.09% of its value, under-crediting the client by ~2.91% silently, because both figures
-    look plausible.
+    THREE CASES, because the old `total / 1.03` collapsed them into one.
 
-    The rule, from Travis: when no fee is captured, the FULL amount posts to TA.
+    1. An order carrying an explicit fee line -> apportion by the principal:fee ratio. Exact for
+       a whole installment, pro-rata for a partial one.
 
-    So the split is read from the invoice's own fee line instead of assumed. With a fee, the
-    payment is apportioned by the order's principal:fee ratio, which is exact for a whole
-    installment and pro-rata for a partial one. With no fee line, the whole payment is
-    principal.
+    2. An IP-CREATED invoice with NO fee line -> the whole payment is principal. This is the bug
+       being fixed: Square-native plan installments created before the fee was wired in carry
+       bare principal, and dividing them by 1.03 under-credited the client ~2.91% silently.
+       Travis's rule: when no fee is captured, the full amount posts.
 
-    Returns None rather than guessing when the order cannot be read — the caller leaves the
-    payment unposted for the next cycle, which is the safe direction on a money path: a
-    delayed posting is recoverable, a wrong balance is not.
+    3. Anything else -> `total / 1.03`, UNCHANGED. Keragon check-in charges and receivables-bot
+       charges are direct card charges with the 3% already baked into a single unnamed line item.
+       Square keeps no marker for it (total_card_surcharge_money is 0), so absence of a fee line
+       proves nothing there. That path is already correct and must not be touched — treating it
+       like case 2 would OVER-credit every client by 3%, which is worse than the bug being fixed
+       because it pays clinicians on the fee.
+
+    Returns None rather than guessing when the order cannot be read; the caller leaves the
+    payment unposted for the next cycle. A delayed posting is recoverable, a wrong balance is not.
     """
-    split = order_fee_split(order_id)
-    if split is None:
+    facts = order_fee_facts(order_id)
+    if facts is None:
         return None
-    principal, fee = split
-    if fee <= 0:
-        return total_cents           # no fee captured -> the whole payment is principal
-    if principal <= 0:
-        return None                  # a fee with no principal is not a shape we understand
-    return round(total_cents * principal / (principal + fee))
+    is_ip, principal, fee = facts
+    if fee > 0:
+        if principal <= 0:
+            return None            # a fee with no principal is not a shape we understand
+        return round(total_cents * principal / (principal + fee))
+    if is_ip:
+        return total_cents         # IP invoice, no fee line -> nothing was surcharged
+    return round(total_cents / 1.03)   # direct charge: fee baked in, unchanged behaviour
 
 
 def extract_payment_fields(p):
