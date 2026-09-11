@@ -1670,6 +1670,41 @@ def _payment_form_gone(page):
         return False
 
 
+# PostIQ only ever works inside TherapyAppointment, so a real save can only land on a TA page.
+# Any *.therapyappointment.com host counts: TA serves parts of its app from sub-hosts (its newer
+# billing views live on api.portal.therapyappointment.com), and refusing one of those would flag
+# every genuine save for a manual check.
+TA_DOMAIN = "therapyappointment.com"
+
+
+def _ta_page_problem(page):
+    """None if the page is a TA page other than its sign-in route; otherwise a short, PHI-free
+    reason (host and route kind only -- never the path or query, which can carry record ids).
+
+    postiq#12: both "saved" signals in submit_payment are equally true on the wrong page.
+    networkidle only means the page went quiet, and "Save Payment" is absent from ANY page that
+    is not the payment form -- a session-expiry redirect to TA's login, an error page, a blank
+    page. Either would record the Square payment as posted when TA never saved it.
+    """
+    try:
+        url = page.url or ""
+    except Exception:
+        return "page URL unreadable"
+    if not url or url == "about:blank":
+        return "blank page"
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "page URL unreadable"
+    host = (parsed.hostname or "").lower()
+    if host != TA_DOMAIN and not host.endswith("." + TA_DOMAIN):
+        return f"left TA (host {host or 'none'})"
+    route = f"{parsed.path}?{parsed.query}".lower()
+    if "public:auth" in route or "/login" in route:
+        return "TA sign-in page"
+    return None
+
+
 def submit_payment(page, name, dry_run=False):
     """Click Continue then Save Payment, or Cancel if dry run."""
     if dry_run:
@@ -1699,6 +1734,16 @@ def submit_payment(page, name, dry_run=False):
         # open never reaches it however well the save went. Before calling this
         # a failure, ask the page directly: the form only goes away on success.
         saved = _payment_form_gone(page)
+
+    # A save signal only counts if it was read off a TA page. Otherwise take the unconfirmed
+    # path below: it returns False, and every caller then FLAGS the payment as "may already have
+    # posted -- check TA" (AT_PAYMENT_FORM) instead of posting it again, so nothing is posted
+    # twice and nothing is recorded as posted that TA never saved.
+    problem = _ta_page_problem(page) if saved else None
+    if problem:
+        print(f"  WARNING: after Save Payment the page is not a TA page ({problem}) -- "
+              f"not treating it as saved")
+        saved = False
 
     if not saved:
         # Deliberately unguarded-proof: this path is reached exactly when the
