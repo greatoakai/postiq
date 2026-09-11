@@ -323,6 +323,7 @@ def post_new_payments(to_post, posted_ids):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=bot.HEADLESS)
         page = browser.new_page()
+        bot.block_beacon(page)
         page.set_default_timeout(bot.ACTION_TIMEOUT)
         try:
             bot.login(page)
@@ -407,6 +408,7 @@ def backfill_missing(since_iso, dry_run=False, limit=None):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=bot.HEADLESS)
         page = browser.new_page()
+        bot.block_beacon(page)
         page.set_default_timeout(bot.ACTION_TIMEOUT)
         try:
             bot.login(page)
