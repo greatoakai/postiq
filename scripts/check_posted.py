@@ -86,7 +86,7 @@ def check(page, name, amt, date):
     # Click the CLIENT's Billing TAB (a.v-tab; its href is URL-encoded so a plain
     # href*='billing/account' won't match). It bounces to the billing ledger page.
     page.click("a.v-tab:has-text('Billing')")
-    page.wait_for_load_state("networkidle")
+    bot.settle(page)
     page.wait_for_timeout(2800)
     rows = scrape_client_payments(page)
     target_dt = parse_date(date)
@@ -126,6 +126,7 @@ def main():
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=bot.HEADLESS)
         page = browser.new_page()
+        bot.block_beacon(page)
         page.set_default_timeout(bot.ACTION_TIMEOUT)
         try:
             bot.login(page)

@@ -8,6 +8,7 @@ import sys
 import unicodedata
 from datetime import datetime, timedelta, date as date_type
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -284,6 +285,90 @@ def detect_duplicates(payments):
     return {name for name, count in seen.items() if count > 1}
 
 
+# How long to give "networkidle" before deciding the page simply never goes
+# quiet, and the fixed pause we substitute once we've decided that.
+NETWORK_SETTLE_MS = 15000
+SETTLE_FALLBACK_MS = 800
+
+# How long to allow after "Save Payment". Deliberately generous: this is the
+# wait we refuse to guess on, so it errs towards waiting over assuming.
+SAVE_CONFIRM_MS = 30000
+
+# Consecutive timeouts before we conclude the page really never reaches
+# networkidle. One slow page is just a slow page — only a repeated failure
+# should downgrade every later settle() to a fixed pause.
+SETTLE_STRIKES_BEFORE_GIVING_UP = 3
+_settle_strikes = 0
+
+
+def settle(page):
+    """Wait for the page to go quiet — but never let that wait end the run.
+
+    "networkidle" is worth attempting — a genuinely settled page avoids a lot
+    of flaky clicks — but it is not something to bet a run on. It needs a 500ms
+    window with no in-flight requests, so one slow asset, or any page that keeps
+    a connection open, times it out however completely the page has loaded.
+
+    So it must degrade to a short pause rather than raise. On 2026-09-08 a
+    single slow load raised out of login() and killed a run with 27 payments
+    still to post; the next run 30 minutes later reached networkidle in under
+    five seconds and posted all 27.
+    """
+    settled(page)
+
+
+def settled(page, timeout=None):
+    """settle(), but reports whether the page actually went quiet.
+
+    Returns True if networkidle was reached, False if it timed out or we've
+    already given up on it. Callers that only want the pause can ignore the
+    result; the one caller that must not guess (submit_payment) checks it.
+
+    Passing an explicit `timeout` marks the wait as one that matters: it always
+    makes a real attempt, ignoring and not adding to the strike count. Without
+    that, tripping the strike threshold once would make every later save
+    unconfirmable and fail the whole run.
+    """
+    global _settle_strikes
+    if timeout is not None:
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout)
+            return True
+        except Exception:
+            _pause(page)
+            return False
+
+    if _settle_strikes >= SETTLE_STRIKES_BEFORE_GIVING_UP:
+        _pause(page)
+        return False
+    try:
+        page.wait_for_load_state("networkidle", timeout=NETWORK_SETTLE_MS)
+        _settle_strikes = 0  # a success clears the run of strikes
+        return True
+    except PlaywrightTimeout:
+        _settle_strikes += 1
+        if _settle_strikes >= SETTLE_STRIKES_BEFORE_GIVING_UP:
+            print("  (page never reaches networkidle — using a fixed settle "
+                  "pause from here on)")
+        _pause(page)
+        return False
+    except Exception:
+        # wait_for_load_state also raises a plain Error when a navigation
+        # interrupts it or the page is closing. That says nothing about
+        # whether networkidle works, so don't count it as a strike — just
+        # don't let a convenience wait be the thing that ends the run.
+        _pause(page)
+        return False
+
+
+def _pause(page):
+    """Best-effort fixed settle pause; never raises."""
+    try:
+        page.wait_for_timeout(SETTLE_FALLBACK_MS)
+    except Exception:
+        pass
+
+
 def login(page):
     """Log in to TherapyAppointment."""
     print("Opening login portal...")
@@ -298,7 +383,7 @@ def login(page):
     print("Clicking Sign In...")
     page.click("text=Sign In")
     page.wait_for_url("**/dashboard/**", timeout=30000)
-    page.wait_for_load_state("networkidle")
+    settle(page)
     screenshot(page, "02_dashboard")
     print("Login successful.")
 
@@ -309,6 +394,95 @@ def login(page):
     # reloads the widget.
     suppress_beacon_widget(page)
     dismiss_popups(page)
+
+
+# Substrings that identify a HelpScout Beacon request, matched against the
+# lowercased *hostname* only. Matching the whole URL would also catch first-
+# party paths — "beacon" is a very common name for a sendBeacon telemetry
+# endpoint — and silently aborting one of TA's own requests would resurface
+# later as an unrelated timeout.
+BEACON_HOST_MARKERS = ("helpscout", "beacon")
+
+# Hosts we've already reported blocking, so the log says it once per run
+# rather than on every navigation.
+_beacon_hosts_logged = set()
+
+
+def is_beacon_url(url):
+    """True if `url`'s host belongs to the HelpScout Beacon widget."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(m in host for m in BEACON_HOST_MARKERS)
+
+_BEACON_HIDE_CSS = """
+    #beacon-container,
+    iframe[title*="Help Scout"],
+    iframe[title*="Beacon"],
+    div[class*="BeaconContainer"] {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }
+"""
+
+
+def block_beacon(page):
+    """Keep the HelpScout Beacon out of the session entirely.
+
+    suppress_beacon_widget() injects CSS into the *current document*, so every
+    navigation drops it and the widget has to be re-hidden and re-dismissed --
+    59 times in a single 27-payment run on 2026-09-08. These two registrations
+    persist for the life of the page instead, across every navigation:
+
+      route()           aborts the widget's own requests, so the script never
+                        downloads and the iframe is never created at all.
+      add_init_script() re-installs the hiding CSS before each new document's
+                        scripts run, covering anything the route filter misses.
+
+    The route is registered against a Beacon-only URL predicate rather than
+    "**/*" on purpose: a catch-all route disables the browser's HTTP cache and
+    routes every request through this process, so each navigation would re-fetch
+    every asset and any slow non-Playwright call on this thread (a Square write,
+    say) would stall TA requests already in flight.
+
+    Call once per page, right after new_page(). The bot never uses the chat
+    widget, so nothing of value is blocked.
+    """
+    def _route(route):
+        try:
+            host = (urlparse(route.request.url).hostname or "").lower()
+            if host and host not in _beacon_hosts_logged:
+                _beacon_hosts_logged.add(host)
+                print(f"  Blocking Beacon host for this session: {host}")
+            route.abort()
+        except Exception:
+            # A route handler that raises wedges the page; never let it.
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    try:
+        page.route(is_beacon_url, _route)
+        page.add_init_script("""
+            (() => {
+              const add = () => {
+                if (document.getElementById('__no_beacon')) return;
+                const s = document.createElement('style');
+                s.id = '__no_beacon';
+                s.textContent = %s;
+                (document.head || document.documentElement).appendChild(s);
+              };
+              document.readyState === 'loading'
+                ? document.addEventListener('DOMContentLoaded', add)
+                : add();
+            })();
+        """ % json.dumps(_BEACON_HIDE_CSS))
+    except Exception as e:
+        # Worst case we fall back to the old per-document suppression path.
+        print(f"  WARNING: Could not install Beacon blocking: {e}")
 
 
 def suppress_beacon_widget(page):
@@ -391,11 +565,21 @@ def dismiss_popups(page):
     try:
         result = page.evaluate("""
             () => {
-                if (typeof window.Beacon === 'function') {
-                    try { window.Beacon('close'); return 'closed-via-api'; }
-                    catch (e) { return 'api-error: ' + e.message; }
-                }
-                return null;
+                if (typeof window.Beacon !== 'function') return null;
+                // block_beacon() aborts the widget's script, but HelpScout's
+                // inline snippet still defines window.Beacon as a queue stub,
+                // recognisable by its readyQueue. Always make the call — it is
+                // harmless on a stub, and on pages created without
+                // block_beacon() the real widget lives in an iframe that the
+                // force-click strategies below cannot reach, so this is the
+                // only thing that closes it. Only the *reporting* distinguishes
+                // them, so the log stops claiming 59 dismissals of a widget
+                // that was never loaded.
+                const real = !window.Beacon.readyQueue;
+                try {
+                    window.Beacon('close');
+                    return real ? 'closed-via-api' : 'closed-stub';
+                } catch (e) { return 'api-error: ' + e.message; }
             }
         """)
         if result == "closed-via-api":
@@ -487,7 +671,7 @@ def recover_to_dashboard(page):
             wait_until="domcontentloaded",
             timeout=15000,
         )
-        page.wait_for_load_state("networkidle")
+        settle(page)
     except Exception as e:
         print(f"  WARNING: dashboard goto failed: {e}")
 
@@ -532,7 +716,7 @@ def navigate_to_clients(page):
     print("  Navigating to Clients...")
     dismiss_popups(page)  # Beacon widget can intercept the sidebar click
     page.click("text=Clients")
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
 
 
@@ -610,7 +794,7 @@ def _do_search(page, first_search, last_search):
     last_input.fill(last_search)
 
     page.locator("button:has-text('Search')").first.click()
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(2000)
 
     screenshot(page, f"search_{first_search}_{last_search}")
@@ -642,7 +826,7 @@ def _try_inactive_clients(page):
         if inactive_btn.is_visible(timeout=1000):
             print("  No active results — clicking 'Inactive Clients' to expand search...")
             inactive_btn.click()
-            page.wait_for_load_state("networkidle")
+            settle(page)
             page.wait_for_timeout(2000)
             screenshot(page, "search_inactive")
             return page.locator("table tr").all()
@@ -782,7 +966,7 @@ def search_client_by_account(page, account):
                 return False, "account field not found"
             acct_input.fill(search_value)
             page.locator("button:has-text('Search')").first.click()
-            page.wait_for_load_state("networkidle")
+            settle(page)
             page.wait_for_timeout(2000)
             screenshot(page, f"search_acct_{account}")
             matching = _rows_matching_account(page.locator("table tr").all(), account)
@@ -814,7 +998,7 @@ def search_client_by_account(page, account):
     row, link = matching[0]
     print(f"  [acct] Found client: {row.text_content().strip()[:60]}")
     link.click()
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
     return True, f"Matched by Account # {account}"
 
@@ -1005,7 +1189,7 @@ def search_client(page, name, account=None):
     row, link = matching_rows[0]
     print(f"  Found client: {row.text_content().strip()[:60]}")
     link.click()
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
     return True, note
 
@@ -1014,7 +1198,7 @@ def navigate_to_appointments(page):
     """Click the Appointments tab on the client profile."""
     print("  Clicking Appointments tab...")
     page.click("text=Appointments")
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
 
 
@@ -1076,7 +1260,7 @@ def ensure_date_filters(page):
         page.keyboard.press("Tab")
         page.wait_for_timeout(500)
 
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
     screenshot(page, "filters_set")
     print(f"  Filters set: {expected_from} — {expected_to}")
@@ -1152,7 +1336,7 @@ def click_appointment_by_date(page, date_str, name):
     if len(eligible) == 1:
         print(f"  Found appointment: {eligible[0].text_content().strip()}")
         eligible[0].click()
-        page.wait_for_load_state("networkidle")
+        settle(page)
         page.wait_for_timeout(1000)
         return None  # exact match, no note needed
 
@@ -1245,7 +1429,7 @@ def click_appointment_by_date(page, date_str, name):
         f"({chosen['days_diff']} day(s) before Square date)"
     )
     chosen["link"].click()
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
 
     note = (
@@ -1326,7 +1510,7 @@ def click_accept_payment(page, name):
                 f"NO_ACCEPT_PAYMENT: the appointment matched for {name} offers no "
                 f"Accept Payment button (cancelled, or no client charge on it)"
             )
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(2000)
 
     # Handle modal: "Additional charges exist for this client"
@@ -1350,7 +1534,7 @@ def click_accept_payment(page, name):
             print("  Clicking: Yes, accept payment for this appointment")
             btn = modal.locator("button:has-text('Yes, accept payment for this appointment')")
         btn.click()
-        page.wait_for_load_state("networkidle")
+        settle(page)
         page.wait_for_timeout(1000)
         # Capture what TA now reports as owed, for the report's Amount-due column.
         # On the "all_open_charges" path this is the client's total open
@@ -1473,23 +1657,61 @@ def fill_payment_form(page, amount):
     ref_input.fill("Square")
 
 
+def _payment_form_gone(page):
+    """True if the payment form has closed — the page's own evidence of a save.
+
+    A second opinion for when networkidle is unavailable: TA only clears the
+    Save Payment control once the save has gone through, so its absence is
+    positive evidence where a timed-out wait is merely absence of evidence.
+    """
+    try:
+        return page.locator("text=Save Payment").count() == 0
+    except Exception:
+        return False
+
+
 def submit_payment(page, name, dry_run=False):
     """Click Continue then Save Payment, or Cancel if dry run."""
     if dry_run:
         print("  DRY RUN: Clicking Cancel instead of saving.")
         page.click("text=Cancel")
-        page.wait_for_load_state("networkidle")
+        settle(page)
         return True
 
     print("  Clicking Continue...")
     page.click("text=Continue")
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(2000)
     screenshot(page, f"payment_{name.replace(' ', '_')}_03_continue")
 
     print("  Clicking Save Payment...")
     page.click("text=Save Payment")
-    page.wait_for_load_state("networkidle")
+
+    # The one wait in this file that must NOT degrade to a fixed pause. The
+    # caller records the Square payment id as posted on a True return, so
+    # guessing here risks marking a payment posted that TA never saved — the
+    # one error this system cannot detect afterwards. Reporting a save that did
+    # happen as failed is recoverable (it lands on the reconciliation list for a
+    # human to check); silently losing one is not.
+    saved = settled(page, timeout=SAVE_CONFIRM_MS)
+    if not saved:
+        # networkidle is not proof on its own — a page holding a connection
+        # open never reaches it however well the save went. Before calling this
+        # a failure, ask the page directly: the form only goes away on success.
+        saved = _payment_form_gone(page)
+
+    if not saved:
+        # Deliberately unguarded-proof: this path is reached exactly when the
+        # page may be closing, and a screenshot that raises here would turn a
+        # careful `return False` into an exception on the money path.
+        try:
+            screenshot(page, f"payment_{name.replace(' ', '_')}_04_unconfirmed")
+        except Exception:
+            pass
+        print(f"  WARNING: could not confirm the save for {name} — "
+              f"NOT recording as posted; verify this one in TA by hand")
+        return False
+
     page.wait_for_timeout(2000)
     screenshot(page, f"payment_{name.replace(' ', '_')}_04_saved")
 
@@ -1531,7 +1753,7 @@ def navigate_to_client_billing(page, profile_url):
     print("  Opening the client's Billing tab...")
     if profile_url:
         page.goto(profile_url)
-        page.wait_for_load_state("networkidle")
+        settle(page)
         page.wait_for_timeout(1500)
     dismiss_popups(page)
     try:
@@ -1550,7 +1772,7 @@ def navigate_to_client_billing(page, profile_url):
         """)
         if not opened:
             raise Exception("Could not open the client's Billing tab")
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(2500)
 
 
@@ -1599,7 +1821,7 @@ def post_payment_to_balance(page, name, amount, dry_run=False, profile_url=None,
         clicked = False
     if not clicked:
         raise Exception(f"No Take Payment button on the Billing tab for {name}")
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(2500)
     screenshot(page, f"payment_{name.replace(' ', '_')}_bal_01_form")
 
@@ -1724,7 +1946,7 @@ def navigate_to_billing(page):
     print("  Navigating to Billing...")
     dismiss_popups(page)  # Beacon widget can intercept the sidebar click
     page.click("text=Billing")
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
 
 
@@ -1803,7 +2025,7 @@ def select_client_v1(page, name):
 
     print("  Clicking Search...")
     page.locator("button:has-text('Search')").first.click()
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(3000)
 
 
@@ -1884,7 +2106,7 @@ def post_payment_v1(page, name, amount, dry_run=False):
     # Click Take Payment
     print("  Clicking Take Payment...")
     page.locator("text=Take Payment").first.click()
-    page.wait_for_load_state("networkidle")
+    settle(page)
     page.wait_for_timeout(1000)
 
     # Select client and search
@@ -1912,7 +2134,7 @@ def post_payment_v1(page, name, amount, dry_run=False):
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_02_filled")
 
     if not submit_payment(page, name, dry_run):
-        raise Exception("V1 submit_payment returned failure")
+        raise Exception("AT_PAYMENT_FORM: V1 submit_payment returned failure")
 
     # After save, scrape the confirmation page for the definitive Date of Svc
     if not dry_run:
@@ -2026,12 +2248,19 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     try:
         v1_ok, posted_date = post_payment_v1(page, name, amount, dry_run)
         if not v1_ok:
-            raise Exception("V1 submit_payment returned failure")
+            raise Exception("AT_PAYMENT_FORM: V1 submit_payment returned failure")
         return True, "V1", None, None, posted_date, combined_v2_error, None
     except Exception as e:
         v1_error = str(e)
         if "FLAG" in v1_error:
             return False, "FLAGGED", v1_error, None, None, None, None
+        if "AT_PAYMENT_FORM" in v1_error:
+            # V1 clicked Save and then went dark. Same rule as the V2 paths:
+            # this is the last route we have, and reporting it as a plain
+            # failure would leave the id unretired for the next cycle's
+            # overlap window to post a second time.
+            return False, "FLAGGED", _may_have_posted_flag(
+                name, f"{combined_v2_error}; V1: {v1_error}"), None, None, None, None
         print(f"  V1 also failed: {v1_error}")
 
     # --- All attempts failed ---
@@ -2463,9 +2692,10 @@ def _classify_issue(reason):
                 "fill_payment_form() couldn't find the expected text input. "
                 "TA may have changed the form layout.")
     if "submit_payment returned failure" in r:
-        return ("Save Payment click failed",
-                "submit_payment returned False without raising. Could be a stuck "
-                "modal or a UI change blocking the Save Payment button.")
+        return ("Save Payment not confirmed",
+                "Save Payment was clicked but the save could not be confirmed — "
+                "the page neither settled nor closed the form. The payment may or "
+                "may not be in TA: check the client's ledger before posting by hand.")
     return ("Other", "")
 
 
@@ -2993,6 +3223,7 @@ def run():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
         page = browser.new_page()
+        block_beacon(page)
         page.set_default_timeout(ACTION_TIMEOUT)
 
         try:
