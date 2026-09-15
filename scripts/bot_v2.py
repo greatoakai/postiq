@@ -369,6 +369,88 @@ def _pause(page):
         pass
 
 
+DASHBOARD_URL = "https://portal.therapyappointment.com/index.cfm/dashboard"
+
+# TA's app is a Nuxt single-page app: the dashboard URL loads a bare shell and
+# the sidebar only appears once the app's JS chunks have been fetched and run.
+# TA intermittently answers one of those chunks with a 502 — caught on
+# 2026-09-15 in 1 of 8 logins (/n/_nuxt/f6b39a6.js) — and the page then stays a
+# blank shell with no sidebar, however long you wait. Loading the page again
+# refetches the chunk. Unhandled, it cost the first payment of a run 17 times
+# between 8/21 and 9/14: three routes x three 30s clicks at a link that did not
+# exist, before recover_to_dashboard() reloaded the page for the next payment.
+APP_RENDER_TIMEOUT_MS = 15000
+APP_RENDER_ATTEMPTS = 3
+SIDEBAR_QUICK_CHECK_MS = 5000
+
+# Set when a pre-click reload failed to bring the app back, so a TA outage costs
+# one reload rather than one per sidebar click. Cleared by any successful render
+# check, including the quick one every sidebar click makes first.
+_app_unrendered = False
+
+
+def dashboard_ready(page, timeout_ms=APP_RENDER_TIMEOUT_MS):
+    """True once TA's app has rendered its sidebar (present on every app page)."""
+    global _app_unrendered
+    try:
+        page.wait_for_selector("text=Clients", timeout=timeout_ms)
+    except Exception:
+        return False
+    _app_unrendered = False
+    return True
+
+
+def ensure_app_rendered(page, context):
+    """Reload the dashboard until TA's app renders, up to APP_RENDER_ATTEMPTS.
+
+    Returns True once the sidebar is visible, False if it never appears.
+    """
+    for attempt in range(1, APP_RENDER_ATTEMPTS + 1):
+        if dashboard_ready(page):
+            if attempt > 1:
+                print(f"  TA app rendered after {attempt - 1} reload(s).")
+            return True
+        if attempt == APP_RENDER_ATTEMPTS:
+            break
+        print(f"  TA app did not render {context} — reloading the dashboard "
+              f"(attempt {attempt} of {APP_RENDER_ATTEMPTS - 1})...")
+        try:
+            page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=15000)
+            settle(page)
+        except Exception as e:
+            print(f"  WARNING: dashboard reload failed: {e}")
+    return False
+
+
+def _ensure_sidebar(page):
+    """Before a sidebar click: if the app shell is gone, reload it once.
+
+    The sidebar exists on every app page, so when it is missing no sidebar click
+    can succeed — clicking anyway just burns the 30s action timeout, and the
+    account search, name search and V1 each try again.
+
+    Deliberately only a reload: no re-login and no raise. Every caller sits
+    inside a catch-all retry handler, so recover_to_dashboard() here would
+    re-login once per retry during an outage (about ten per payment) and its
+    UnrecoverableStateError would be swallowed instead of halting the batch.
+    Escalation stays with the recover_to_dashboard() call between payments.
+    """
+    global _app_unrendered
+    # Check first, even when flagged: a successful check is what clears the flag,
+    # so skipping it would leave reloads off for the rest of the run.
+    if dashboard_ready(page, SIDEBAR_QUICK_CHECK_MS) or _app_unrendered:
+        return
+    print("  Sidebar missing — TA app not rendered; reloading the dashboard before the click...")
+    try:
+        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=15000)
+        settle(page)
+    except Exception as e:
+        print(f"  WARNING: dashboard reload failed: {e}")
+    if not dashboard_ready(page):
+        _app_unrendered = True
+        print("  TA app still not rendered after a reload — not reloading again until it recovers")
+
+
 def login(page):
     """Log in to TherapyAppointment."""
     print("Opening login portal...")
@@ -385,6 +467,14 @@ def login(page):
     page.wait_for_url("**/dashboard/**", timeout=30000)
     settle(page)
     screenshot(page, "02_dashboard")
+    if not ensure_app_rendered(page, "after login"):
+        screenshot(page, "02_dashboard_not_rendered")
+        # Raise rather than press on: nothing has been posted yet, and the
+        # poller leaves its cursor alone on a failed run, so the next cycle
+        # retries these payments from scratch.
+        raise UnrecoverableStateError(
+            "TA dashboard never rendered after login "
+            f"({APP_RENDER_ATTEMPTS - 1} reloads) — TA may be serving errors")
     print("Login successful.")
 
     # Permanently disable the Beacon (HelpScout) chat widget for this session.
@@ -658,16 +748,12 @@ def recover_to_dashboard(page):
     to halt loudly at payment N+1 than to mass-fail 72 in a row.
     """
     def _sidebar_visible() -> bool:
-        try:
-            page.wait_for_selector("text=Clients", timeout=10000)
-            return True
-        except PlaywrightTimeout:
-            return False
+        return dashboard_ready(page, 10000)
 
     print("  Recovering to dashboard...")
     try:
         page.goto(
-            "https://portal.therapyappointment.com/index.cfm/dashboard",
+            DASHBOARD_URL,
             wait_until="domcontentloaded",
             timeout=15000,
         )
@@ -715,6 +801,7 @@ def navigate_to_clients(page):
     """Click Clients in the sidebar."""
     print("  Navigating to Clients...")
     dismiss_popups(page)  # Beacon widget can intercept the sidebar click
+    _ensure_sidebar(page)
     page.click("text=Clients")
     settle(page)
     page.wait_for_timeout(1000)
@@ -1990,6 +2077,7 @@ def navigate_to_billing(page):
     """Navigate to the Billing dashboard."""
     print("  Navigating to Billing...")
     dismiss_popups(page)  # Beacon widget can intercept the sidebar click
+    _ensure_sidebar(page)
     page.click("text=Billing")
     settle(page)
     page.wait_for_timeout(1000)
