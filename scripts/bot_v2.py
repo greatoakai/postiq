@@ -371,6 +371,12 @@ def _pause(page):
 
 DASHBOARD_URL = "https://portal.therapyappointment.com/index.cfm/dashboard"
 
+# Wording matters: _classify_issue() keys off it, and it must not contain "FLAG",
+# "AT_PAYMENT_FORM", or any _NO_APPOINTMENT_MARKERS text, or the payment would be
+# rerouted instead of simply failing.
+APP_NOT_RENDERING_REASON = ("TA app not rendering (blank page with no sidebar "
+                            "after repeated reloads)")
+
 # TA's app is a Nuxt single-page app: the dashboard URL loads a bare shell and
 # the sidebar only appears once the app's JS chunks have been fetched and run.
 # TA intermittently answers one of those chunks with a 502 — caught on
@@ -383,9 +389,17 @@ APP_RENDER_TIMEOUT_MS = 15000
 APP_RENDER_ATTEMPTS = 3
 SIDEBAR_QUICK_CHECK_MS = 5000
 
-# Set when a pre-click reload failed to bring the app back, so a TA outage costs
-# one reload rather than one per sidebar click. Cleared by any successful render
-# check, including the quick one every sidebar click makes first.
+# Reloads to try mid-run before concluding the app really is down, and the pause
+# between them. One reload was not always enough: on 2026-09-15 a payment lost
+# its single reload by seconds — the app was back 8 seconds later, but reloads
+# were already switched off for the rest of the run, so the remaining seven
+# sidebar clicks each waited the full 30s ACTION_TIMEOUT and the payment failed.
+SIDEBAR_RELOAD_ATTEMPTS = 3
+SIDEBAR_RELOAD_PAUSE_MS = 2000
+
+# Set once the pre-click reloads are spent, so the rest of THIS payment fails fast
+# instead of reloading again at every sidebar click. Cleared by any successful
+# render check, and by reset_app_render_state() at the start of each payment.
 _app_unrendered = False
 
 
@@ -422,33 +436,72 @@ def ensure_app_rendered(page, context):
     return False
 
 
+class AppNotRenderedError(RuntimeError):
+    """TA's app shell isn't rendering, so no sidebar click can succeed.
+
+    Raised instead of clicking a link that is not there. Nothing has been
+    submitted when this is raised, so the payment is a plain failure that is
+    safe to post later — the message deliberately avoids the markers that would
+    route it elsewhere ('FLAG', 'AT_PAYMENT_FORM', 'no appointment found').
+    """
+
+
+def reset_app_render_state():
+    """Give each payment a fresh start at reloading a blank app."""
+    global _app_unrendered
+    _app_unrendered = False
+
+
 def _ensure_sidebar(page):
-    """Before a sidebar click: if the app shell is gone, reload it once.
+    """Before a sidebar click: if the app shell is gone, reload it back.
 
     The sidebar exists on every app page, so when it is missing no sidebar click
     can succeed — clicking anyway just burns the 30s action timeout, and the
     account search, name search and V1 each try again.
 
-    Deliberately only a reload: no re-login and no raise. Every caller sits
-    inside a catch-all retry handler, so recover_to_dashboard() here would
-    re-login once per retry during an outage (about ten per payment) and its
-    UnrecoverableStateError would be swallowed instead of halting the batch.
-    Escalation stays with the recover_to_dashboard() call between payments.
+    Reloads only: no re-login. Every caller sits inside a catch-all retry
+    handler, so recover_to_dashboard() here would re-login once per retry during
+    an outage (about ten per payment) and its UnrecoverableStateError would be
+    swallowed instead of halting the batch. Escalation stays with the
+    recover_to_dashboard() call between payments.
+
+    Once the reloads are spent, raise rather than let the caller click anyway:
+    that turns ~30s of certain failure per sidebar click into ~5s, and puts a
+    legible reason in the morning report instead of a Playwright timeout.
     """
     global _app_unrendered
     # Check first, even when flagged: a successful check is what clears the flag,
-    # so skipping it would leave reloads off for the rest of the run.
-    if dashboard_ready(page, SIDEBAR_QUICK_CHECK_MS) or _app_unrendered:
+    # so skipping it would leave reloads off for the rest of this payment.
+    if dashboard_ready(page, SIDEBAR_QUICK_CHECK_MS):
         return
-    print("  Sidebar missing — TA app not rendered; reloading the dashboard before the click...")
+    if _app_unrendered:
+        raise AppNotRenderedError(APP_NOT_RENDERING_REASON)
+
+    for attempt in range(1, SIDEBAR_RELOAD_ATTEMPTS + 1):
+        print(f"  Sidebar missing — TA app not rendered; reloading the dashboard "
+              f"({attempt} of {SIDEBAR_RELOAD_ATTEMPTS})...")
+        try:
+            page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=15000)
+            settle(page)
+        except Exception as e:
+            print(f"  WARNING: dashboard reload failed: {e}")
+        if dashboard_ready(page):
+            if attempt > 1:
+                print(f"  TA app rendered after {attempt} reload(s).")
+            return
+        if attempt < SIDEBAR_RELOAD_ATTEMPTS:
+            page.wait_for_timeout(SIDEBAR_RELOAD_PAUSE_MS)
+
+    # Still blank. Stop reloading for the rest of this payment (reset_app_render_state()
+    # re-arms it for the next one) and keep the evidence.
+    _app_unrendered = True
+    print(f"  TA app still not rendered after {SIDEBAR_RELOAD_ATTEMPTS} reloads — "
+          f"failing this payment fast rather than clicking a link that is not there")
     try:
-        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=15000)
-        settle(page)
-    except Exception as e:
-        print(f"  WARNING: dashboard reload failed: {e}")
-    if not dashboard_ready(page):
-        _app_unrendered = True
-        print("  TA app still not rendered after a reload — not reloading again until it recovers")
+        screenshot(page, "sidebar_missing_app_not_rendered")
+    except Exception:
+        pass
+    raise AppNotRenderedError(APP_NOT_RENDERING_REASON)
 
 
 def login(page):
@@ -1069,6 +1122,10 @@ def search_client_by_account(page, account):
                 print(f"  [acct] attempt {attempt + 1}: 0 results (TA search can flake); retrying...")
                 page.wait_for_timeout(1500)
                 continue
+        except AppNotRenderedError:
+            # Not a flake: the app shell is gone, so retrying this click just waits
+            # again. _ensure_sidebar has already spent its reloads — let it out.
+            raise
         except Exception as e:
             if attempt < 2:
                 print(f"  [acct] attempt {attempt + 1} transient error ({e}); retrying...")
@@ -1206,7 +1263,8 @@ def search_client(page, name, account=None):
                 return True, acct_note
             print(f"  [acct] {acct_note} — falling back to name search")
         except Exception as e:
-            if "FLAG" in str(e):
+            # A blank app shell won't be fixed by searching a different way.
+            if isinstance(e, AppNotRenderedError) or "FLAG" in str(e):
                 raise
             print(f"  [acct] account search errored ({e}) — falling back to name search")
 
@@ -2330,6 +2388,7 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     miss. V1 (the billing-autocomplete fallback) remains name-based.
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
+    reset_app_render_state()
 
     # --- Attempt 1: V2 flow. No open-balance fallback yet — a "no appointment
     # found" here can just be TA's appointment list not having rendered, and a
@@ -2792,17 +2851,27 @@ def _classify_issue(reason):
     """Categorize a failure reason string into an actionable group + suggested fix."""
     r = (reason or "").lower()
 
-    if "timeout" in r and ("click" in r or "intercepts pointer events" in r):
-        return ("Click blocked by overlay",
-                "A popup (often the Beacon chat widget) was covering the page. "
-                "The dismiss_popups() helper should catch this — if it persists, "
-                "add the new selector to dismiss_popups().")
+    # Order matters, and safety comes first. A combined V2/V2-retry/V1 reason can
+    # carry several of these at once, and the most dangerous reading must win: a
+    # payment that reached the form may be in TA already, so it can never be
+    # described as safe to re-post. App-not-rendering is next, ahead of the generic
+    # click timeout it would otherwise be mistaken for.
     if "reached ta's payment form before failing" in r:
         return ("May already have posted — verify before re-posting",
                 "The bot filled TA's payment form and then lost the page, so the "
                 "payment may or may not have saved. It deliberately did not try "
                 "another route. Check the client's ledger and post by hand only if "
                 "the payment isn't already there.")
+    if "app not rendering" in r:
+        return ("TherapyAppointment wasn't loading",
+                "TA served a blank page (its app failed to start), so the bot could "
+                "not reach the client. Nothing was submitted, so this payment is "
+                "safe to post — by hand, or by re-running the poller for that day.")
+    if "timeout" in r and ("click" in r or "intercepts pointer events" in r):
+        return ("Click blocked by overlay",
+                "A popup (often the Beacon chat widget) was covering the page. "
+                "The dismiss_popups() helper should catch this — if it persists, "
+                "add the new selector to dismiss_popups().")
     if "no appointment found" in r:
         return ("Appointment not found on date",
                 "Client exists in TA but has no appointment matching the Square "

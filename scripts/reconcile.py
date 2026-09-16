@@ -293,6 +293,17 @@ def explain(status, reason, name):
         return ("The Square payment has no customer attached, so the bot couldn't tell whose it was.",
                 "Look the payment up in Square to identify the client, post it in TA, "
                 "then attach the customer to the payment in Square.")
+    # First, ahead of every other reason. A payment that reached TA's form may
+    # already be in TA, and the poller retires those ids (MAY_HAVE_POSTED_MARKER)
+    # so they are never retried — which makes this report the only thing between a
+    # save that went dark and a second charge. It has to win, and it would not
+    # otherwise: the flag embeds the whole chained reason, which routinely also
+    # carries "no appointment found" or a name-lookup miss from the earlier legs.
+    if "reached ta's payment form before failing" in r:
+        return ("The bot filled TA's payment form and then lost the page, so this one may "
+                "or may not have saved. It deliberately didn't try again.",
+                "Open the client's ledger in TA. Post the payment only if it isn't already "
+                "there — don't assume either way.")
     if "not found in search results" in r or "not found in autocomplete" in r:
         return (f"No TherapyAppointment client matched the name Square has for them ({esc(name)}).",
                 "Find the client in TA — it's usually a nickname, maiden name, or spelling "
@@ -307,11 +318,15 @@ def explain(status, reason, name):
                 "bot couldn't tell which session the payment belongs to.",
                 "Find where the appointment moved to and post the payment there — or to the "
                 "client's open balance if the session didn't happen.")
-    if "reached ta's payment form before failing" in r:
-        return ("The bot filled TA's payment form and then lost the page, so this one may "
-                "or may not have saved. It deliberately didn't try again.",
-                "Open the client's ledger in TA. Post the payment only if it isn't already "
-                "there — don't assume either way.")
+    # Checked below may-have-posted, never above it. The wording stops short of
+    # promising the payment isn't in TA: reasons_from_logs() fills missing backlog
+    # reasons by client name, so a row can inherit a newer reason of its own
+    # client's, and an unconditional "safe to post" would be riding that.
+    if "app not rendering" in r:
+        return ("TherapyAppointment was serving a blank page, so the bot couldn't reach "
+                "the client at all.",
+                "Post it in TA. Check the ledger first as usual — the bot never got as "
+                "far as TA's payment form, so it shouldn't already be there.")
     if "multiple appointments" in r:
         return ("The client had more than one appointment that day, so the bot wouldn't guess which one.",
                 "Pick the right appointment in TA and post the payment there.")
