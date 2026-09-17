@@ -2422,13 +2422,16 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         return True, method, None, note, posted, None, balance_amount
     except Exception as e:
         v2_error = str(e)
-        if "FLAG" in v2_error:
-            return False, "FLAGGED", v2_error, None, None, None, None
+        # AT_PAYMENT_FORM before FLAG: the tagged error carries the underlying message,
+        # and if that happened to contain "FLAG" the payment would otherwise be flagged
+        # WITHOUT the may-already-have-posted marker — so the poller wouldn't retire it.
         if "AT_PAYMENT_FORM" in v2_error:
             # Continue/Save were clicked and then the page went away. Retrying —
             # by any route, including a plain V2 retry that would just fill the
             # form again — risks posting the same money twice.
             return False, "FLAGGED", _may_have_posted_flag(name, v2_error), None, None, None, None
+        if "FLAG" in v2_error:
+            return False, "FLAGGED", v2_error, None, None, None, None
         print(f"  V2 failed: {v2_error}")
 
     # --- Attempt 2: Retry V2 with fresh navigation ---
@@ -2444,11 +2447,14 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         return True, f"{method}-retry", None, note, posted, None, balance_amount
     except Exception as e:
         v2_retry_error = str(e)
-        if "FLAG" in v2_retry_error:
-            return False, "FLAGGED", v2_retry_error, None, None, None, None
+        # AT_PAYMENT_FORM before FLAG: the tagged error carries the underlying message,
+        # and if that happened to contain "FLAG" the payment would otherwise be flagged
+        # WITHOUT the may-already-have-posted marker — so the poller wouldn't retire it.
         if "AT_PAYMENT_FORM" in v2_retry_error:
             return False, "FLAGGED", _may_have_posted_flag(
                 name, f"V2: {v2_error}; V2-retry: {v2_retry_error}"), None, None, None, None
+        if "FLAG" in v2_retry_error:
+            return False, "FLAGGED", v2_retry_error, None, None, None, None
         print(f"  V2 retry failed: {v2_retry_error}")
         print(f"  Falling back to V1...")
 
@@ -2463,8 +2469,9 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         return True, "V1", None, None, posted_date, combined_v2_error, None
     except Exception as e:
         v1_error = str(e)
-        if "FLAG" in v1_error:
-            return False, "FLAGGED", v1_error, None, None, None, None
+        # AT_PAYMENT_FORM before FLAG: the tagged error carries the underlying message,
+        # and if that happened to contain "FLAG" the payment would otherwise be flagged
+        # WITHOUT the may-already-have-posted marker — so the poller wouldn't retire it.
         if "AT_PAYMENT_FORM" in v1_error:
             # V1 clicked Save and then went dark. Same rule as the V2 paths:
             # this is the last route we have, and reporting it as a plain
@@ -2472,6 +2479,8 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
             # overlap window to post a second time.
             return False, "FLAGGED", _may_have_posted_flag(
                 name, f"{combined_v2_error}; V1: {v1_error}"), None, None, None, None
+        if "FLAG" in v1_error:
+            return False, "FLAGGED", v1_error, None, None, None, None
         print(f"  V1 also failed: {v1_error}")
 
     # --- All attempts failed ---
