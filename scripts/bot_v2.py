@@ -1902,8 +1902,17 @@ def submit_payment(page, name, dry_run=False):
               f"NOT recording as posted; verify this one in TA by hand")
         return False
 
-    page.wait_for_timeout(2000)
-    screenshot(page, f"payment_{name.replace(' ', '_')}_04_saved")
+    # The save is confirmed. Nothing after this point may turn it into a failure:
+    # a raise here makes every caller report a payment TA already saved as not
+    # saved — V2 and the balance post as "may already have posted", and V1 (before
+    # it was wrapped) as a plain FAILED that looked safe to post a second time.
+    # The failure path above guards its screenshot for the same reason; this one
+    # is reached just as often with a page that is about to close.
+    try:
+        page.wait_for_timeout(2000)
+        screenshot(page, f"payment_{name.replace(' ', '_')}_04_saved")
+    except Exception as e:
+        print(f"  (post-save pause/screenshot skipped: {e})")
 
     print(f"  Payment saved for {name}.")
     return True
@@ -2324,7 +2333,17 @@ def post_payment_v1(page, name, amount, dry_run=False):
     fill_payment_form(page, amount)
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_02_filled")
 
-    if not submit_payment(page, name, dry_run):
+    # Past this point Continue/Save have been clicked and the money may already be
+    # in TA. Tag every failure, raised as well as returned, the way V2 and the
+    # balance post do — so post_payment FLAGS it "may already have posted" instead
+    # of reporting a plain FAILED. A plain FAILED must mean nothing was submitted:
+    # the morning report tells staff to post those, and anything that re-attempts
+    # failures relies on it.
+    try:
+        submitted = submit_payment(page, name, dry_run)
+    except Exception as e:
+        raise Exception(f"AT_PAYMENT_FORM: {e}")
+    if not submitted:
         raise Exception("AT_PAYMENT_FORM: V1 submit_payment returned failure")
 
     # After save, scrape the confirmation page for the definitive Date of Svc
