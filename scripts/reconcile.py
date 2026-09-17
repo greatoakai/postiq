@@ -39,10 +39,11 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter, OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape as esc
 from pathlib import Path
 
@@ -446,24 +447,167 @@ def save_cleared(c):
 # RECONCILIATION
 # =============================================================================
 
+# The poller's write-ahead intent markers (poll_square.INFLIGHT_DIR): one small file per Square
+# payment a run had started posting when it was interrupted, before it could record how it went.
+# Kept in step with poll_square by name only, so the report doesn't import the poller.
+INFLIGHT_DIRNAME = "poll_inflight"
+
+# When the emailed report read the ledger (poll_square.REPORT_STAMP_PATH, shared by name). The
+# poller never auto-retries a failure the report may have shown staff, and the report reads the
+# ledger whenever it actually runs — a Mac that wakes at 08:20 runs it then — so the poller needs
+# the real times, not an assumed 08:00. started_at is written before the first ledger read,
+# sent_at once the email has gone.
+REPORT_STAMP_FILENAME = "report_stamp.json"
+
+
+def _write_report_stamp(**fields):
+    path = bot.DATA_DIR / REPORT_STAMP_FILENAME
+    try:
+        cur = json.loads(path.read_text())
+        cur = cur if isinstance(cur, dict) else {}
+    except Exception:
+        cur = {}
+    cur.update(fields)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(cur, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as e:
+        # The staff email matters more than the stamp, so carry on. The poller holds every
+        # auto-retry on a weekday until it finds a stamp from that day, so this fails closed;
+        # tell the admin, because retries stay off until the stamp can be written.
+        print(f"  reconcile: could not record the report time in {path} ({e}).")
+        try:
+            bot.send_email(to=ADMIN_TO, cc=None,
+                           subject="PostIQ — report time could not be recorded",
+                           body=f"reconcile could not write {path} ({e}). The poller will not "
+                                f"auto-retry failed payments until it can, so failures wait for "
+                                f"staff on the morning report instead. Check that file's "
+                                f"ownership (and any leftover .tmp beside it).",
+                           html=False)
+        except Exception:
+            pass
+
+
+def _utc_stamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_inflight_markers(txn_date):
+    """Intent markers for payments dated `txn_date` (MM/DD/YYYY).
+
+    A marker with no readable date can't be placed on a day; the poller alerts the admin about
+    those itself, every day, until they're resolved.
+    """
+    d = bot.DATA_DIR / INFLIGHT_DIRNAME
+    if not d.exists():
+        return []
+    out = []
+    for p in sorted(d.glob("*.json")):
+        try:
+            m = json.loads(p.read_text())
+        except Exception:
+            continue
+        if isinstance(m, dict) and m.get("date") == txn_date:
+            m.setdefault("id", p.stem)
+            out.append(m)
+    return out
+
+
+def _interrupted_item(base, marker, attach_id=True):
+    """A payment a run started posting and never recorded — so it may already be in TA."""
+    name = base.get("name") or marker.get("name") or "(unknown client)"
+    item = {**base, "name": name, "date": base.get("date") or marker.get("date"),
+            "amount": base.get("amount") or marker.get("amount"),
+            "status": "FLAGGED", "account": base.get("account", ""),
+            "reason": bot._may_have_posted_flag(
+                name, "a poller run started posting it and was interrupted before it could "
+                      "record the outcome")}
+    if attach_id:
+        item["id"] = marker.get("id")
+    return item
+
+
+def _marker_ledger_split(markers, ledger):
+    """Sort a day's intent markers by what the ledger already says about each payment.
+
+    recorded   : a row is OK, or already flagged may-have-posted — the outcome is on
+                 record, so the marker adds nothing.
+    override   : a row exists but records something else (FAILED, ERROR, a plain flag).
+                 That row predates an attempt that was started and cut off — an
+                 interrupted retry — so the payment must read may-have-posted, not
+                 "post it in TA". Returned as {id: marker}.
+    unrecorded : no row at all.
+    """
+    rows = {e.get("id"): e for e in ledger if isinstance(e, dict) and e.get("id")}
+    recorded, override, unrecorded = [], {}, []
+    for m in markers:
+        row = rows.get(m.get("id"))
+        if row is None:
+            unrecorded.append(m)
+        elif row.get("status") == "OK" or bot.MAY_HAVE_POSTED_MARKER in (row.get("reason") or ""):
+            recorded.append(m)
+        else:
+            override[m.get("id")] = m
+    return recorded, override, unrecorded
+
+
+def _marker_lookalikes(marker, gaps):
+    """Gaps that could be the CSV's row for this marker's payment: same amount, or same client."""
+    mamt, mname = _amt(marker.get("amount")), _norm(marker.get("name"))
+    return [g for g in gaps
+            if _amt(g.get("amount")) == mamt or (mname and _norm(g.get("name")) == mname)]
+
+
+def _apply_marker_overrides(override, items):
+    """Rewrite items for interrupted retries as may-have-posted, in place.
+
+    Matches on the Square id every ledger-derived item carries, however it reached the
+    list. A marker whose payment has no item at all is still reported.
+    """
+    found = set()
+    for n, it in enumerate(items):
+        mk = override.get(it.get("id"))
+        if mk is not None:
+            items[n] = _interrupted_item(it, mk)
+            found.add(it.get("id"))
+    for pid, mk in override.items():
+        if pid not in found:
+            items.append(_interrupted_item({}, mk))
+
+
 def reconcile(csv_path):
     csv_payments = bot.read_csv(csv_path)            # [{name, date, amount}]
     txn_date = csv_payments[0]["date"] if csv_payments else date_from_csv_name(csv_path.name)
+    # Intent markers BEFORE the ledger. The poller writes a payment's ledger row and only then
+    # removes its marker; read the other way round, a retry that finishes between the two reads
+    # shows its old FAILED row and no marker — "post it in TA" for a payment that just posted.
+    markers = load_inflight_markers(txn_date)
     ledger = load_ledger_for_date(txn_date) if txn_date else []
 
     led_by_name = {}
     for e in ledger:
         led_by_name.setdefault(_norm(e.get("name")), []).append(e)
 
+    _recorded, marker_overrides, unrecorded_markers = _marker_ledger_split(markers, ledger)
+    unrecorded_keys = {(_norm(m.get("name")), _amt(m.get("amount"))) for m in unrecorded_markers}
+
     matched, gaps, errors, discrepancies = [], [], [], []
     used = set()
     for c in csv_payments:
         camt = _amt(c["amount"])
         cand = [e for e in led_by_name.get(_norm(c["name"]), []) if id(e) not in used]
-        if not cand:
+        exact = next((x for x in cand if _amt(x.get("amount")) == camt), None)
+        if not cand or (exact is None and (_norm(c["name"]), camt) in unrecorded_keys):
+            # No ledger row — or none at this amount, and an interrupted post for exactly this
+            # client and amount has no row either. Don't graft this row onto a different payment
+            # of the same client's: leave it a gap, for the marker pass below to claim.
             gaps.append(dict(c))
             continue
-        e = next((x for x in cand if _amt(x.get("amount")) == camt), cand[0])
+        e = exact or cand[0]
         used.add(id(e))
         if e.get("status") not in POSTED_OK:
             # Nothing was posted, whatever the amounts say — this needs a human,
@@ -475,6 +619,36 @@ def reconcile(csv_path):
                                   "status": e.get("status"), "id": e.get("id")})
         else:
             matched.append(c)
+
+    # Payments a poller run started posting and was interrupted before recording. With no ledger
+    # row, each would show as a plain GAP — "post it in TA" — when it may already be in TA, and
+    # staff would post it a second time. Report each as may-have-posted instead.
+    #
+    # The CSV carries no Square id, so match on name + amount (same day), then on amount alone.
+    # Unlike the gap/failure pairing below, ambiguity is resolved toward caution: if several
+    # same-amount gaps could be the one, flag them ALL "check TA first" — over-flagging costs a
+    # look, under-flagging costs a double charge. Only a unique match takes the marker's id, so
+    # no two items share a clear-key. A marker that matches no gap is still reported.
+    #
+    # "Could be the one" is: the same amount under any name, OR the same client at any amount —
+    # the CSV's Base Amount can differ from Square's total/1.03 by a cent.
+    for mk in unrecorded_markers:
+        mamt = _amt(mk.get("amount"))
+        named = next((x for x in gaps if _norm(x.get("name")) == _norm(mk.get("name"))
+                      and _amt(x.get("amount")) == mamt), None)
+        same = _marker_lookalikes(mk, gaps)
+        if named is not None:
+            gaps.remove(named)
+            errors.append(_interrupted_item(named, mk))
+        elif len(same) == 1:
+            gaps.remove(same[0])
+            errors.append(_interrupted_item(same[0], mk))
+        elif same:
+            for x in same:
+                gaps.remove(x)
+                errors.append(_interrupted_item(x, mk, attach_id=False))
+        else:
+            errors.append(_interrupted_item({}, mk))
 
     # A CSV row lands in `gaps` whenever no ledger entry carries its name — but
     # that also happens when the poller DID handle the payment under a different
@@ -511,6 +685,9 @@ def reconcile(csv_path):
                        "account": m.get("account", ""), "id": m.get("id"),
                        "square_name": m.get("name", ""), "uncertain": uncertain})
 
+    # Ledger rows a CSV row has now claimed, by name or by the pairing above.
+    csv_claimed = {e.get("id") for e in ledger if id(e) in used and e.get("id")}
+
     # Anything the poller tried and failed that no CSV row claimed — a payment
     # missing from the export, a name too different to pair, an amount that
     # didn't line up. It is money that isn't in TA, so it belongs on the list
@@ -523,6 +700,23 @@ def reconcile(csv_path):
                        "date": e.get("date") or txn_date, "amount": e.get("amount"),
                        "status": e.get("status"), "reason": e.get("reason", ""),
                        "account": e.get("account", ""), "id": e.get("id")})
+
+    # Interrupted RETRIES: the payment already had a ledger row (an earlier FAILED, say), so it
+    # reached `errors` above under that row's old reason — "post it in TA" — by a name match, an
+    # amount pairing, or as an unclaimed failure. But a later attempt was started and cut off,
+    # and may have saved it. Every one of those items carries the Square id, so rewrite it here.
+    #
+    # When no CSV row claimed that ledger row (a different spelling, and the amount pairing gave
+    # up because it was ambiguous), the CSV's own row for the payment is still sitting in `gaps`
+    # saying "post it in TA". It can't be told apart from the other same-amount gaps, so flag
+    # them all "check TA first", exactly as for a marker with no ledger row.
+    for pid, mk in marker_overrides.items():
+        if pid in csv_claimed:
+            continue
+        for x in _marker_lookalikes(mk, gaps):
+            gaps.remove(x)
+            errors.append(_interrupted_item(x, mk, attach_id=False))
+    _apply_marker_overrides(marker_overrides, errors)
 
     posted_ok = [e for e in ledger if e.get("status") in POSTED_OK]
     extras = [e for e in posted_ok if id(e) not in used]
@@ -550,12 +744,18 @@ def reconcile_ledger_only(date_slashed):
     there is — but its failures are exactly the payments staff need to chase,
     and holding the whole email back over a missing export would hide them.
     """
+    markers = load_inflight_markers(date_slashed)  # before the ledger: see reconcile()
     ledger = load_ledger_for_date(date_slashed)
     errors = [{"name": _clean(e.get("name")) or "(unknown client)",
                "date": e.get("date") or date_slashed, "amount": e.get("amount"),
                "status": e.get("status"), "reason": e.get("reason", ""),
                "account": e.get("account", ""), "id": e.get("id")}
               for e in ledger if e.get("status") and e.get("status") not in POSTED_OK]
+    # With no Square report, an interrupted payment's intent marker is the only thing that
+    # would ever put it on this list.
+    _recorded, overrides, unrecorded = _marker_ledger_split(markers, ledger)
+    _apply_marker_overrides(overrides, errors)
+    errors.extend(_interrupted_item({}, mk) for mk in unrecorded)
     posted_ok = [e for e in ledger if e.get("status") in POSTED_OK]
     return {"csv": "(no Square report for this day)", "txn_date": date_slashed,
             "csv_count": 0, "ledger_count": len(ledger), "matched": [], "gaps": [],
@@ -777,7 +977,9 @@ def history_for_day(date_dotted, log_reasons):
     else:
         # No archived CSV for that day — the ledger is all we have, so gaps
         # (payments the poller never saw) can't be detected for it.
-        for e in load_ledger_for_date(date_slashed):
+        markers = load_inflight_markers(date_slashed)  # before the ledger: see reconcile()
+        day_ledger = load_ledger_for_date(date_slashed)
+        for e in day_ledger:
             if e.get("status") in POSTED_OK or not e.get("status"):
                 continue
             items.append({"name": e.get("name") or "(unknown client)",
@@ -785,6 +987,11 @@ def history_for_day(date_dotted, log_reasons):
                           "amount": e.get("amount"), "status": e.get("status"),
                           "reason": e.get("reason", ""), "account": e.get("account", ""),
                           "id": e.get("id")})
+        # Same for the backlog: without a CSV, a marker is the only record that a payment was
+        # interrupted mid-post, and it would otherwise never reach the list.
+        _recorded, overrides, unrecorded = _marker_ledger_split(markers, day_ledger)
+        _apply_marker_overrides(overrides, items)
+        items.extend(_interrupted_item({}, mk) for mk in unrecorded)
 
     for i in items:
         if not i.get("reason") and i.get("status") != "GAP":
@@ -1307,9 +1514,9 @@ def main():
         if not csv_path.exists():
             print(f"reconcile: no such CSV: {args.csv}")
             sys.exit(1)
-        results = [reconcile(csv_path)]
+        build = lambda: [reconcile(csv_path)]
     elif args.date:
-        results = [result_for_date(args.date)]
+        build = lambda: [result_for_date(args.date)]
     else:
         targets = default_target_dates(datetime.now())
         if not targets:
@@ -1317,7 +1524,11 @@ def main():
                   "in Monday's email with Friday's.")
             sys.exit(0)
         print(f"reconcile: covering {', '.join(targets)}")
-        results = [result_for_date(d) for d in targets]
+        build = lambda: [result_for_date(d) for d in targets]
+    if args.email:
+        # Before the first ledger read: from here until sent_at, the poller retries nothing.
+        _write_report_stamp(started_at=_utc_stamp())
+    results = build()
 
     all_heals, unreported_heals = load_unreported_heals()
     r = combine(results)
@@ -1383,6 +1594,8 @@ def main():
     clean = print_report(r, unreported_heals, backlog, args.backlog_days, review)
     if args.email:
         sent = email_report(r, unreported_heals, backlog, args.backlog_days, backlog_failed, review)
+        if sent:
+            _write_report_stamp(sent_at=_utc_stamp())
         if sent and unreported_heals:
             mark_heals_reported(all_heals)  # exactly-once: don't re-report tomorrow
         if not sent:
