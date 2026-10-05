@@ -286,7 +286,7 @@ def _inflight_record(payment_id):
 
 
 def record_ledger(payment_id, name, date, amount, status, account="", reason="",
-                  method="", note=""):
+                  method="", note="", due_before=""):
     """Append/update a payment in the per-transaction-date ledger (idempotent by id).
 
     The ledger is the poller's record of what it did (or, in shadow mode, would
@@ -300,7 +300,10 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="",
     `method` is how it posted (V2, V2-balance, V1, ...) and `note` is bot_v2's
     per-payment note; together they let the report say a payment went to the
     client's open balance rather than to a date of service, and flag the ones
-    that landed as an unapplied credit.
+    that landed as an unapplied credit. `due_before` is TA's "Due From Client
+    Now" read off the payment form just before saving — set only when TA showed
+    more open charges than the one being paid — so the report can list clients
+    who still owe once this payment is in.
     """
     if not date:
         return
@@ -314,6 +317,8 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="",
     row = {"id": payment_id, "name": name, "date": date,
            "amount": amount, "status": status, "account": account,
            "reason": reason, "method": method, "note": note}
+    if due_before:
+        row["due_before"] = due_before
     if status != "OK":
         # When it failed, and how many attempts have been spent on it. Rows written
         # before this existed have neither, so they are never auto-retried. The
@@ -777,7 +782,7 @@ def alert_admin(kind, detail):
 def _write_result_row(r):
     record_ledger(r["id"], r["name"], r["date"], r["amount"],
                   r["status"], r.get("account", ""), r.get("error", ""),
-                  r.get("method", ""), r.get("note", ""))
+                  r.get("method", ""), r.get("note", ""), r.get("due_before", ""))
 
 
 def make_persister(state, posted_ids):
@@ -1006,12 +1011,16 @@ def post_new_payments(to_post, posted_ids, on_result=None):
 
                 # Exactly one recorded outcome per payment, decided here and only here.
                 try:
-                    success, method, error, note, *_ = bot.post_payment(
+                    success, method, error, note, *extra = bot.post_payment(
                         page, item["name"], item["date"], item["amount"],
                         account=item.get("account"))
+                    # (..., posted_date, v2_error, balance_amount): TA's "Due From
+                    # Client Now" before this payment, when it showed other charges.
+                    due_before = extra[2] if len(extra) > 2 else None
                     if success:
                         posted_ids.add(item["id"])
-                        result = {**item, "status": "OK", "method": method, "note": note or ""}
+                        result = {**item, "status": "OK", "method": method, "note": note or "",
+                                  "due_before": due_before or ""}
                     else:
                         # A payment that reached TA's payment form before failing may
                         # already be in TA. Retire the id BEFORE persisting, so the save

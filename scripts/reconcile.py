@@ -79,6 +79,11 @@ def _amt(a):
         return str(a)
 
 
+def _num(a):
+    """Dollar amount as a float; raises ValueError if it isn't one."""
+    return float(str(a).replace("$", "").replace(",", ""))
+
+
 def _account(raw):
     """TA Account # for display, or "" if Square's reference_id isn't one.
 
@@ -242,6 +247,41 @@ def credit_posts(entries):
         if CREDIT_MARKER in (e.get("note") or ""):
             out.append({**e, "kind": "credit", "name": _clean(e.get("name"))})
     return out
+
+
+def still_owing(entries):
+    """Posted payments that left the client with an open balance.
+
+    The poller records TA's "Due From Client Now" (`due_before`) whenever the
+    payment form showed open charges beyond the one being paid. What's left after
+    this payment is money the client still owes on older sessions — a candidate
+    for charging the card on file to bring the account current. One row per
+    client: the later payment's figure already includes the earlier ones.
+    """
+    by_client = OrderedDict()
+    for e in entries:
+        if not e.get("due_before"):
+            continue
+        try:
+            remaining = _num(e["due_before"]) - _num(e.get("amount"))
+        except (TypeError, ValueError):
+            continue
+        key = _account(e.get("account")) or _norm(e.get("name"))
+        by_client.pop(key, None)
+        if remaining > 0.005:
+            by_client[key] = {**e, "kind": "owes", "name": _clean(e.get("name")),
+                              "remaining": f"{remaining:.2f}"}
+    return list(by_client.values())
+
+
+def _latest_per_client(items):
+    """Across several days, keep each client's most recent still-owing row."""
+    out = OrderedDict()
+    for i in sorted(items, key=lambda i: _dt(i.get("date")) or datetime.min):
+        key = _account(i.get("account")) or _norm(i.get("name"))
+        out.pop(key, None)
+        out[key] = i
+    return list(out.values())
 
 
 def date_from_csv_name(name):
@@ -734,6 +774,7 @@ def reconcile(csv_path):
         "discrepancies": discrepancies, "extras": extras,
         "missing_account": missing_account,
         "credits": credit_posts(posted_ok),
+        "owing": still_owing(posted_ok),
     }
 
 
@@ -762,6 +803,7 @@ def reconcile_ledger_only(date_slashed):
             "errors": errors, "discrepancies": [], "extras": [],
             "missing_account": [e for e in posted_ok if not (e.get("account") or "").strip()],
             "credits": credit_posts(posted_ok),
+            "owing": still_owing(posted_ok),
             "no_csv": True}
 
 
@@ -931,6 +973,7 @@ def combine(results):
     for k in ("matched", "gaps", "errors", "discrepancies", "extras",
               "missing_account", "credits"):
         out[k] = [x for r in results for x in r[k]]
+    out["owing"] = _latest_per_client(x for r in results for x in r.get("owing", []))
 
     return out
 
@@ -1069,6 +1112,32 @@ def action_items(r):
         i["name"] = _clean(i["name"])
     items.sort(key=lambda i: i["name"])
     return items
+
+
+def _acct_suffix(o):
+    acct = _account(o.get("account"))
+    return f' <span style="color:#888;">({esc(acct)})</span>' if acct else ""
+
+
+def _owing_html(items):
+    rows = "".join(
+        f'<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;">{esc(o["name"])}'
+        f'{_acct_suffix(o)}</td>'
+        f'<td style="padding:6px 8px;border-bottom:1px solid #eee;">{esc(o.get("date") or "")}</td>'
+        f'<td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">{_money(o.get("amount"))}</td>'
+        f'<td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;font-weight:700;">'
+        f'{_money(o["remaining"])}</td></tr>'
+        for o in items)
+    return (
+        '<p style="font-size:13px;color:#555;margin:8px 0 12px;">These payments posted fine, but TA '
+        'still shows an open balance from older sessions afterwards. <strong>Nothing to post</strong> '
+        '&mdash; consider charging the card on file to bring the account current (check TA first: '
+        'part of it may be waiting on insurance).</p>'
+        '<table style="border-collapse:collapse;font-size:13px;width:100%;">'
+        '<tr style="background:#f5f5f5;text-align:left;"><th style="padding:6px 8px;">Client</th>'
+        '<th style="padding:6px 8px;">Paid on</th><th style="padding:6px 8px;text-align:right;">Paid</th>'
+        '<th style="padding:6px 8px;text-align:right;">Still owes</th></tr>'
+        + rows + '</table>')
 
 
 def _total(items):
@@ -1233,6 +1302,9 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
         bits.append(f"{len(verify) + len(review)} to check")
     if missing:
         bits.append(f"{len(missing)} day{'s' if len(missing) != 1 else ''} unchecked")
+    owing = r.get("owing") or []
+    if owing:
+        bits.append(f"{len(owing)} still owe")
     subject = f"PostIQ Daily Reconcile — {date} — " + (" · ".join(bits) if bits else "all caught up")
 
     # ── Headline ──
@@ -1348,6 +1420,13 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
                      'Travis will clear them off.</p>')
         parts.append(_review_html(review))
 
+    # ── Balances left after paying ──
+    if owing:
+        parts.append(_h2(f"Still owe after paying — {len(owing)} client"
+                         f"{'s' if len(owing) != 1 else ''} "
+                         f"({_money(sum(_num(o['remaining']) for o in owing))})", "#00695c"))
+        parts.append(_owing_html(owing))
+
     # ── Housekeeping (admin) ──
     house = []
     if r.get("missing_account"):
@@ -1428,6 +1507,9 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, review=()):
                       f"day's report"
                       f"{'  [pairs with ' + v['also_listed']['name'] + ' ' + v['also_listed']['date'] + ']' if v.get('also_listed') else ''}")
             print(f"      clear key: {v['clear_key']}")
+    for o in r.get("owing", []):
+        print(f"  STILL OWES  {o['name']} ${_amt(o['remaining'])} after paying ${_amt(o['amount'])} "
+              f"on {o['date']} — consider charging the card on file")
     if backlog:
         print(f"\n--- Still outstanding, last {days} days ({len(backlog)} payments, "
               f"{_money(_total(backlog))}) ---")
