@@ -42,34 +42,54 @@ def _row(name, amount, due_before=None, account="", date="10/05/2026", status="O
     return e
 
 
+def owing(rows):
+    return rec.still_owing(rec.latest_balances(rows))
+
+
 class StillOwingTest(unittest.TestCase):
     def test_remaining_balance_is_listed(self):
-        out = rec.still_owing([_row("Kate Harding", "320.00", "480.00", "C007852421")])
-        self.assertEqual([(o["name"], o["remaining"]) for o in out], [("Kate Harding", "160.00")])
+        out = owing([_row("Kate Harding", "320.00", "480.00", "C007852421")])
+        self.assertEqual([(o["name"], o["remaining"]) for o in out], [("Kate Harding", 160.0)])
 
     def test_paid_in_full_or_no_figure_is_not_listed(self):
-        self.assertEqual(rec.still_owing([_row("A B", "60.00", "60.00"),
+        self.assertEqual(owing([_row("A B", "60.00", "60.00"),
                                           _row("C D", "10.00"),
                                           _row("E F", "50.00", "20.00")]), [])
 
     def test_later_payment_same_day_supersedes_earlier(self):
         rows = [_row("Kate Harding", "100.00", "480.00", "C007852421"),
                 _row("Kate Harding", "380.00", "380.00", "C007852421")]
-        self.assertEqual(rec.still_owing(rows), [], "second payment cleared the balance")
+        self.assertEqual(owing(rows), [], "second payment cleared the balance")
+
+    def _combined(self, *days):
+        rs = [{"balances": rec.latest_balances(d)} for d in days]
+        bal = rec._latest_per_client(x for r in rs for x in r["balances"])
+        return rec.still_owing(bal)
 
     def test_combine_keeps_latest_day_per_client(self):
-        a = {"owing": rec.still_owing([_row("Kate Harding", "100.00", "480.00", "C007852421",
-                                            date="10/02/2026")])}
-        b = {"owing": rec.still_owing([_row("Kate Harding", "320.00", "380.00", "C007852421",
-                                            date="10/05/2026")])}
-        out = rec._latest_per_client(x for r in (a, b) for x in r["owing"])
-        self.assertEqual([(o["date"], o["remaining"]) for o in out], [("10/05/2026", "60.00")])
+        out = self._combined(
+            [_row("Kate Harding", "100.00", "480.00", "C007852421", date="10/02/2026")],
+            [_row("Kate Harding", "320.00", "380.00", "C007852421", date="10/05/2026")])
+        self.assertEqual([(o["date"], o["remaining"]) for o in out], [("10/05/2026", 60.0)])
+
+    def test_later_day_clearing_payment_removes_earlier_balance(self):
+        out = self._combined(
+            [_row("Kate Harding", "100.00", "480.00", "C007852421", date="10/02/2026")],
+            [_row("Kate Harding", "380.00", "380.00", "C007852421", date="10/04/2026")])
+        self.assertEqual(out, [])
+
+    def test_later_payment_with_no_figure_supersedes_earlier(self):
+        rows = [_row("Kate Harding", "100.00", "480.00", "C007852421"),
+                _row("Kate Harding", "380.00", None, "C007852421")]
+        self.assertEqual(owing(rows), [])
+        out = self._combined(rows[:1], [{**rows[1], "date": "10/06/2026"}])
+        self.assertEqual(out, [])
 
     def test_report_has_section_and_subject_bit(self):
         r = {"txn_date": "10/05/2026", "csv": "x.csv", "csv_count": 1, "ledger_count": 1,
              "matched": [{}], "gaps": [], "errors": [], "discrepancies": [], "extras": [],
              "missing_account": [], "credits": [],
-             "owing": rec.still_owing([_row("Kate Harding", "320.00", "480.00", "C007852421")])}
+             "owing": owing([_row("Kate Harding", "320.00", "480.00", "C007852421")])}
         subject, html, clean = rec.build_report_html(r)
         self.assertIn("1 still owe", subject)
         self.assertIn("Still owe after paying", html)

@@ -249,33 +249,37 @@ def credit_posts(entries):
     return out
 
 
-def still_owing(entries):
-    """Posted payments that left the client with an open balance.
+def latest_balances(entries):
+    """Each client's balance after their latest posted payment, one row per client.
 
-    The poller records TA's "Due From Client Now" (`due_before`) whenever the
-    payment form showed open charges beyond the one being paid. What's left after
-    this payment is money the client still owes on older sessions — a candidate
-    for charging the card on file to bring the account current. One row per
-    client: the later payment's figure already includes the earlier ones.
+    The poller records TA's "Due From Client Now" (`due_before`) when the payment
+    form showed the client's whole open balance. What's left after the payment
+    is money still owed on older sessions — a candidate for charging the card on
+    file. A later payment always replaces an earlier one, even with no figure of
+    its own: no figure means TA showed no other open charges (or couldn't be
+    read), and an old "still owes" must never outlive the payment that cleared it.
+    Rows carry `remaining` as a float; 0 means nothing (known) to chase.
     """
     by_client = OrderedDict()
     for e in entries:
-        if not e.get("due_before"):
-            continue
         try:
-            remaining = _num(e["due_before"]) - _num(e.get("amount"))
-        except (TypeError, ValueError):
-            continue
+            remaining = max(_num(e["due_before"]) - _num(e.get("amount")), 0.0)
+        except (KeyError, TypeError, ValueError):
+            remaining = 0.0
         key = _account(e.get("account")) or _norm(e.get("name"))
         by_client.pop(key, None)
-        if remaining > 0.005:
-            by_client[key] = {**e, "kind": "owes", "name": _clean(e.get("name")),
-                              "remaining": f"{remaining:.2f}"}
+        by_client[key] = {**e, "kind": "owes", "name": _clean(e.get("name")),
+                          "remaining": remaining}
     return list(by_client.values())
 
 
+def still_owing(latest):
+    """The clients in `latest` (latest_balances rows) who still owe something."""
+    return [o for o in latest if o["remaining"] > 0.005]
+
+
 def _latest_per_client(items):
-    """Across several days, keep each client's most recent still-owing row."""
+    """Across several days, keep each client's most recent balance row."""
     out = OrderedDict()
     for i in sorted(items, key=lambda i: _dt(i.get("date")) or datetime.min):
         key = _account(i.get("account")) or _norm(i.get("name"))
@@ -774,7 +778,8 @@ def reconcile(csv_path):
         "discrepancies": discrepancies, "extras": extras,
         "missing_account": missing_account,
         "credits": credit_posts(posted_ok),
-        "owing": still_owing(posted_ok),
+        "balances": latest_balances(posted_ok),
+        "owing": still_owing(latest_balances(posted_ok)),
     }
 
 
@@ -803,7 +808,8 @@ def reconcile_ledger_only(date_slashed):
             "errors": errors, "discrepancies": [], "extras": [],
             "missing_account": [e for e in posted_ok if not (e.get("account") or "").strip()],
             "credits": credit_posts(posted_ok),
-            "owing": still_owing(posted_ok),
+            "balances": latest_balances(posted_ok),
+            "owing": still_owing(latest_balances(posted_ok)),
             "no_csv": True}
 
 
@@ -973,7 +979,8 @@ def combine(results):
     for k in ("matched", "gaps", "errors", "discrepancies", "extras",
               "missing_account", "credits"):
         out[k] = [x for r in results for x in r[k]]
-    out["owing"] = _latest_per_client(x for r in results for x in r.get("owing", []))
+    out["balances"] = _latest_per_client(x for r in results for x in r.get("balances", []))
+    out["owing"] = still_owing(out["balances"])
 
     return out
 
@@ -1424,7 +1431,7 @@ def build_report_html(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed
     if owing:
         parts.append(_h2(f"Still owe after paying — {len(owing)} client"
                          f"{'s' if len(owing) != 1 else ''} "
-                         f"({_money(sum(_num(o['remaining']) for o in owing))})", "#00695c"))
+                         f"({_money(sum(o['remaining'] for o in owing))})", "#00695c"))
         parts.append(_owing_html(owing))
 
     # ── Housekeeping (admin) ──
@@ -1508,7 +1515,7 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, review=()):
                       f"{'  [pairs with ' + v['also_listed']['name'] + ' ' + v['also_listed']['date'] + ']' if v.get('also_listed') else ''}")
             print(f"      clear key: {v['clear_key']}")
     for o in r.get("owing", []):
-        print(f"  STILL OWES  {o['name']} ${_amt(o['remaining'])} after paying ${_amt(o['amount'])} "
+        print(f"  STILL OWES  {o['name']} ${o['remaining']:.2f} after paying ${_amt(o['amount'])} "
               f"on {o['date']} — consider charging the card on file")
     if backlog:
         print(f"\n--- Still outstanding, last {days} days ({len(backlog)} payments, "

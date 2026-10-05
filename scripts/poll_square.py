@@ -1017,6 +1017,12 @@ def post_new_payments(to_post, posted_ids, on_result=None):
                     # (..., posted_date, v2_error, balance_amount): TA's "Due From
                     # Client Now" before this payment, when it showed other charges.
                     due_before = extra[2] if len(extra) > 2 else None
+                    # Only the client's WHOLE open balance is worth reporting. Under
+                    # CHARGES_MODAL_CHOICE "this_appointment" the V2 figure is just this
+                    # session's, so it can't say what's owed on older ones.
+                    if not (bot._is_balance_method(method)
+                            or bot.CHARGES_MODAL_CHOICE == "all_open_charges"):
+                        due_before = None
                     if success:
                         posted_ids.add(item["id"])
                         result = {**item, "status": "OK", "method": method, "note": note or "",
