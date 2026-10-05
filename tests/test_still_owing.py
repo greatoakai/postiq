@@ -78,6 +78,13 @@ class StillOwingTest(unittest.TestCase):
             [_row("Kate Harding", "380.00", "380.00", "C007852421", date="10/04/2026")])
         self.assertEqual(out, [])
 
+    def test_retry_that_posted_last_wins_over_a_later_square_date(self):
+        fri = _row("Kate Harding", "380.00", "380.00", "C007852421", date="10/02/2026")
+        fri["posted_at"] = "2026-10-04T15:00:00Z"   # auto-retried Sunday
+        sat = _row("Kate Harding", "100.00", "480.00", "C007852421", date="10/03/2026")
+        sat["posted_at"] = "2026-10-03T15:00:00Z"
+        self.assertEqual(self._combined([fri], [sat]), [])
+
     def test_later_payment_with_no_figure_supersedes_earlier(self):
         rows = [_row("Kate Harding", "100.00", "480.00", "C007852421"),
                 _row("Kate Harding", "380.00", None, "C007852421")]
@@ -111,6 +118,7 @@ class LedgerTest(unittest.TestCase):
                 ps.LEDGER_DIR = saved
         self.assertEqual(rows["Kate Harding"]["due_before"], "480.00")
         self.assertNotIn("due_before", rows["Joe Smith"])
+        self.assertIn("posted_at", rows["Kate Harding"])
 
 
 if __name__ == "__main__":

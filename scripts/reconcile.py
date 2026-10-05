@@ -278,10 +278,27 @@ def still_owing(latest):
     return [o for o in latest if o["remaining"] > 0.005]
 
 
+def _posted_when(row):
+    """When a ledger row's payment went into TA: posted_at, else its Square date.
+
+    Rows written before posted_at existed fall back to the transaction date
+    (start of day), which sorts them before anything stamped later that day.
+    """
+    try:
+        return datetime.strptime(row["posted_at"], "%Y-%m-%dT%H:%M:%SZ")
+    except (KeyError, TypeError, ValueError):
+        return _dt(row.get("date") or "") or datetime.min
+
+
 def _latest_per_client(items):
-    """Across several days, keep each client's most recent balance row."""
+    """Across several days, keep each client's most recently POSTED balance row.
+
+    Ordered by when the payment went into TA, not its Square date: a retry that
+    cleared the balance on Sunday must beat Saturday's payment even though the
+    retried payment is dated Friday.
+    """
     out = OrderedDict()
-    for i in sorted(items, key=lambda i: _dt(i.get("date")) or datetime.min):
+    for i in sorted(items, key=_posted_when):
         key = _account(i.get("account")) or _norm(i.get("name"))
         out.pop(key, None)
         out[key] = i

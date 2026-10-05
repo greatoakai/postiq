@@ -319,6 +319,10 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="",
            "reason": reason, "method": method, "note": note}
     if due_before:
         row["due_before"] = due_before
+    if status == "OK":
+        # When it actually went into TA. A retry posts days after its Square date
+        # but stays in that date's file, so the report orders balances by this.
+        row["posted_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if status != "OK":
         # When it failed, and how many attempts have been spent on it. Rows written
         # before this existed have neither, so they are never auto-retried. The
