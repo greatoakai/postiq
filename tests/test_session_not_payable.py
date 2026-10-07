@@ -133,6 +133,13 @@ class RequirePaymentFormTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, bot.PAYMENT_FORM_NOT_READY_REASON):
             bot._require_payment_form(_Page(**{"External Credit Card": True}), timeout_ms=1)
 
+    def test_start_billing_still_showing_while_the_form_loads_is_not_a_verdict(self):
+        page = _Page(**{"Start Billing": True})
+        def form_arrives(ms):
+            page.visible = {"Payment Amount": True, "External Credit Card": True}
+        page.wait_for_timeout = form_arrives
+        bot._require_payment_form(page, timeout_ms=1000, appointment=True)
+
     def test_start_billing_on_the_appointment_means_not_billed_yet(self):
         with self.assertRaisesRegex(Exception, "no payment form yet"):
             bot._require_payment_form(_Page(**{"Start Billing": True}), timeout_ms=1,
@@ -201,13 +208,18 @@ class FallbackTest(unittest.TestCase):
         ok, status, error, *_ = self._post()
         self.assertFalse(ps._reason_is_only_retryable(error))
 
-    def test_v1_flag_before_its_form_still_flags(self):
-        self.v2_errors = [bot.PAYMENT_FORM_NOT_READY_REASON, bot.PAYMENT_FORM_NOT_READY_REASON]
-        def v1(*a, **k):
-            raise Exception(f"{bot.V1_BEFORE_FORM_TAG} FLAG: multiple matches for Pat Example")
-        bot.post_payment_v1 = v1
-        ok, status, *_ = self._post()
-        self.assertEqual(status, "FLAGGED")
+    def test_v1_flag_before_its_form_still_flags_untagged(self):
+        saved = bot.navigate_to_billing
+        def flag(page):
+            raise Exception("FLAG: Multiple matches for Pat Example")
+        bot.navigate_to_billing = flag
+        try:
+            with self.assertRaises(Exception) as cm:
+                saved_v1 = self._saved[1]
+                saved_v1(None, "Pat Example", "30.00")
+        finally:
+            bot.navigate_to_billing = saved
+        self.assertTrue(str(cm.exception).startswith("FLAG:"))
 
     def test_one_unpayable_leg_is_enough_to_keep_v1_away(self):
         self.v2_errors = ["No appointment found on 10/06/2026 for Pat Example",
@@ -216,7 +228,7 @@ class FallbackTest(unittest.TestCase):
         bot.post_payment_v1 = lambda *a, **k: v1.append(1) or (True, "Posted ✓")
         ok, status, error, *_ = self._post()
         self.assertEqual((ok, status, v1), (False, "FAILED", []))
-        self.assertFalse(ps._reason_is_only_retryable(error), "the miss leaves it for staff")
+        self.assertTrue(ps._reason_is_only_retryable(error), "the slow first leg mustn't block it")
 
 
 class IsTodayTest(unittest.TestCase):

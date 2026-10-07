@@ -1822,7 +1822,7 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     painted without its contents fails.
     `appointment` is set only on the appointment's own page for a session ON the
     payment date (V2) — the one place a visible "Start Billing" means THIS session
-    hasn't been billed. It also ends the wait early: no form is coming.
+    hasn't been billed.
     """
     def seen(text, exact=False):
         try:
@@ -1834,11 +1834,14 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     while True:
         if seen("Payment Amount") and seen("Credit Card"):
             return
-        if appointment and seen("Start Billing", exact=True):
-            raise Exception(SESSION_NOT_PAYABLE_REASON)
         if time.monotonic() >= deadline:
-            raise Exception(PAYMENT_FORM_NOT_READY_REASON)
+            break
         page.wait_for_timeout(500)
+    # Only after the full wait: right after Accept Payment the appointment page,
+    # Start Billing and all, can still be on screen while the form loads.
+    if appointment and seen("Start Billing", exact=True):
+        raise Exception(SESSION_NOT_PAYABLE_REASON)
+    raise Exception(PAYMENT_FORM_NOT_READY_REASON)
 
 
 def fill_payment_form(page, amount, appointment=False):
@@ -2415,6 +2418,8 @@ def post_payment_v1(page, name, amount, dry_run=False):
         # Select client and search
         select_client_v1(page, name)
     except Exception as e:
+        if "FLAG" in str(e):
+            raise                       # a judgement call, not a page that didn't load
         raise Exception(f"{V1_BEFORE_FORM_TAG} {e}")
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_01_form")
 
@@ -2574,12 +2579,12 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     # V1 would let TA pick a charge — an older one, or with none, a FLAG that
     # retries can't touch. (Jacob Legrand, 10/06, posted via V1 because his was
     # the only charge; a retry an hour later would have put it in the same place.)
-    # Either leg is enough: the other one's miss is then a slow page. When that
-    # other reason isn't a retryable one the poller leaves it for staff — still
-    # better than V1 guessing a charge.
+    # Either leg is enough: the other one's miss is then a slow page. Record only
+    # the finding that matters, so the poller retries it: the other leg can't have
+    # submitted anything — a save that went dark returned FLAGGED above.
     if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error):
         print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
-        return False, "FAILED", combined_v2_error, None, None, None, None
+        return False, "FAILED", f"V2: {SESSION_NOT_PAYABLE_REASON}", None, None, None, None
 
     print(f"  Falling back to V1...")
 

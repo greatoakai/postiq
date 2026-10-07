@@ -485,6 +485,7 @@ def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
     Defensive throughout: a single malformed row must never abort a run and leave
     that run's genuinely new payments unposted.
     """
+    now = now or datetime.now(timezone.utc)
     try:
         if not isinstance(e, dict) or e.get("status") != "FAILED":
             return None
@@ -1387,6 +1388,7 @@ def main():
         if not name:
             continue
         attempt = int(row.get("retries") or 0) + 1
+        session_wait = _session_wait_active(row)
         if not args.dry_run and not mark_retry_attempt(row):
             log(f"  (skipping retry of {row['id']}: could not record the attempt)")
             continue
@@ -1395,8 +1397,8 @@ def main():
                         "account": account, "customer_id": p.get("customer_id", ""),
                         # A same-day session wait isn't on any report (see
                         # RETRY_MAX_ATTEMPTS_SESSION), so there's no report to race.
-                        "retry_failed_at": None if _session_wait_active(row) else row.get("failed_at")})
-        limit = RETRY_MAX_ATTEMPTS_SESSION if _session_wait_active(row) else RETRY_MAX_ATTEMPTS
+                        "retry_failed_at": None if session_wait else row.get("failed_at")})
+        limit = RETRY_MAX_ATTEMPTS_SESSION if session_wait else RETRY_MAX_ATTEMPTS
         log(f"  RETRY {name} ${amount} on {date} — earlier failure could not have reached "
             f"TA's payment form (attempt {attempt} of {limit})")
 
