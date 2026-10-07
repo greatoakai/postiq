@@ -104,9 +104,9 @@ RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
 # The morning report covers yesterday and earlier, never today, so a same-day
 # retry can't race staff working the report.
 RETRY_MAX_ATTEMPTS_SESSION = 8
-# Just under the hour: runs fire on :00/:30 and stamp the attempt seconds after
-# starting, so a full 60 minutes would always miss the next hourly run.
-RETRY_SPACING_SESSION = timedelta(minutes=55)
+# Under the hour: runs fire on :00/:30 and stamp the failure or attempt minutes
+# into a run, so a full 60 would keep missing the next hourly run.
+RETRY_SPACING_SESSION = timedelta(minutes=50)
 CLEARED_PATH = bot.DATA_DIR / "manual_cleared.json"
 LOCK_PATH = bot.DATA_DIR / "poll_square.lock"
 # Written by reconcile (REPORT_STAMP_FILENAME there): started_at before the morning report reads
@@ -1072,9 +1072,11 @@ def post_new_payments(to_post, posted_ids, on_result=None):
 
                 # Exactly one recorded outcome per payment, decided here and only here.
                 try:
+                    kwargs = {"account": item.get("account")}
+                    if item.get("hold_for_session"):
+                        kwargs["hold_for_session"] = True
                     success, method, error, note, *extra = bot.post_payment(
-                        page, item["name"], item["date"], item["amount"],
-                        account=item.get("account"))
+                        page, item["name"], item["date"], item["amount"], **kwargs)
                     # (..., posted_date, v2_error, balance_amount): TA's "Due From
                     # Client Now" before this payment, when it showed other charges.
                     due_before = extra[2] if len(extra) > 2 else None
@@ -1397,7 +1399,8 @@ def main():
                         "account": account, "customer_id": p.get("customer_id", ""),
                         # A same-day session wait isn't on any report (see
                         # RETRY_MAX_ATTEMPTS_SESSION), so there's no report to race.
-                        "retry_failed_at": None if session_wait else row.get("failed_at")})
+                        "retry_failed_at": None if session_wait else row.get("failed_at"),
+                        "hold_for_session": session_wait})
         limit = RETRY_MAX_ATTEMPTS_SESSION if session_wait else RETRY_MAX_ATTEMPTS
         log(f"  RETRY {name} ${amount} on {date} — earlier failure could not have reached "
             f"TA's payment form (attempt {attempt} of {limit})")

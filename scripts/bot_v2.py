@@ -1685,7 +1685,10 @@ def click_accept_payment(page, name, same_day=False):
             # Unbilled is not "no charge to take": the charge just doesn't exist
             # YET. Say so, or the V2 retry reroutes today's money to an older
             # session's open balance.
-            if same_day and _shows_start_billing(page):
+            if same_day:
+                # Today's session with no Accept Payment hasn't got its charge yet
+                # (in progress, or not billed). Never "no charge to take": that
+                # reroutes today's money to an older session's balance.
                 raise Exception(SESSION_NOT_PAYABLE_REASON)
             raise Exception(
                 f"NO_ACCEPT_PAYMENT: the appointment matched for {name} offers no "
@@ -1797,19 +1800,6 @@ def _visible(page, text, exact=False):
     """
     sel = f'text="{text}"' if exact else f"text={text}"
     return page.locator(f"{sel} >> visible=true")
-
-
-def _shows_start_billing(page, timeout_ms=3000):
-    """Does the open appointment still offer "Start Billing" (no charge created yet)?
-
-    Waits briefly: the action panel paints late, and calling it absent sends an
-    unbilled session down the no-charge path to the open balance.
-    """
-    try:
-        _visible(page, "Start Billing", exact=True).first.wait_for(state="visible", timeout=timeout_ms)
-        return True
-    except Exception:
-        return False
 
 
 def _require_payment_form(page, timeout_ms=10000, appointment=False):
@@ -2497,7 +2487,8 @@ def _is_balance_method(method):
     return (method or "").startswith("V2-balance")
 
 
-def post_payment(page, name, date, amount, dry_run=False, account=None):
+def post_payment(page, name, date, amount, dry_run=False, account=None,
+                 hold_for_session=False):
     """
     Post a payment with retry and fallback logic:
     1. Try V2 (Clients > Appointments > Accept Payment). When no appointment can
@@ -2515,6 +2506,8 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     `account` is the TA Account Number (Square reference_id); when present, V2
     matches the client by it deterministically and only falls back to name on a
     miss. V1 (the billing-autocomplete fallback) remains name-based.
+    `hold_for_session`: a poller retry of a payment waiting on today's session —
+    no open-balance fallback and no V1; if V2 can't post it, it waits again.
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
     reset_app_render_state()
@@ -2554,7 +2547,7 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         # fallback would put today's money on an older session.
         ok, note, balance_amount, method = post_payment_v2(
             page, name, date, amount, dry_run, account=account,
-            allow_balance=v2_error != SESSION_NOT_PAYABLE_REASON)
+            allow_balance=not hold_for_session and v2_error != SESSION_NOT_PAYABLE_REASON)
         if not ok:
             raise Exception("V2-retry returned ok=False")
         posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
@@ -2582,7 +2575,9 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     # Either leg is enough: the other one's miss is then a slow page. Record only
     # the finding that matters, so the poller retries it: the other leg can't have
     # submitted anything — a save that went dark returned FLAGGED above.
-    if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error):
+    # `hold_for_session`: the poller already knows this payment is waiting on today's
+    # session, so a retry that only met a half-drawn page is the same situation.
+    if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error) or hold_for_session:
         print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
         return False, "FAILED", f"V2: {SESSION_NOT_PAYABLE_REASON}", None, None, None, None
 

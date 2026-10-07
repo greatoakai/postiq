@@ -68,7 +68,7 @@ class SessionWaitRetryGateTest(_LedgerCase):
     def test_session_wait_waits_an_hour_between_attempts(self):
         self._today(retries=1, last_retry_at=_ago(20))
         self.assertEqual(self._ids(), [])
-        self._today(retries=1, last_retry_at=_ago(56))
+        self._today(retries=1, last_retry_at=_ago(51))
         self.assertEqual(self._ids(), ["sq_1"])
 
     def test_session_wait_gives_up_after_its_own_limit(self):
@@ -229,6 +229,20 @@ class FallbackTest(unittest.TestCase):
         ok, status, error, *_ = self._post()
         self.assertEqual((ok, status, v1), (False, "FAILED", []))
         self.assertTrue(ps._reason_is_only_retryable(error), "the slow first leg mustn't block it")
+
+
+    def test_known_session_wait_never_goes_to_v1_or_the_balance(self):
+        self.v2_errors = [bot.PAYMENT_FORM_NOT_READY_REASON, bot.PAYMENT_FORM_NOT_READY_REASON]
+        seen, v1 = [], []
+        def v2(*a, **k):
+            seen.append(k.get("allow_balance"))
+            raise Exception(self.v2_errors.pop(0))
+        bot.post_payment_v2 = v2
+        bot.post_payment_v1 = lambda *a, **k: v1.append(1) or (True, "Posted ✓")
+        ok, status, error, *_ = bot.post_payment(None, "Pat Example", "10/06/2026", "30.00",
+                                                 hold_for_session=True)
+        self.assertEqual((ok, status, seen, v1), (False, "FAILED", [False, False], []))
+        self.assertTrue(ps._reason_is_only_retryable(error))
 
 
 class IsTodayTest(unittest.TestCase):
