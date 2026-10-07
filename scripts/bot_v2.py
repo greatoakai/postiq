@@ -2667,7 +2667,7 @@ def _header_date_range(payloads):
 
 
 def generate_report(payloads, dry_run=False):
-    """Generate the HTML staff report (for Hannah) and save to logs.
+    """Generate the HTML staff report (for Lacey and Alex) and save to logs.
 
     Accepts a list of payload dicts — one per day in the reporting range.
     For single-day reports (len(payloads) == 1) the rendering matches the
@@ -2738,13 +2738,13 @@ def generate_report(payloads, dry_run=False):
     </tr></table>
   </td></tr>''')
 
-    # --- Extra-emphasis banner for Hannah when the new distribution mode is on ---
+    # --- Extra-emphasis banner for staff when the new distribution mode is on ---
     # Gated on CHARGES_MODAL_CHOICE so it appears only on runs that used
     # "No, show all open charges" and disappears automatically once reverted.
     if CHARGES_MODAL_CHOICE == "all_open_charges":
         h.append('''<tr><td style="padding:12px 32px 4px;">
           <div style="background:#fff3cd;border:2px solid #e0a800;border-radius:4px;padding:16px 20px;font-size:14px;color:#5a4a00;">
-            <div style="font-size:17px;font-weight:800;color:#9a6a00;margin-bottom:6px;">&#9888;&#65039; Hannah &mdash; please cross-check this run</div>
+            <div style="font-size:17px;font-weight:800;color:#9a6a00;margin-bottom:6px;">&#9888;&#65039; Please cross-check this run</div>
             <p style="margin:6px 0;">This run posted payments with a <strong>new distribution method</strong> (&ldquo;show all open charges&rdquo;): each payment was distributed across the client&rsquo;s open charges, <strong>oldest balance first</strong>, instead of being applied to a single appointment.</p>
             <p style="margin:6px 0;">Please verify in TherapyAppointment that <strong>each payment landed on the correct line item(s)</strong> &mdash; especially the <strong>Outstanding balances</strong> clients below, and anyone with multiple payments or multiple open charges. Confirm nothing was over-applied to one appointment or left unapplied, and flag anything that looks off.</p>
           </div>
@@ -3073,7 +3073,7 @@ def generate_tech_report(payloads):
     Accepts a list of payload dicts (one per day in the reporting range).
     Categorizes ALL non-perfect outcomes (failures, flagged, V1 fallbacks,
     encoding issues, name notes, popup blocks) into actionable groups so they
-    can be reviewed and fixed. Sent only to Travis, never to Hannah.
+    can be reviewed and fixed. Sent only to Travis, never to staff.
 
     Returns (path, html) or (None, None) if there is genuinely nothing to report.
     """
@@ -3328,7 +3328,7 @@ def generate_tech_report(payloads):
 #
 # The bot runs every day, but no one's at a desk on Saturday or Sunday to act
 # on the action items (V1 fallbacks, FLAGs, balance alerts). Sending a report
-# nobody reads splits Hannah's attention. Instead we:
+# nobody reads splits staff attention. Instead we:
 #   - Run the bot every day (Sat/Sun included) so payments post promptly.
 #   - On Sat/Sun, persist the run's results as JSON and skip the email.
 #   - On Mon-Fri, merge any pending weekend runs with today's results into a
@@ -3499,10 +3499,10 @@ def send_reports(results, duplicates, csv_date, dry_run=False):
     else:
         staff_subject = _format_combined_subject(payloads, has_errors)
 
-    # Staff report → Hannah
+    # Staff report → Lacey and Alex
     staff_path, staff_body = generate_report(payloads, dry_run=dry_run)
     staff_sent = send_email(
-        to="hannah@greatoakcounseling.com",
+        to="lacey@greatoakcounseling.com, alex@greatoakcounseling.com",
         cc="travis@greatoakcounseling.com, supportstaff@greatoakcounseling.com",
         subject=staff_subject,
         body=staff_body,

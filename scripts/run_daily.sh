@@ -9,7 +9,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INBOX="$PROJECT_ROOT/drive-inbox"
 LOG_DIR="$PROJECT_ROOT/logs"
 MARKER="$PROJECT_ROOT/.last_processed"
-RECIPIENTS="hannah@greatoakcounseling.com,travis@greatoakcounseling.com,supportstaff@greatoakcounseling.com"
+RECIPIENTS="lacey@greatoakcounseling.com,alex@greatoakcounseling.com,travis@greatoakcounseling.com,supportstaff@greatoakcounseling.com"
 
 mkdir -p "$LOG_DIR"
 

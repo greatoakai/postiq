@@ -6,7 +6,7 @@ Replaces the old Google Drive sync. After successful download, the file is
 DELETED from S3 — the bucket is a transient handoff, not long-term storage.
 
 The permanent record of each daily report lives in two places:
-  1. The HTML email Hannah and Travis receive (with both CSVs attached)
+  1. The HTML email staff and Travis receive (with both CSVs attached)
   2. The local archive folder (Square Payment Archive/) — pruned by the
      existing weekly cleanup job
 
