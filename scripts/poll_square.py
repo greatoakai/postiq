@@ -98,6 +98,10 @@ OVERLAP_MIN = 5                            # re-scan window for eventual consist
 RETRY_WINDOW_MIN = 180                     # only failures this recent
 RETRY_MAX_ATTEMPTS = 2                     # per payment, then leave it for a person
 RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
+# A payment made before its session was billed waits on the therapist, which can
+# take hours: keep trying, at most hourly, until the next morning report.
+RETRY_MAX_ATTEMPTS_UNBILLED = 8
+RETRY_SPACING_UNBILLED = timedelta(minutes=60)
 CLEARED_PATH = bot.DATA_DIR / "manual_cleared.json"
 LOCK_PATH = bot.DATA_DIR / "poll_square.lock"
 # Written by reconcile (REPORT_STAMP_FILENAME there): started_at before the morning report reads
@@ -112,7 +116,10 @@ REPORT_RUN_GRACE = timedelta(hours=1)
 # cannot have reached TA's payment form are retried. The app-not-rendering error
 # qualifies because it is raised solely by _ensure_sidebar, reachable only from the
 # two sidebar clicks, both of which run before any form is filled.
-RETRYABLE_REASONS = (bot.APP_NOT_RENDERING_REASON,)
+# The other two are raised by fill_payment_form's own checks, before any field is
+# touched — see NOT_BILLED_YET_REASON and PAYMENT_FORM_NOT_READY_REASON.
+RETRYABLE_REASONS = (bot.APP_NOT_RENDERING_REASON, bot.NOT_BILLED_YET_REASON,
+                     bot.PAYMENT_FORM_NOT_READY_REASON)
 
 # The leg labels post_payment chains reasons with ("V2: ...; V2-retry: ...; V1: ...").
 _REASON_LEG_LABEL_RX = re.compile(r"\b(?:V2-retry|V2|V1)\s*:")
@@ -337,6 +344,8 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="",
             row["retries"] = int(prior.get("retries") or 0)
         except (TypeError, ValueError):
             row["retries"] = 0
+        if prior.get("last_retry_at"):
+            row["last_retry_at"] = prior["last_retry_at"]
     entries.append(row)
     _atomic_write_json(path, entries)
 
@@ -435,8 +444,12 @@ def last_report_at(now_utc=None):
     return max(marks)
 
 
-def _retryable_row(e, posted_ids, cleared, cutoff):
+def _retryable_row(e, posted_ids, cleared, cutoff, report_cutoff=None, now=None):
     """Is this ledger row one the bot may re-attempt on its own?
+
+    `cutoff` is the usual one (recent, and after the last report). A row waiting
+    for its session to be billed is held only to `report_cutoff` — the last
+    report — and gets more attempts, spaced at least RETRY_SPACING_UNBILLED apart.
 
     Defensive throughout: a single malformed row must never abort a run and leave
     that run's genuinely new payments unposted.
@@ -452,12 +465,21 @@ def _retryable_row(e, posted_ids, cleared, cutoff):
             return None
         if not _reason_is_only_retryable(reason):
             return None
-        if int(e.get("retries") or 0) >= RETRY_MAX_ATTEMPTS:
+        unbilled = bot.NOT_BILLED_YET_REASON in reason and report_cutoff is not None
+        limit = RETRY_MAX_ATTEMPTS_UNBILLED if unbilled else RETRY_MAX_ATTEMPTS
+        if int(e.get("retries") or 0) >= limit:
             return None
         stamp = e.get("failed_at")
         if not stamp:
             return None
         failed_at = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if unbilled:
+            last = e.get("last_retry_at")
+            if last:
+                last_at = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if (now or datetime.now(timezone.utc)) - last_at < RETRY_SPACING_UNBILLED:
+                    return None
+            cutoff = report_cutoff
     except (TypeError, ValueError, AttributeError):
         return None
     return failed_at if failed_at >= cutoff else None
@@ -478,8 +500,9 @@ def retry_candidates(posted_ids):
       older than the window      stale; the report carries it
       out of attempts            stop trying and let the report carry it
     """
-    cutoff = max(datetime.now(timezone.utc) - timedelta(minutes=RETRY_WINDOW_MIN),
-                 last_report_at())
+    now = datetime.now(timezone.utc)
+    report_cutoff = last_report_at()
+    cutoff = max(now - timedelta(minutes=RETRY_WINDOW_MIN), report_cutoff)
     cleared, out = _cleared_keys(), []
     for path in sorted(LEDGER_DIR.glob("*.json")):
         try:
@@ -489,7 +512,8 @@ def retry_candidates(posted_ids):
         if not isinstance(entries, list):
             continue
         for e in entries:
-            failed_at = _retryable_row(e, posted_ids, cleared, cutoff)
+            failed_at = _retryable_row(e, posted_ids, cleared, cutoff,
+                                       report_cutoff=report_cutoff, now=now)
             if failed_at:
                 out.append((failed_at, e))
     out.sort(key=lambda pair: pair[0])
@@ -514,6 +538,7 @@ def mark_retry_attempt(row):
                     e["retries"] = int(e.get("retries") or 0) + 1
                 except (TypeError, ValueError):
                     e["retries"] = 1
+                e["last_retry_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 hit = True
         if not hit:
             return False

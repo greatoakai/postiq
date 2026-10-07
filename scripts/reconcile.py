@@ -384,6 +384,19 @@ def explain(status, reason, name):
     # promising the payment isn't in TA: reasons_from_logs() fills missing backlog
     # reasons by client name, so a row can inherit a newer reason of its own
     # client's, and an unconditional "safe to post" would be riding that.
+    # Any leg, not just V2's: the first attempt often sees only a half-drawn page,
+    # and it's the retry that finds the "Start Billing" button.
+    if "not billed in ta yet" in (reason or "").lower():
+        return ("The client paid before their session was billed in TA (Start Billing hadn't "
+                "been clicked), so there was no charge to apply it to. The bot kept retrying "
+                "through the day, but the session still wasn't billed.",
+                "Make sure the session is billed, then post it with Accept Payment on that "
+                "appointment. The bot never got as far as TA's payment form.")
+    if "payment form never became usable" in r:
+        return ("TherapyAppointment's payment form didn't finish loading, so the bot couldn't "
+                "enter the payment.",
+                "Post it in TA. Check the ledger first as usual — nothing was entered on the "
+                "form, so it shouldn't already be there.")
     if "app not rendering" in r:
         return ("TherapyAppointment was serving a blank page, so the bot couldn't reach "
                 "the client at all.",

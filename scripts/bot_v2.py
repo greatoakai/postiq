@@ -377,6 +377,19 @@ DASHBOARD_URL = "https://portal.therapyappointment.com/index.cfm/dashboard"
 APP_NOT_RENDERING_REASON = ("TA app not rendering (blank page with no sidebar "
                             "after repeated reloads)")
 
+# The client paid before their session was billed in TA: the appointment still
+# shows "Start Billing", so there is no charge for Accept Payment to open a form
+# against. Common when a client pays at or just before an early session. Raised
+# before any field is filled; the poller retries it through the day, by when the
+# therapist has billed the session. Same wording rules as above.
+NOT_BILLED_YET_REASON = ("Session not billed in TA yet (Start Billing not clicked), "
+                         "so there was no charge to take the payment")
+
+# TA's payment form never became usable: absent, or drawn without its text (TA
+# sometimes paints the form's frame long before its contents). Raised before any
+# field is filled, so nothing can have been submitted.
+PAYMENT_FORM_NOT_READY_REASON = "TA payment form never became usable"
+
 # TA's app is a Nuxt single-page app: the dashboard URL loads a bare shell and
 # the sidebar only appears once the app's JS chunks have been fetched and run.
 # TA intermittently answers one of those chunks with a 502 — caught on
@@ -1752,6 +1765,28 @@ def _resolve_reference_input(page, timeout_ms=4000):
     return None
 
 
+def _require_payment_form(page, timeout_ms=10000):
+    """Raise unless TA's payment form is on screen and drawn.
+
+    "External Credit Card" is the form's signature: every variant of it (V2,
+    all-open-charges, V1, open balance) offers that payment method, and it is
+    text, so a form painted without its contents doesn't pass. When the form is
+    missing because the session hasn't been billed yet, say so — the poller
+    treats that as "try again later", not as a fault.
+    """
+    try:
+        page.get_by_text("External Credit Card").first.wait_for(
+            state="visible", timeout=timeout_ms)
+        return
+    except Exception:
+        pass
+    try:
+        unbilled = page.get_by_text("Start Billing", exact=True).first.is_visible()
+    except Exception:
+        unbilled = False
+    raise Exception(NOT_BILLED_YET_REASON if unbilled else PAYMENT_FORM_NOT_READY_REASON)
+
+
 def fill_payment_form(page, amount):
     """Fill in the payment form fields.
 
@@ -1761,6 +1796,7 @@ def fill_payment_form(page, amount):
     miss, and logs when the fallback fires.
     """
     print(f"  Entering amount: ${amount}")
+    _require_payment_form(page)
 
     payment_input = _resolve_payment_amount_input(page)
     if payment_input is None:
@@ -1779,8 +1815,14 @@ def fill_payment_form(page, amount):
                 continue
         if payment_input is None and all_inputs:
             payment_input = all_inputs[1] if len(all_inputs) > 1 else all_inputs[0]
+    if payment_input is None:
+        raise Exception(PAYMENT_FORM_NOT_READY_REASON)
 
-    payment_input.click(click_count=3)
+    try:
+        payment_input.click(click_count=3, timeout=10000)
+    except Exception:
+        # Nothing typed yet: a form that can't take a click is a form that isn't ready.
+        raise Exception(PAYMENT_FORM_NOT_READY_REASON)
     payment_input.fill(amount)
 
     print("  Selecting External Credit Card...")
@@ -2456,10 +2498,17 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         if "FLAG" in v2_retry_error:
             return False, "FLAGGED", v2_retry_error, None, None, None, None
         print(f"  V2 retry failed: {v2_retry_error}")
-        print(f"  Falling back to V1...")
 
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
+
+    # Session not billed yet: today's charge doesn't exist, so V1 — which lets TA
+    # pick an outstanding charge — could only land the money on an older session.
+    # Fail plainly instead; the poller retries once the session has been billed.
+    if NOT_BILLED_YET_REASON in v2_error or NOT_BILLED_YET_REASON in v2_retry_error:
+        print("  Session not billed yet — leaving it for a later retry, not V1.")
+        return False, "FAILED", combined_v2_error, None, None, None, None
+    print(f"  Falling back to V1...")
 
     # --- Attempt 3: V1 fallback ---
     try:
@@ -2890,6 +2939,17 @@ def _classify_issue(reason):
                 "payment may or may not have saved. It deliberately did not try "
                 "another route. Check the client's ledger and post by hand only if "
                 "the payment isn't already there.")
+    if "not billed in ta yet" in r:
+        return ("Session not billed yet",
+                "The client paid before their session was billed in TA (Start Billing "
+                "not clicked), so there was no charge to apply it to. The bot retries "
+                "through the day; once the session is billed, post it via Accept "
+                "Payment if it's still here.")
+    if "payment form never became usable" in r:
+        return ("TA payment form didn't load",
+                "TA's payment form never finished loading, so nothing was entered or "
+                "submitted. The bot retries on its own; if it's still here, post it "
+                "by hand.")
     if "app not rendering" in r:
         return ("TherapyAppointment wasn't loading",
                 "TA served a blank page (its app failed to start), so the bot could "
