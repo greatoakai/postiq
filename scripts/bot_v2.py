@@ -1664,6 +1664,11 @@ def click_accept_payment(page, name):
         try:
             page.click("text=Accept Payment", timeout=10000)
         except Exception:
+            # Unbilled is not "no charge to take": the charge just doesn't exist
+            # YET. Say so, or the V2 retry reroutes today's money to an older
+            # session's open balance.
+            if _shows_start_billing(page):
+                raise Exception(NOT_BILLED_YET_REASON)
             raise Exception(
                 f"NO_ACCEPT_PAYMENT: the appointment matched for {name} offers no "
                 f"Accept Payment button (cancelled, or no client charge on it)"
@@ -1765,29 +1770,42 @@ def _resolve_reference_input(page, timeout_ms=4000):
     return None
 
 
-def _require_payment_form(page, timeout_ms=10000):
+def _visible(page, text, exact=False):
+    """First VISIBLE element showing `text` — hidden leftovers in TA's SPA DOM don't count."""
+    return page.get_by_text(text, exact=exact).filter(visible=True).first
+
+
+def _shows_start_billing(page):
+    """Does the open appointment still offer "Start Billing" (no charge created yet)?"""
+    try:
+        return _visible(page, "Start Billing", exact=True).is_visible()
+    except Exception:
+        return False
+
+
+def _require_payment_form(page, timeout_ms=10000, appointment=False):
     """Raise unless TA's payment form is on screen and drawn.
 
-    "External Credit Card" is the form's signature: every variant of it (V2,
-    all-open-charges, V1, open balance) offers that payment method, and it is
-    text, so a form painted without its contents doesn't pass. When the form is
-    missing because the session hasn't been billed yet, say so — the poller
-    treats that as "try again later", not as a fault.
+    The form's signature is its "Payment Amount" heading together with the
+    "External Credit Card" method: every variant (V2, all-open-charges, V1, open
+    balance) shows both, a payment-history row can show the method but not the
+    heading, and both are text, so a form painted without its contents fails.
+    `appointment` is set only from an appointment's own page (V2), the one place
+    a visible "Start Billing" means THIS session hasn't been billed — elsewhere
+    (the Billing dashboard lists other clients' sessions) it would mislead.
     """
     try:
-        page.get_by_text("External Credit Card").first.wait_for(
-            state="visible", timeout=timeout_ms)
+        for text in ("Payment Amount", "External Credit Card"):
+            _visible(page, text).wait_for(state="visible", timeout=timeout_ms)
         return
     except Exception:
         pass
-    try:
-        unbilled = page.get_by_text("Start Billing", exact=True).first.is_visible()
-    except Exception:
-        unbilled = False
-    raise Exception(NOT_BILLED_YET_REASON if unbilled else PAYMENT_FORM_NOT_READY_REASON)
+    if appointment and _shows_start_billing(page):
+        raise Exception(NOT_BILLED_YET_REASON)
+    raise Exception(PAYMENT_FORM_NOT_READY_REASON)
 
 
-def fill_payment_form(page, amount):
+def fill_payment_form(page, amount, appointment=False):
     """Fill in the payment form fields.
 
     Uses label/placeholder-anchored selectors for the Payment Amount and
@@ -1796,7 +1814,7 @@ def fill_payment_form(page, amount):
     miss, and logs when the fallback fires.
     """
     print(f"  Entering amount: ${amount}")
-    _require_payment_form(page)
+    _require_payment_form(page, appointment=appointment)
 
     payment_input = _resolve_payment_amount_input(page)
     if payment_input is None:
@@ -2162,7 +2180,7 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
     notes = [n for n in (name_note, date_note, balance_note) if n]
     note = "; ".join(notes) if notes else None
 
-    fill_payment_form(page, amount)
+    fill_payment_form(page, amount, appointment=True)
     screenshot(page, f"payment_{name.replace(' ', '_')}_02_filled")
 
     # Past this point Continue/Save have been clicked and the money may already
@@ -2502,11 +2520,14 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
 
-    # Session not billed yet: today's charge doesn't exist, so V1 — which lets TA
-    # pick an outstanding charge — could only land the money on an older session.
-    # Fail plainly instead; the poller retries once the session has been billed.
-    if NOT_BILLED_YET_REASON in v2_error or NOT_BILLED_YET_REASON in v2_retry_error:
-        print("  Session not billed yet — leaving it for a later retry, not V1.")
+    # The session isn't billed yet, or both V2 legs stopped at a form that never
+    # drew — before touching it, for reasons the poller retries. Skip V1:
+    # it lets TA pick an outstanding charge, and if today's session isn't billed
+    # that can only be an older one. The retry will find the right charge.
+    pre_form = (NOT_BILLED_YET_REASON, PAYMENT_FORM_NOT_READY_REASON)
+    if (NOT_BILLED_YET_REASON in (v2_error, v2_retry_error)
+            or all(err in pre_form for err in (v2_error, v2_retry_error))):
+        print("  Payment form unavailable on both tries — leaving it for a later retry, not V1.")
         return False, "FAILED", combined_v2_error, None, None, None, None
     print(f"  Falling back to V1...")
 

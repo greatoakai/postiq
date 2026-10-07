@@ -99,7 +99,9 @@ RETRY_WINDOW_MIN = 180                     # only failures this recent
 RETRY_MAX_ATTEMPTS = 2                     # per payment, then leave it for a person
 RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
 # A payment made before its session was billed waits on the therapist, which can
-# take hours: keep trying, at most hourly, until the next morning report.
+# take hours: keep trying, at most hourly, for the rest of the day it was paid.
+# The morning report covers yesterday and earlier, never today, so a same-day
+# retry can't race staff working the report.
 RETRY_MAX_ATTEMPTS_UNBILLED = 8
 RETRY_SPACING_UNBILLED = timedelta(minutes=60)
 CLEARED_PATH = bot.DATA_DIR / "manual_cleared.json"
@@ -346,6 +348,8 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="",
             row["retries"] = 0
         if prior.get("last_retry_at"):
             row["last_retry_at"] = prior["last_retry_at"]
+        if _awaiting_billing(prior) or bot.NOT_BILLED_YET_REASON in (reason or ""):
+            row["awaiting_billing"] = True
     entries.append(row)
     _atomic_write_json(path, entries)
 
@@ -444,12 +448,26 @@ def last_report_at(now_utc=None):
     return max(marks)
 
 
-def _retryable_row(e, posted_ids, cleared, cutoff, report_cutoff=None, now=None):
+def _parse_stamp(stamp):
+    """A ledger timestamp ("...Z") as an aware UTC datetime. Raises ValueError/TypeError."""
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _awaiting_billing(e):
+    """Has this payment ever been found waiting for its session to be billed?
+
+    Sticky: a later attempt that only meets a half-drawn form mustn't demote it
+    back to an ordinary failure with two attempts and a three-hour window.
+    """
+    return bool(e.get("awaiting_billing")) or bot.NOT_BILLED_YET_REASON in (e.get("reason") or "")
+
+
+def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
     """Is this ledger row one the bot may re-attempt on its own?
 
     `cutoff` is the usual one (recent, and after the last report). A row waiting
-    for its session to be billed is held only to `report_cutoff` — the last
-    report — and gets more attempts, spaced at least RETRY_SPACING_UNBILLED apart.
+    for its session to be billed is retried instead for as long as its Square
+    date is today, up to RETRY_MAX_ATTEMPTS_UNBILLED times, at most hourly.
 
     Defensive throughout: a single malformed row must never abort a run and leave
     that run's genuinely new payments unposted.
@@ -465,21 +483,22 @@ def _retryable_row(e, posted_ids, cleared, cutoff, report_cutoff=None, now=None)
             return None
         if not _reason_is_only_retryable(reason):
             return None
-        unbilled = bot.NOT_BILLED_YET_REASON in reason and report_cutoff is not None
+        unbilled = _awaiting_billing(e)
         limit = RETRY_MAX_ATTEMPTS_UNBILLED if unbilled else RETRY_MAX_ATTEMPTS
         if int(e.get("retries") or 0) >= limit:
             return None
         stamp = e.get("failed_at")
         if not stamp:
             return None
-        failed_at = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        failed_at = _parse_stamp(stamp)
         if unbilled:
+            now = now or datetime.now(timezone.utc)
+            if e.get("date") != now.astimezone().strftime("%m/%d/%Y"):
+                return None                 # its day is over: the report carries it
             last = e.get("last_retry_at")
-            if last:
-                last_at = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                if (now or datetime.now(timezone.utc)) - last_at < RETRY_SPACING_UNBILLED:
-                    return None
-            cutoff = report_cutoff
+            if last and now - _parse_stamp(last) < RETRY_SPACING_UNBILLED:
+                return None
+            return failed_at
     except (TypeError, ValueError, AttributeError):
         return None
     return failed_at if failed_at >= cutoff else None
@@ -501,8 +520,7 @@ def retry_candidates(posted_ids):
       out of attempts            stop trying and let the report carry it
     """
     now = datetime.now(timezone.utc)
-    report_cutoff = last_report_at()
-    cutoff = max(now - timedelta(minutes=RETRY_WINDOW_MIN), report_cutoff)
+    cutoff = max(now - timedelta(minutes=RETRY_WINDOW_MIN), last_report_at())
     cleared, out = _cleared_keys(), []
     for path in sorted(LEDGER_DIR.glob("*.json")):
         try:
@@ -512,11 +530,12 @@ def retry_candidates(posted_ids):
         if not isinstance(entries, list):
             continue
         for e in entries:
-            failed_at = _retryable_row(e, posted_ids, cleared, cutoff,
-                                       report_cutoff=report_cutoff, now=now)
+            failed_at = _retryable_row(e, posted_ids, cleared, cutoff, now=now)
             if failed_at:
                 out.append((failed_at, e))
-    out.sort(key=lambda pair: pair[0])
+    # Ordinary failures first: they have a three-hour window, while a payment
+    # waiting on billing has all day and must not crowd them out of the run's slots.
+    out.sort(key=lambda pair: (_awaiting_billing(pair[1]), pair[0]))
     return [e for _stamp, e in out[:RETRY_MAX_PER_RUN]]
 
 
@@ -924,7 +943,7 @@ def _retry_now_on_report(item):
     if not stamp:
         return False
     try:
-        failed_at = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        failed_at = _parse_stamp(stamp)
     except (TypeError, ValueError):
         return True
     return failed_at < last_report_at()
@@ -1362,9 +1381,12 @@ def main():
         queued.add(row["id"])
         to_post.append({"id": row["id"], "name": name, "date": date, "amount": amount,
                         "account": account, "customer_id": p.get("customer_id", ""),
-                        "retry_failed_at": row.get("failed_at")})
+                        # A same-day billing wait isn't on any report (see
+                        # RETRY_MAX_ATTEMPTS_UNBILLED), so there's no report to race.
+                        "retry_failed_at": None if _awaiting_billing(row) else row.get("failed_at")})
+        limit = RETRY_MAX_ATTEMPTS_UNBILLED if _awaiting_billing(row) else RETRY_MAX_ATTEMPTS
         log(f"  RETRY {name} ${amount} on {date} — earlier failure could not have reached "
-            f"TA's payment form (attempt {attempt} of {RETRY_MAX_ATTEMPTS})")
+            f"TA's payment form (attempt {attempt} of {limit})")
 
     # Every other intent marker: payments already retired in posted_payment_ids, and any that
     # didn't come up this run at all. Clear one only if the ledger durably records the outcome

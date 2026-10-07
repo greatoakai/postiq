@@ -388,8 +388,8 @@ def explain(status, reason, name):
     # and it's the retry that finds the "Start Billing" button.
     if "not billed in ta yet" in (reason or "").lower():
         return ("The client paid before their session was billed in TA (Start Billing hadn't "
-                "been clicked), so there was no charge to apply it to. The bot kept retrying "
-                "through the day, but the session still wasn't billed.",
+                "been clicked), so there was no charge to apply it to. The bot retried it "
+                "during that day, but it still hadn't posted, and the bot has now stopped.",
                 "Make sure the session is billed, then post it with Accept Payment on that "
                 "appointment. The bot never got as far as TA's payment form.")
     if "payment form never became usable" in r:
