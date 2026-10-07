@@ -142,6 +142,9 @@ def _reason_is_only_retryable(reason):
     """
     if not reason or not any(allowed in reason for allowed in RETRYABLE_REASONS):
         return False
+    # V1's pre-form reason carries its detail in brackets (bot_v2.post_payment).
+    reason = re.sub(re.escape(bot.V1_BEFORE_FORM_REASON) + r" \[[^\[\]]*\]",
+                    bot.V1_BEFORE_FORM_REASON, reason)
     residue = reason
     for allowed in RETRYABLE_REASONS:
         residue = residue.replace(allowed, "")
@@ -486,7 +489,10 @@ def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
             return None
         if not _reason_is_only_retryable(reason):
             return None
-        waiting = _awaiting_session(e)
+        now = now or datetime.now(timezone.utc)
+        # Only while its day lasts; after that it's an ordinary failure again.
+        waiting = (_awaiting_session(e)
+                   and e.get("date") == now.astimezone().strftime("%m/%d/%Y"))
         limit = RETRY_MAX_ATTEMPTS_SESSION if waiting else RETRY_MAX_ATTEMPTS
         if int(e.get("retries") or 0) >= limit:
             return None
@@ -495,9 +501,6 @@ def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
             return None
         failed_at = _parse_stamp(stamp)
         if waiting:
-            now = now or datetime.now(timezone.utc)
-            if e.get("date") != now.astimezone().strftime("%m/%d/%Y"):
-                return None                 # its day is over: the report carries it
             last = e.get("last_retry_at") or stamp     # first retry: an hour after failing
             if now - _parse_stamp(last) < RETRY_SPACING_SESSION:
                 return None

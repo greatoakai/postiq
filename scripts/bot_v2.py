@@ -1778,13 +1778,15 @@ def _resolve_reference_input(page, timeout_ms=4000):
     return None
 
 
-def _visible(page, text):
-    """Visible elements whose whole text is `text` — hidden SPA leftovers don't count.
+def _visible(page, text, exact=False):
+    """Visible elements showing `text` — hidden SPA leftovers don't count.
 
-    A selector-engine filter rather than Locator.filter(visible=...), which only
-    exists from Playwright 1.51.
+    Substring and case-insensitive unless `exact`, so "Payment Amount *" or a
+    label split over two lines still matches. A selector-engine filter rather
+    than Locator.filter(visible=...), which only exists from Playwright 1.51.
     """
-    return page.locator(f'text="{text}" >> visible=true')
+    sel = f'text="{text}"' if exact else f"text={text}"
+    return page.locator(f"{sel} >> visible=true")
 
 
 def _shows_start_billing(page, timeout_ms=3000):
@@ -1794,7 +1796,7 @@ def _shows_start_billing(page, timeout_ms=3000):
     unbilled session down the no-charge path to the open balance.
     """
     try:
-        _visible(page, "Start Billing").first.wait_for(state="visible", timeout=timeout_ms)
+        _visible(page, "Start Billing", exact=True).first.wait_for(state="visible", timeout=timeout_ms)
         return True
     except Exception:
         return False
@@ -1804,9 +1806,10 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     """Raise unless TA's payment form is on screen and drawn.
 
     The form's signature is its "Payment Amount" heading together with the
-    "External Credit Card" method: every variant (V2, all-open-charges, V1, open
-    balance) shows both, a payment-history row can show the method but not the
-    heading, and both are text, so a form painted without its contents fails.
+    "Credit Card" payment methods: every variant (V2, all-open-charges, V1, open
+    balance — checked against screenshots of each) shows both, a payment-history
+    row can show a method but not the heading, and both are text, so a form
+    painted without its contents fails.
     `appointment` is set only on the appointment's own page for a session ON the
     payment date (V2) — the one place a visible "Start Billing" means THIS session
     hasn't been billed. It also ends the wait early: no form is coming.
@@ -1814,9 +1817,9 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
         try:
-            if all(_visible(page, t).count() for t in ("Payment Amount", "External Credit Card")):
+            if all(_visible(page, t).count() for t in ("Payment Amount", "Credit Card")):
                 return
-            if appointment and _visible(page, "Start Billing").count():
+            if appointment and _visible(page, "Start Billing", exact=True).count():
                 raise Exception(SESSION_NOT_PAYABLE_REASON)
         except Exception as e:
             if str(e) == SESSION_NOT_PAYABLE_REASON:
@@ -2530,8 +2533,12 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     # second miss means there really is no appointment, not a slow render. ---
     print(f"  Retrying V2...")
     try:
+        # Not after the first try found today's session unpayable: a miss on the
+        # retry is then a slow page, not a missing appointment, and the balance
+        # fallback would put today's money on an older session.
         ok, note, balance_amount, method = post_payment_v2(
-            page, name, date, amount, dry_run, account=account, allow_balance=True)
+            page, name, date, amount, dry_run, account=account,
+            allow_balance=v2_error != SESSION_NOT_PAYABLE_REASON)
         if not ok:
             raise Exception("V2-retry returned ok=False")
         posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
@@ -2550,6 +2557,17 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
 
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
+
+    # Today's session isn't payable yet and nothing else went wrong. Leave it for
+    # the poller's hourly retry, which posts it to THIS session once it's over.
+    # V1 would let TA pick a charge — an older one, or with none, a FLAG that
+    # retries can't touch. (Jacob Legrand, 10/06, posted via V1 because his was
+    # the only charge; a retry an hour later would have put it in the same place.)
+    pre_form = (SESSION_NOT_PAYABLE_REASON, PAYMENT_FORM_NOT_READY_REASON, APP_NOT_RENDERING_REASON)
+    if (SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error)
+            and all(err in pre_form for err in (v2_error, v2_retry_error))):
+        print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
+        return False, "FAILED", combined_v2_error, None, None, None, None
 
     print(f"  Falling back to V1...")
 
@@ -2575,9 +2593,11 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
             return False, "FLAGGED", v1_error, None, None, None, None
         print(f"  V1 also failed: {v1_error}")
         if v1_error.startswith(V1_BEFORE_FORM_TAG):
-            # Record the fixed wording, not the detail, so the retry gate can
-            # recognise it; the detail is in the run log above.
-            v1_error = V1_BEFORE_FORM_REASON
+            # Fixed wording the retry gate recognises, then the detail in brackets
+            # (brackets inside it neutralised, so the gate can strip it cleanly).
+            detail = v1_error[len(V1_BEFORE_FORM_TAG):].strip()
+            detail = detail.replace("[", "(").replace("]", ")")
+            v1_error = f"{V1_BEFORE_FORM_REASON} [{detail}]"
 
     # --- All attempts failed ---
     return False, "FAILED", f"{combined_v2_error}; V1: {v1_error}", None, None, None, None
@@ -2989,8 +3009,8 @@ def _classify_issue(reason):
     if "appointment had no payment form yet" in r:
         return ("Appointment not payable yet",
                 "The appointment offered no payment form — usually because the session "
-                "was in progress when the client paid. The bot retries it during that "
-                "day; if it's still here, post it via Accept Payment on the appointment.")
+                "was in progress when the client paid. The bot usually retries these "
+                "that day; if it's still here, post it via Accept Payment on the appointment.")
     if "payment form never became usable" in r:
         return ("TA payment form didn't load",
                 "TA's payment form never finished loading, so nothing was entered or "
