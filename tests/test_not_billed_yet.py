@@ -156,6 +156,17 @@ class SkipV1WhenUnbilledTest(unittest.TestCase):
         self.assertEqual(self.v1_calls, [])
         self.assertTrue(ps._reason_is_only_retryable(error))
 
+    def test_unbilled_first_try_stops_before_the_balance_fallback(self):
+        calls = []
+        def v2(*a, **k):
+            calls.append(k.get("allow_balance"))
+            raise Exception(bot.NOT_BILLED_YET_REASON)
+        bot.post_payment_v2 = v2
+        ok, status, error, *_ = bot.post_payment(None, "Pat Example", "10/06/2026", "30.00")
+        self.assertEqual(calls, [False], "no V2 retry: it may reroute to the open balance")
+        self.assertEqual((ok, status, self.v1_calls), (False, "FAILED", []))
+        self.assertTrue(ps._reason_is_only_retryable(error))
+
     def test_form_never_drawing_on_both_tries_is_not_sent_to_v1(self):
         def v2(*a, **k):
             raise Exception(bot.PAYMENT_FORM_NOT_READY_REASON)

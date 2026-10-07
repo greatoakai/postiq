@@ -1775,10 +1775,15 @@ def _visible(page, text, exact=False):
     return page.get_by_text(text, exact=exact).filter(visible=True).first
 
 
-def _shows_start_billing(page):
-    """Does the open appointment still offer "Start Billing" (no charge created yet)?"""
+def _shows_start_billing(page, timeout_ms=3000):
+    """Does the open appointment still offer "Start Billing" (no charge created yet)?
+
+    Waits briefly: the action panel paints late, and calling it absent sends an
+    unbilled session down the no-charge path to the open balance.
+    """
     try:
-        return _visible(page, "Start Billing", exact=True).is_visible()
+        _visible(page, "Start Billing", exact=True).wait_for(state="visible", timeout=timeout_ms)
+        return True
     except Exception:
         return False
 
@@ -1796,7 +1801,7 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     """
     try:
         for text in ("Payment Amount", "External Credit Card"):
-            _visible(page, text).wait_for(state="visible", timeout=timeout_ms)
+            _visible(page, text, exact=True).wait_for(state="visible", timeout=timeout_ms)
         return
     except Exception:
         pass
@@ -2493,6 +2498,12 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         if "FLAG" in v2_error:
             return False, "FLAGGED", v2_error, None, None, None, None
         print(f"  V2 failed: {v2_error}")
+        if v2_error == NOT_BILLED_YET_REASON:
+            # Not a slow render a retry might get past: today's charge doesn't
+            # exist yet. Every route from here — the V2 retry's open-balance
+            # fallback, V1 — could only put the money on an older session.
+            print("  Session not billed yet — leaving it for a later retry.")
+            return False, "FAILED", f"V2: {v2_error}", None, None, None, None
 
     # --- Attempt 2: Retry V2 with fresh navigation ---
     # --- Attempt 2: retry V2. This one may fall back to the open balance: a
@@ -2520,11 +2531,11 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
 
-    # The session isn't billed yet, or both V2 legs stopped at a form that never
-    # drew — before touching it, for reasons the poller retries. Skip V1:
+    # The session isn't billed yet, or both V2 legs stopped before touching a form,
+    # for reasons the poller retries (form never drew, app blank). Skip V1:
     # it lets TA pick an outstanding charge, and if today's session isn't billed
     # that can only be an older one. The retry will find the right charge.
-    pre_form = (NOT_BILLED_YET_REASON, PAYMENT_FORM_NOT_READY_REASON)
+    pre_form = (NOT_BILLED_YET_REASON, PAYMENT_FORM_NOT_READY_REASON, APP_NOT_RENDERING_REASON)
     if (NOT_BILLED_YET_REASON in (v2_error, v2_retry_error)
             or all(err in pre_form for err in (v2_error, v2_retry_error))):
         print("  Payment form unavailable on both tries — leaving it for a later retry, not V1.")

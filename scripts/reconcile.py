@@ -390,13 +390,12 @@ def explain(status, reason, name):
         return ("The client paid before their session was billed in TA (Start Billing hadn't "
                 "been clicked), so there was no charge to apply it to. The bot retried it "
                 "during that day, but it still hadn't posted, and the bot has now stopped.",
-                "Make sure the session is billed, then post it with Accept Payment on that "
-                "appointment. The bot never got as far as TA's payment form.")
+                "Make sure the session is billed, check the ledger as usual, then post it "
+                "with Accept Payment on that appointment.")
     if "payment form never became usable" in r:
         return ("TherapyAppointment's payment form didn't finish loading, so the bot couldn't "
                 "enter the payment.",
-                "Post it in TA. Check the ledger first as usual — nothing was entered on the "
-                "form, so it shouldn't already be there.")
+                "Post it in TA. Check the ledger first as usual.")
     if "app not rendering" in r:
         return ("TherapyAppointment was serving a blank page, so the bot couldn't reach "
                 "the client at all.",

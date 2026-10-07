@@ -508,7 +508,10 @@ def retry_candidates(posted_ids):
     """Recent failures that are safe to re-attempt, oldest first.
 
     Safe means the recorded reason is one that cannot have reached TA's payment
-    form (RETRYABLE_REASONS). Everything else is left for a person:
+    form (RETRYABLE_REASONS). A payment waiting for its session to be billed
+    follows its own rule instead of the window and the report cutoff: retried for
+    as long as its Square date is today, at most hourly, RETRY_MAX_ATTEMPTS_UNBILLED
+    times. Everything else is left for a person:
 
       not an allowlisted reason  it might have submitted — never assume otherwise
       FLAGGED                    a human judgement call (multiple appointments, ...)
