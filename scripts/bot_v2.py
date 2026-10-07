@@ -1636,6 +1636,16 @@ def _scrape_due_now(page):
         return None
 
 
+def _is_today(date_str):
+    """Is `date_str` (MM/DD/YYYY or YYYY-MM-DD) today's local date?"""
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str, fmt).date() == datetime.now().date()
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def click_accept_payment(page, name, same_day=False):
     """Click the Accept Payment button on the appointment summary.
 
@@ -1814,20 +1824,21 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     payment date (V2) — the one place a visible "Start Billing" means THIS session
     hasn't been billed. It also ends the wait early: no form is coming.
     """
+    def seen(text, exact=False):
+        try:
+            return _visible(page, text, exact).count() > 0
+        except Exception:
+            return False
+
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
-        try:
-            if all(_visible(page, t).count() for t in ("Payment Amount", "Credit Card")):
-                return
-            if appointment and _visible(page, "Start Billing", exact=True).count():
-                raise Exception(SESSION_NOT_PAYABLE_REASON)
-        except Exception as e:
-            if str(e) == SESSION_NOT_PAYABLE_REASON:
-                raise
+        if seen("Payment Amount") and seen("Credit Card"):
+            return
+        if appointment and seen("Start Billing", exact=True):
+            raise Exception(SESSION_NOT_PAYABLE_REASON)
         if time.monotonic() >= deadline:
-            break
+            raise Exception(PAYMENT_FORM_NOT_READY_REASON)
         page.wait_for_timeout(500)
-    raise Exception(PAYMENT_FORM_NOT_READY_REASON)
 
 
 def fill_payment_form(page, amount, appointment=False):
@@ -2186,10 +2197,10 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
 
     try:
         date_note = click_appointment_by_date(page, date, name)
-        # Only a session ON the payment date can be "not billed yet". A nearby
-        # earlier one that was never billed (a payment-plan payment landing on a
-        # forgotten session) keeps the old no-charge path to the open balance.
-        same_day = date_note is None
+        # Only TODAY's session, matched on the payment date, can be "not payable
+        # yet" — it may still be in progress. An earlier one that was never billed
+        # (a payment-plan payment, a backlog catch-up) keeps the old no-charge path.
+        same_day = date_note is None and _is_today(date)
         balance_note, balance_amount = click_accept_payment(page, name, same_day=same_day)
     except Exception as e:
         if "FLAG" in str(e) or not _is_no_appointment_error(e):
@@ -2558,14 +2569,15 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
 
-    # Today's session isn't payable yet and nothing else went wrong. Leave it for
+    # Today's session isn't payable yet. Leave it for
     # the poller's hourly retry, which posts it to THIS session once it's over.
     # V1 would let TA pick a charge — an older one, or with none, a FLAG that
     # retries can't touch. (Jacob Legrand, 10/06, posted via V1 because his was
     # the only charge; a retry an hour later would have put it in the same place.)
-    pre_form = (SESSION_NOT_PAYABLE_REASON, PAYMENT_FORM_NOT_READY_REASON, APP_NOT_RENDERING_REASON)
-    if (SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error)
-            and all(err in pre_form for err in (v2_error, v2_retry_error))):
+    # Either leg is enough: the other one's miss is then a slow page. When that
+    # other reason isn't a retryable one the poller leaves it for staff — still
+    # better than V1 guessing a charge.
+    if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error):
         print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
         return False, "FAILED", combined_v2_error, None, None, None, None
 

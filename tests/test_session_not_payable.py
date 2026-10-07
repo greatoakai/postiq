@@ -209,13 +209,23 @@ class FallbackTest(unittest.TestCase):
         ok, status, *_ = self._post()
         self.assertEqual(status, "FLAGGED")
 
-    def test_generic_v2_failure_keeps_the_chain_unretryable(self):
-        self.v2_errors = ["Locator.click: Timeout 30000ms exceeded", bot.SESSION_NOT_PAYABLE_REASON]
-        def v1(*a, **k):
-            raise Exception(f"{bot.V1_BEFORE_FORM_TAG} Page.click: Timeout")
-        bot.post_payment_v1 = v1
-        _ok, _status, error, *_ = self._post()
-        self.assertFalse(ps._reason_is_only_retryable(error))
+    def test_one_unpayable_leg_is_enough_to_keep_v1_away(self):
+        self.v2_errors = ["No appointment found on 10/06/2026 for Pat Example",
+                          bot.SESSION_NOT_PAYABLE_REASON]
+        v1 = []
+        bot.post_payment_v1 = lambda *a, **k: v1.append(1) or (True, "Posted ✓")
+        ok, status, error, *_ = self._post()
+        self.assertEqual((ok, status, v1), (False, "FAILED", []))
+        self.assertFalse(ps._reason_is_only_retryable(error), "the miss leaves it for staff")
+
+
+class IsTodayTest(unittest.TestCase):
+    def test_formats(self):
+        today = datetime.now()
+        self.assertTrue(bot._is_today(today.strftime("%m/%d/%Y")))
+        self.assertTrue(bot._is_today(today.strftime("%Y-%m-%d")))
+        self.assertFalse(bot._is_today((today - timedelta(days=3)).strftime("%m/%d/%Y")))
+        self.assertFalse(bot._is_today("garbage"))
 
 
 class V1TagTest(unittest.TestCase):
@@ -235,6 +245,9 @@ class ReportWordingTest(unittest.TestCase):
     def test_reconcile_and_classifier_name_the_real_cause(self):
         import reconcile as rec
         why, todo = rec.explain("FAILED", UNBILLED, "Pat Example")
+        why2, _ = rec.explain("FAILED", "V2: No appointment found on 10/06/2026 for Pat; "
+                              f"V2-retry: {bot.SESSION_NOT_PAYABLE_REASON}", "Pat")
+        self.assertIn("in progress", why2)
         self.assertIn("in progress", why)
         self.assertNotIn("popup", why.lower())
         self.assertEqual(bot._classify_issue(UNBILLED)[0], "Appointment not payable yet")

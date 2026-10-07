@@ -468,6 +468,13 @@ def _awaiting_session(e):
     return bool(e.get("awaiting_session")) or bot.SESSION_NOT_PAYABLE_REASON in (e.get("reason") or "")
 
 
+def _session_wait_active(e, now=None):
+    """Retry this row under the session-wait rule? Only while its Square date is
+    today; after that it's an ordinary failure again."""
+    now = now or datetime.now(timezone.utc)
+    return _awaiting_session(e) and e.get("date") == now.astimezone().strftime("%m/%d/%Y")
+
+
 def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
     """Is this ledger row one the bot may re-attempt on its own?
 
@@ -489,10 +496,7 @@ def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
             return None
         if not _reason_is_only_retryable(reason):
             return None
-        now = now or datetime.now(timezone.utc)
-        # Only while its day lasts; after that it's an ordinary failure again.
-        waiting = (_awaiting_session(e)
-                   and e.get("date") == now.astimezone().strftime("%m/%d/%Y"))
+        waiting = _session_wait_active(e, now)
         limit = RETRY_MAX_ATTEMPTS_SESSION if waiting else RETRY_MAX_ATTEMPTS
         if int(e.get("retries") or 0) >= limit:
             return None
@@ -543,7 +547,7 @@ def retry_candidates(posted_ids):
                 out.append((failed_at, e))
     # Ordinary failures first: they have a three-hour window, while a payment
     # waiting on its session has all day and must not crowd them out of the run's slots.
-    out.sort(key=lambda pair: (_awaiting_session(pair[1]), pair[0]))
+    out.sort(key=lambda pair: (_session_wait_active(pair[1], now), pair[0]))
     return [e for _stamp, e in out[:RETRY_MAX_PER_RUN]]
 
 
@@ -1391,8 +1395,8 @@ def main():
                         "account": account, "customer_id": p.get("customer_id", ""),
                         # A same-day session wait isn't on any report (see
                         # RETRY_MAX_ATTEMPTS_SESSION), so there's no report to race.
-                        "retry_failed_at": None if _awaiting_session(row) else row.get("failed_at")})
-        limit = RETRY_MAX_ATTEMPTS_SESSION if _awaiting_session(row) else RETRY_MAX_ATTEMPTS
+                        "retry_failed_at": None if _session_wait_active(row) else row.get("failed_at")})
+        limit = RETRY_MAX_ATTEMPTS_SESSION if _session_wait_active(row) else RETRY_MAX_ATTEMPTS
         log(f"  RETRY {name} ${amount} on {date} — earlier failure could not have reached "
             f"TA's payment form (attempt {attempt} of {limit})")
 

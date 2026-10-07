@@ -371,6 +371,14 @@ def explain(status, reason, name):
                 "Find the client in TA — it's usually a nickname, maiden name, or spelling "
                 "difference — and post the payment. Reply to Travis with the correct TA name "
                 "so the bot gets it right next time.")
+    # Any leg, not just V2's, and ahead of "no appointment found": the first try
+    # often meets a half-drawn page, and it's the retry that finds today's
+    # appointment with no payment form. That, not the miss, is what staff act on.
+    if "appointment had no payment form yet" in (reason or "").lower():
+        return ("The appointment didn't offer a payment form yet — usually the session was "
+                "in progress when the client paid. The bot retries these during the day they "
+                "were paid, but this one still hadn't posted.",
+                "Check the ledger as usual, then post it with Accept Payment on that appointment.")
     if "no appointment found" in r:
         return ("The client is in TA, but had no appointment on the date of the payment.",
                 "Post the payment to the correct appointment, or to the client's open balance "
@@ -384,13 +392,6 @@ def explain(status, reason, name):
     # promising the payment isn't in TA: reasons_from_logs() fills missing backlog
     # reasons by client name, so a row can inherit a newer reason of its own
     # client's, and an unconditional "safe to post" would be riding that.
-    # Any leg, not just V2's: the first try often meets a half-drawn page, and
-    # it's the retry that finds the appointment with no payment form.
-    if "appointment had no payment form yet" in (reason or "").lower():
-        return ("The appointment didn't offer a payment form yet — usually the session was "
-                "in progress when the client paid. The bot retries these during the day they "
-                "were paid, but this one still hadn't posted.",
-                "Check the ledger as usual, then post it with Accept Payment on that appointment.")
     if "payment form never became usable" in r:
         return ("TherapyAppointment's payment form didn't finish loading, so the bot couldn't "
                 "enter the payment.",
