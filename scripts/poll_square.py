@@ -98,12 +98,15 @@ OVERLAP_MIN = 5                            # re-scan window for eventual consist
 RETRY_WINDOW_MIN = 180                     # only failures this recent
 RETRY_MAX_ATTEMPTS = 2                     # per payment, then leave it for a person
 RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
-# A payment made before its session was billed waits on the therapist, which can
-# take hours: keep trying, at most hourly, for the rest of the day it was paid.
+# A payment whose appointment offered no form yet (session in progress, or not
+# billed) waits on the session: keep trying, at most hourly, for the rest of the
+# day it was paid.
 # The morning report covers yesterday and earlier, never today, so a same-day
 # retry can't race staff working the report.
-RETRY_MAX_ATTEMPTS_UNBILLED = 8
-RETRY_SPACING_UNBILLED = timedelta(minutes=60)
+RETRY_MAX_ATTEMPTS_SESSION = 8
+# Just under the hour: runs fire on :00/:30 and stamp the attempt seconds after
+# starting, so a full 60 minutes would always miss the next hourly run.
+RETRY_SPACING_SESSION = timedelta(minutes=55)
 CLEARED_PATH = bot.DATA_DIR / "manual_cleared.json"
 LOCK_PATH = bot.DATA_DIR / "poll_square.lock"
 # Written by reconcile (REPORT_STAMP_FILENAME there): started_at before the morning report reads
@@ -118,10 +121,10 @@ REPORT_RUN_GRACE = timedelta(hours=1)
 # cannot have reached TA's payment form are retried. The app-not-rendering error
 # qualifies because it is raised solely by _ensure_sidebar, reachable only from the
 # two sidebar clicks, both of which run before any form is filled.
-# The other two are raised by fill_payment_form's own checks, before any field is
-# touched — see NOT_BILLED_YET_REASON and PAYMENT_FORM_NOT_READY_REASON.
-RETRYABLE_REASONS = (bot.APP_NOT_RENDERING_REASON, bot.NOT_BILLED_YET_REASON,
-                     bot.PAYMENT_FORM_NOT_READY_REASON)
+# The rest are raised before any field is touched — see SESSION_NOT_PAYABLE_REASON,
+# PAYMENT_FORM_NOT_READY_REASON and V1_BEFORE_FORM_REASON in bot_v2.
+RETRYABLE_REASONS = (bot.APP_NOT_RENDERING_REASON, bot.SESSION_NOT_PAYABLE_REASON,
+                     bot.PAYMENT_FORM_NOT_READY_REASON, bot.V1_BEFORE_FORM_REASON)
 
 # The leg labels post_payment chains reasons with ("V2: ...; V2-retry: ...; V1: ...").
 _REASON_LEG_LABEL_RX = re.compile(r"\b(?:V2-retry|V2|V1)\s*:")
@@ -348,8 +351,8 @@ def record_ledger(payment_id, name, date, amount, status, account="", reason="",
             row["retries"] = 0
         if prior.get("last_retry_at"):
             row["last_retry_at"] = prior["last_retry_at"]
-        if _awaiting_billing(prior) or bot.NOT_BILLED_YET_REASON in (reason or ""):
-            row["awaiting_billing"] = True
+        if _awaiting_session(prior) or _awaiting_session({"reason": reason}):
+            row["awaiting_session"] = True
     entries.append(row)
     _atomic_write_json(path, entries)
 
@@ -453,21 +456,21 @@ def _parse_stamp(stamp):
     return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
-def _awaiting_billing(e):
-    """Has this payment ever been found waiting for its session to be billed?
+def _awaiting_session(e):
+    """Has this payment ever been found waiting on its session (no payment form yet)?
 
     Sticky: a later attempt that only meets a half-drawn form mustn't demote it
     back to an ordinary failure with two attempts and a three-hour window.
     """
-    return bool(e.get("awaiting_billing")) or bot.NOT_BILLED_YET_REASON in (e.get("reason") or "")
+    return bool(e.get("awaiting_session")) or bot.SESSION_NOT_PAYABLE_REASON in (e.get("reason") or "")
 
 
 def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
     """Is this ledger row one the bot may re-attempt on its own?
 
     `cutoff` is the usual one (recent, and after the last report). A row waiting
-    for its session to be billed is retried instead for as long as its Square
-    date is today, up to RETRY_MAX_ATTEMPTS_UNBILLED times, at most hourly.
+    on its session is retried instead for as long as its Square date is today,
+    up to RETRY_MAX_ATTEMPTS_SESSION times, at most hourly.
 
     Defensive throughout: a single malformed row must never abort a run and leave
     that run's genuinely new payments unposted.
@@ -483,20 +486,20 @@ def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
             return None
         if not _reason_is_only_retryable(reason):
             return None
-        unbilled = _awaiting_billing(e)
-        limit = RETRY_MAX_ATTEMPTS_UNBILLED if unbilled else RETRY_MAX_ATTEMPTS
+        waiting = _awaiting_session(e)
+        limit = RETRY_MAX_ATTEMPTS_SESSION if waiting else RETRY_MAX_ATTEMPTS
         if int(e.get("retries") or 0) >= limit:
             return None
         stamp = e.get("failed_at")
         if not stamp:
             return None
         failed_at = _parse_stamp(stamp)
-        if unbilled:
+        if waiting:
             now = now or datetime.now(timezone.utc)
             if e.get("date") != now.astimezone().strftime("%m/%d/%Y"):
                 return None                 # its day is over: the report carries it
-            last = e.get("last_retry_at")
-            if last and now - _parse_stamp(last) < RETRY_SPACING_UNBILLED:
+            last = e.get("last_retry_at") or stamp     # first retry: an hour after failing
+            if now - _parse_stamp(last) < RETRY_SPACING_SESSION:
                 return None
             return failed_at
     except (TypeError, ValueError, AttributeError):
@@ -508,9 +511,8 @@ def retry_candidates(posted_ids):
     """Recent failures that are safe to re-attempt, oldest first.
 
     Safe means the recorded reason is one that cannot have reached TA's payment
-    form (RETRYABLE_REASONS). A payment waiting for its session to be billed
-    follows its own rule instead of the window and the report cutoff: retried for
-    as long as its Square date is today, at most hourly, RETRY_MAX_ATTEMPTS_UNBILLED
+    form (RETRYABLE_REASONS). A payment waiting on its session follows its own rule instead of the window and the report cutoff: retried for
+    as long as its Square date is today, at most hourly, RETRY_MAX_ATTEMPTS_SESSION
     times. Everything else is left for a person:
 
       not an allowlisted reason  it might have submitted — never assume otherwise
@@ -537,8 +539,8 @@ def retry_candidates(posted_ids):
             if failed_at:
                 out.append((failed_at, e))
     # Ordinary failures first: they have a three-hour window, while a payment
-    # waiting on billing has all day and must not crowd them out of the run's slots.
-    out.sort(key=lambda pair: (_awaiting_billing(pair[1]), pair[0]))
+    # waiting on its session has all day and must not crowd them out of the run's slots.
+    out.sort(key=lambda pair: (_awaiting_session(pair[1]), pair[0]))
     return [e for _stamp, e in out[:RETRY_MAX_PER_RUN]]
 
 
@@ -1384,10 +1386,10 @@ def main():
         queued.add(row["id"])
         to_post.append({"id": row["id"], "name": name, "date": date, "amount": amount,
                         "account": account, "customer_id": p.get("customer_id", ""),
-                        # A same-day billing wait isn't on any report (see
-                        # RETRY_MAX_ATTEMPTS_UNBILLED), so there's no report to race.
-                        "retry_failed_at": None if _awaiting_billing(row) else row.get("failed_at")})
-        limit = RETRY_MAX_ATTEMPTS_UNBILLED if _awaiting_billing(row) else RETRY_MAX_ATTEMPTS
+                        # A same-day session wait isn't on any report (see
+                        # RETRY_MAX_ATTEMPTS_SESSION), so there's no report to race.
+                        "retry_failed_at": None if _awaiting_session(row) else row.get("failed_at")})
+        limit = RETRY_MAX_ATTEMPTS_SESSION if _awaiting_session(row) else RETRY_MAX_ATTEMPTS
         log(f"  RETRY {name} ${amount} on {date} — earlier failure could not have reached "
             f"TA's payment form (attempt {attempt} of {limit})")
 
