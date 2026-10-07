@@ -56,10 +56,10 @@ POSTED_OK = ("OK", "WOULD_POST")
 # during the shadow window). Search both so reconcile works from either tree.
 LIVE_ROOT = Path("/Users/travmegsam/Developer/postiq")
 
-# Who gets the morning report. Hannah works the manual-posting list; Travis owns
+# Who gets the morning report. Lacey and Alex work the manual-posting list; Travis owns
 # the system and gets the housekeeping sections. Add supportstaff@ to STAFF_TO if
 # the whole billing desk should see it.
-STAFF_TO = "hannah@greatoakcounseling.com"
+STAFF_TO = "lacey@greatoakcounseling.com, alex@greatoakcounseling.com"
 ADMIN_TO = "travis@greatoakcounseling.com"
 
 # Rolling look-back for the "still outstanding" list.
@@ -1547,7 +1547,7 @@ def print_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, review=()):
 
 def email_report(r, heals=(), backlog=(), days=BACKLOG_DAYS, backlog_failed=False,
                  review=()):
-    """Email the morning report to staff (Hannah) with Travis copied.
+    """Email the morning report to staff (Lacey and Alex) with Travis copied.
 
     Returns True only if it actually went out — the caller uses that to decide
     whether the self-heal confirmations can be retired.
