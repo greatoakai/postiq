@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 from datetime import datetime, timedelta, date as date_type
 from pathlib import Path
@@ -376,6 +377,26 @@ DASHBOARD_URL = "https://portal.therapyappointment.com/index.cfm/dashboard"
 # rerouted instead of simply failing.
 APP_NOT_RENDERING_REASON = ("TA app not rendering (blank page with no sidebar "
                             "after repeated reloads)")
+
+# Today's appointment offered no payment form: Accept Payment opened nothing and the
+# page still shows "Start Billing". Seen on 10/06/2026 for four clients whose
+# sessions were IN PROGRESS when the bot ran — the appointment's action panel was
+# still spinning. Raised before any field is filled; the poller retries it hourly
+# for the rest of the day, by when the session is over and V2 works. Same wording
+# rules as above.
+SESSION_NOT_PAYABLE_REASON = ("Appointment had no payment form yet (session in "
+                              "progress or not billed)")
+
+# TA's payment form never became usable: absent, or drawn without its text (TA
+# sometimes paints the form's frame long before its contents). Raised before any
+# field is filled, so nothing can have been submitted.
+PAYMENT_FORM_NOT_READY_REASON = "TA payment form never became usable"
+
+# V1 stopped before its payment form: Billing dashboard, Take Payment, or the
+# client autocomplete. post_payment_v1 tags exactly those steps, so — with submit
+# wrapped in AT_PAYMENT_FORM since PR #16 — nothing can have been submitted.
+V1_BEFORE_FORM_REASON = "V1 stopped before reaching the payment form"
+V1_BEFORE_FORM_TAG = "V1_BEFORE_FORM:"
 
 # TA's app is a Nuxt single-page app: the dashboard URL loads a bare shell and
 # the sidebar only appears once the app's JS chunks have been fetched and run.
@@ -1615,7 +1636,17 @@ def _scrape_due_now(page):
         return None
 
 
-def click_accept_payment(page, name):
+def _is_today(date_str):
+    """Is `date_str` (MM/DD/YYYY or YYYY-MM-DD) today's local date?"""
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str, fmt).date() == datetime.now().date()
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def click_accept_payment(page, name, same_day=False):
     """Click the Accept Payment button on the appointment summary.
 
     Returns (balance_note, balance_amount):
@@ -1651,6 +1682,14 @@ def click_accept_payment(page, name):
         try:
             page.click("text=Accept Payment", timeout=10000)
         except Exception:
+            # Unbilled is not "no charge to take": the charge just doesn't exist
+            # YET. Say so, or the V2 retry reroutes today's money to an older
+            # session's open balance.
+            if same_day:
+                # Today's session with no Accept Payment hasn't got its charge yet
+                # (in progress, or not billed). Never "no charge to take": that
+                # reroutes today's money to an older session's balance.
+                raise Exception(SESSION_NOT_PAYABLE_REASON)
             raise Exception(
                 f"NO_ACCEPT_PAYMENT: the appointment matched for {name} offers no "
                 f"Accept Payment button (cancelled, or no client charge on it)"
@@ -1752,7 +1791,50 @@ def _resolve_reference_input(page, timeout_ms=4000):
     return None
 
 
-def fill_payment_form(page, amount):
+def _visible(page, text, exact=False):
+    """Visible elements showing `text` — hidden SPA leftovers don't count.
+
+    Substring and case-insensitive unless `exact`, so "Payment Amount *" or a
+    label split over two lines still matches. A selector-engine filter rather
+    than Locator.filter(visible=...), which only exists from Playwright 1.51.
+    """
+    sel = f'text="{text}"' if exact else f"text={text}"
+    return page.locator(f"{sel} >> visible=true")
+
+
+def _require_payment_form(page, timeout_ms=10000, appointment=False):
+    """Raise unless TA's payment form is on screen and drawn.
+
+    The form's signature is its "Payment Amount" heading together with the
+    "Credit Card" payment methods: every variant (V2, all-open-charges, V1, open
+    balance — checked against screenshots of each) shows both, a payment-history
+    row can show a method but not the heading, and both are text, so a form
+    painted without its contents fails.
+    `appointment` is set only on the appointment's own page for a session ON the
+    payment date (V2) — the one place a visible "Start Billing" means THIS session
+    hasn't been billed.
+    """
+    def seen(text, exact=False):
+        try:
+            return _visible(page, text, exact).count() > 0
+        except Exception:
+            return False
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        if seen("Payment Amount") and seen("Credit Card"):
+            return
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(500)
+    # Only after the full wait: right after Accept Payment the appointment page,
+    # Start Billing and all, can still be on screen while the form loads.
+    if appointment and seen("Start Billing", exact=True):
+        raise Exception(SESSION_NOT_PAYABLE_REASON)
+    raise Exception(PAYMENT_FORM_NOT_READY_REASON)
+
+
+def fill_payment_form(page, amount, appointment=False):
     """Fill in the payment form fields.
 
     Uses label/placeholder-anchored selectors for the Payment Amount and
@@ -1761,6 +1843,7 @@ def fill_payment_form(page, amount):
     miss, and logs when the fallback fires.
     """
     print(f"  Entering amount: ${amount}")
+    _require_payment_form(page, appointment=appointment)
 
     payment_input = _resolve_payment_amount_input(page)
     if payment_input is None:
@@ -1779,8 +1862,14 @@ def fill_payment_form(page, amount):
                 continue
         if payment_input is None and all_inputs:
             payment_input = all_inputs[1] if len(all_inputs) > 1 else all_inputs[0]
+    if payment_input is None:
+        raise Exception(PAYMENT_FORM_NOT_READY_REASON)
 
-    payment_input.click(click_count=3)
+    try:
+        payment_input.click(click_count=3, timeout=10000)
+    except Exception:
+        # Nothing typed yet: a form that can't take a click is a form that isn't ready.
+        raise Exception(PAYMENT_FORM_NOT_READY_REASON)
     payment_input.fill(amount)
 
     print("  Selecting External Credit Card...")
@@ -2101,7 +2190,11 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
 
     try:
         date_note = click_appointment_by_date(page, date, name)
-        balance_note, balance_amount = click_accept_payment(page, name)
+        # Only TODAY's session, matched on the payment date, can be "not payable
+        # yet" — it may still be in progress. An earlier one that was never billed
+        # (a payment-plan payment, a backlog catch-up) keeps the old no-charge path.
+        same_day = date_note is None and _is_today(date)
+        balance_note, balance_amount = click_accept_payment(page, name, same_day=same_day)
     except Exception as e:
         if "FLAG" in str(e) or not _is_no_appointment_error(e):
             raise
@@ -2120,7 +2213,7 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
     notes = [n for n in (name_note, date_note, balance_note) if n]
     note = "; ".join(notes) if notes else None
 
-    fill_payment_form(page, amount)
+    fill_payment_form(page, amount, appointment=same_day)
     screenshot(page, f"payment_{name.replace(' ', '_')}_02_filled")
 
     # Past this point Continue/Save have been clicked and the money may already
@@ -2301,16 +2394,23 @@ def post_payment_v1(page, name, amount, dry_run=False):
     """V1 fallback: Billing > Take Payment > Search Charges."""
     print(f"  [V1 FALLBACK] Billing > Take Payment > Search Charges")
 
-    navigate_to_billing(page)
+    # Everything up to the client's charges appearing. Tagged so post_payment can
+    # tell "never reached a form" (retryable) from anything later.
+    try:
+        navigate_to_billing(page)
 
-    # Click Take Payment
-    print("  Clicking Take Payment...")
-    page.locator("text=Take Payment").first.click()
-    settle(page)
-    page.wait_for_timeout(1000)
+        # Click Take Payment
+        print("  Clicking Take Payment...")
+        page.locator("text=Take Payment").first.click()
+        settle(page)
+        page.wait_for_timeout(1000)
 
-    # Select client and search
-    select_client_v1(page, name)
+        # Select client and search
+        select_client_v1(page, name)
+    except Exception as e:
+        if "FLAG" in str(e):
+            raise                       # a judgement call, not a page that didn't load
+        raise Exception(f"{V1_BEFORE_FORM_TAG} {e}")
     screenshot(page, f"payment_{name.replace(' ', '_')}_v1_01_form")
 
     # Scrape the allocation date and check whether real charges exist.
@@ -2387,7 +2487,8 @@ def _is_balance_method(method):
     return (method or "").startswith("V2-balance")
 
 
-def post_payment(page, name, date, amount, dry_run=False, account=None):
+def post_payment(page, name, date, amount, dry_run=False, account=None,
+                 hold_for_session=False):
     """
     Post a payment with retry and fallback logic:
     1. Try V2 (Clients > Appointments > Accept Payment). When no appointment can
@@ -2405,6 +2506,8 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     `account` is the TA Account Number (Square reference_id); when present, V2
     matches the client by it deterministically and only falls back to name on a
     miss. V1 (the billing-autocomplete fallback) remains name-based.
+    `hold_for_session`: a poller retry of a payment waiting on today's session —
+    no open-balance fallback and no V1; if V2 can't post it, it waits again.
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
     reset_app_render_state()
@@ -2439,8 +2542,12 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
     # second miss means there really is no appointment, not a slow render. ---
     print(f"  Retrying V2...")
     try:
+        # Not after the first try found today's session unpayable: a miss on the
+        # retry is then a slow page, not a missing appointment, and the balance
+        # fallback would put today's money on an older session.
         ok, note, balance_amount, method = post_payment_v2(
-            page, name, date, amount, dry_run, account=account, allow_balance=True)
+            page, name, date, amount, dry_run, account=account,
+            allow_balance=not hold_for_session and v2_error != SESSION_NOT_PAYABLE_REASON)
         if not ok:
             raise Exception("V2-retry returned ok=False")
         posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
@@ -2456,10 +2563,25 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         if "FLAG" in v2_retry_error:
             return False, "FLAGGED", v2_retry_error, None, None, None, None
         print(f"  V2 retry failed: {v2_retry_error}")
-        print(f"  Falling back to V1...")
 
     # Combine V2 errors for reporting
     combined_v2_error = f"V2: {v2_error}; V2-retry: {v2_retry_error}"
+
+    # Today's session isn't payable yet. Leave it for
+    # the poller's hourly retry, which posts it to THIS session once it's over.
+    # V1 would let TA pick a charge — an older one, or with none, a FLAG that
+    # retries can't touch. (Jacob Legrand, 10/06, posted via V1 because his was
+    # the only charge; a retry an hour later would have put it in the same place.)
+    # Either leg is enough: the other one's miss is then a slow page. Record only
+    # the finding that matters, so the poller retries it: the other leg can't have
+    # submitted anything — a save that went dark returned FLAGGED above.
+    # `hold_for_session`: the poller already knows this payment is waiting on today's
+    # session, so a retry that only met a half-drawn page is the same situation.
+    if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error) or hold_for_session:
+        print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
+        return False, "FAILED", f"V2: {SESSION_NOT_PAYABLE_REASON}", None, None, None, None
+
+    print(f"  Falling back to V1...")
 
     # --- Attempt 3: V1 fallback ---
     try:
@@ -2482,6 +2604,12 @@ def post_payment(page, name, date, amount, dry_run=False, account=None):
         if "FLAG" in v1_error:
             return False, "FLAGGED", v1_error, None, None, None, None
         print(f"  V1 also failed: {v1_error}")
+        if v1_error.startswith(V1_BEFORE_FORM_TAG):
+            # Fixed wording the retry gate recognises, then the detail in brackets
+            # (brackets inside it neutralised, so the gate can strip it cleanly).
+            detail = v1_error[len(V1_BEFORE_FORM_TAG):].strip()
+            detail = detail.replace("[", "(").replace("]", ")")
+            v1_error = f"{V1_BEFORE_FORM_REASON} [{detail}]"
 
     # --- All attempts failed ---
     return False, "FAILED", f"{combined_v2_error}; V1: {v1_error}", None, None, None, None
@@ -2890,6 +3018,16 @@ def _classify_issue(reason):
                 "payment may or may not have saved. It deliberately did not try "
                 "another route. Check the client's ledger and post by hand only if "
                 "the payment isn't already there.")
+    if "appointment had no payment form yet" in r:
+        return ("Appointment not payable yet",
+                "The appointment offered no payment form — usually because the session "
+                "was in progress when the client paid. The bot usually retries these "
+                "that day; if it's still here, post it via Accept Payment on the appointment.")
+    if "payment form never became usable" in r:
+        return ("TA payment form didn't load",
+                "TA's payment form never finished loading, so nothing was entered or "
+                "submitted. The bot usually retries these itself; if it's still here, "
+                "post it by hand.")
     if "app not rendering" in r:
         return ("TherapyAppointment wasn't loading",
                 "TA served a blank page (its app failed to start), so the bot could "
