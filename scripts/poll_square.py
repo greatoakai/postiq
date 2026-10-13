@@ -98,17 +98,17 @@ OVERLAP_MIN = 5                            # re-scan window for eventual consist
 RETRY_WINDOW_MIN = 180                     # only failures this recent
 RETRY_MAX_ATTEMPTS = 2                     # per payment, then leave it for a person
 RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
-# A payment whose appointment offered no form yet (session in progress, or not
-# billed) waits on the session: keep trying, at most hourly, for the rest of the
-# day it was paid.
+# A payment whose appointment offered no form yet (session in progress, or a late
+# cancel not billed) waits on the session: retried at most hourly on the day it was
+# paid, and from SESSION_FALLBACK_HOUR posted to the open balance instead.
 # The morning report covers yesterday and earlier, never today, so a same-day
 # retry can't race staff working the report.
 RETRY_MAX_ATTEMPTS_SESSION = 24           # hourly within one day: never runs out before SESSION_FALLBACK_HOUR
 # Under the hour: runs fire on :00/:30 and stamp the failure or attempt minutes
 # into a run, so a full 60 would keep missing the next hourly run.
 RETRY_SPACING_SESSION = timedelta(minutes=50)
-# The day's last session-wait retry — its final attempt, or any from this hour on —
-# stops waiting and posts to the open balance (see bot_v2.post_payment). Aunicka
+# Session-wait retries from this hour on stop waiting and post to the open balance
+# (see bot_v2.post_payment). Aunicka
 # Tumbleson, 10/09/2026: a late cancel billed after the bot's last try at 9 PM.
 SESSION_FALLBACK_HOUR = 22
 CLEARED_PATH = bot.DATA_DIR / "manual_cleared.json"
@@ -482,12 +482,12 @@ def _session_wait_active(e, now=None):
     return _awaiting_session(e) and e.get("date") == now.astimezone().strftime("%m/%d/%Y")
 
 
-def _last_session_try(attempt, now=None):
+def _last_session_try(attempt=None, now=None):
     """Is this the day's last chance for a payment waiting on its session?
 
     The late-evening runs only: a morning prepayment for a 5 PM session must not
-    give up mid-afternoon. Hourly retries are bounded by the day, so the attempt
-    budget (RETRY_MAX_ATTEMPTS_SESSION) can't run out before then.
+    give up mid-afternoon. `attempt` is unused: hourly retries are bounded by the
+    day, so RETRY_MAX_ATTEMPTS_SESSION can't run out before then.
     """
     local = (now or datetime.now(timezone.utc)).astimezone()
     return local.hour >= SESSION_FALLBACK_HOUR
@@ -564,9 +564,14 @@ def retry_candidates(posted_ids):
             failed_at = _retryable_row(e, posted_ids, cleared, cutoff, now=now)
             if failed_at:
                 out.append((failed_at, e))
-    # Ordinary failures first: they have a three-hour window, while a payment
-    # waiting on its session has all day and must not crowd them out of the run's slots.
-    out.sort(key=lambda pair: (_session_wait_active(pair[1], now), pair[0]))
+    # Ordinary failures before session waits — those have all day — except in the
+    # evening, when a session wait's fallback can only happen in these few runs.
+    evening = _last_session_try(0, now)
+
+    def rank(pair):
+        waiting = _session_wait_active(pair[1], now)
+        return (0 if waiting and evening else 2 if waiting else 1, pair[0])
+    out.sort(key=rank)
     return [e for _stamp, e in out[:RETRY_MAX_PER_RUN]]
 
 

@@ -154,6 +154,33 @@ class PostPaymentPassThroughTest(unittest.TestCase):
             self.assertTrue(ps._reason_is_only_retryable(error), "must stay in the hourly retries")
 
 
+class RescheduledNeverV1Test(PostPaymentPassThroughTest):
+    def test_failed_balance_post_on_a_rescheduled_day_skips_v1(self):
+        errs = ["No active appointment on 10/09/2026 for Sam: every one that day was "
+                "rescheduled or cancelled", "Take Payment form did not load for Sam"]
+        def v2(*a, **k):
+            raise Exception(errs.pop(0))
+        bot.post_payment_v2 = v2
+        v1 = []
+        saved = bot.post_payment_v1
+        bot.post_payment_v1 = lambda *a, **k: v1.append(1) or (True, "Posted ✓")
+        try:
+            ok, status, *_ = bot.post_payment(None, "Sam", "10/09/2026", "35.00")
+        finally:
+            bot.post_payment_v1 = saved
+        self.assertEqual((ok, status, v1), (False, "FAILED", []))
+
+    def test_last_try_lets_a_cancelled_held_session_use_the_balance(self):
+        seen = []
+        def v2(*a, **k):
+            seen.append(k.get("allow_balance"))
+            raise Exception(bot.PAYMENT_FORM_NOT_READY_REASON)
+        bot.post_payment_v2 = v2
+        bot.post_payment(None, "Pat", "10/09/2026", "5.00", hold_for_session=True,
+                         session_fallback=True)
+        self.assertEqual(seen, [False, True])
+
+
 class LastSessionTryTest(unittest.TestCase):
     def _at(self, hour):
         local = datetime.now().astimezone().replace(hour=hour, minute=0)

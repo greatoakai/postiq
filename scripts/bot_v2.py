@@ -2199,6 +2199,9 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
         print(f"  {why}")
         ok, bal_note, due_now = post_payment_to_balance(
             page, name, amount, dry_run, profile_url=profile_url, date=date)
+        if extra_note and bal_note:
+            # Its lead-in ("No appointment matched the ... payment") contradicts ours.
+            bal_note = re.sub(r"^No appointment matched [^—]*— ", "", bal_note)
         notes = [n for n in (name_note, extra_note, bal_note) if n]
         return ok, ("; ".join(notes) if notes else None), due_now, "V2-balance"
 
@@ -2584,7 +2587,8 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
         # fallback would put today's money on an older session.
         ok, note, balance_amount, method = post_payment_v2(
             page, name, date, amount, dry_run, account=account,
-            allow_balance=not hold_for_session and v2_error != SESSION_NOT_PAYABLE_REASON,
+            allow_balance=(session_fallback
+                           or (not hold_for_session and v2_error != SESSION_NOT_PAYABLE_REASON)),
             session_fallback=session_fallback)
         if not ok:
             raise Exception("V2-retry returned ok=False")
@@ -2623,6 +2627,12 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
     if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error) or hold_for_session:
         print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
         return False, "FAILED", f"V2: {SESSION_NOT_PAYABLE_REASON}", None, None, None, None
+    if "rescheduled or cancelled" in f"{v2_error} {v2_retry_error}":
+        # The day was rescheduled/cancelled and the open-balance post didn't happen.
+        # V1 would let TA pick a charge and record nowhere which: leave it for a
+        # person. (A held payment never gets here: it waits for the 22:00 fallback,
+        # whose V2 retry may use the open balance.)
+        return False, "FAILED", combined_v2_error, None, None, None, None
 
     print(f"  Falling back to V1...")
 
