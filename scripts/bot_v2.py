@@ -249,6 +249,16 @@ def screenshot(page, name):
     return path
 
 
+def diag_screenshot(page, name):
+    """A screenshot for diagnosis only: a failure here (they do time out) must never
+    replace the real reason a payment didn't post."""
+    try:
+        return screenshot(page, name)
+    except Exception as e:
+        print(f"  (diagnostic screenshot {name} failed: {e})")
+        return None
+
+
 def read_csv(csv_path):
     """Read payment CSV and return list of dicts with name, date, and amount."""
     payments = []
@@ -384,8 +394,8 @@ APP_NOT_RENDERING_REASON = ("TA app not rendering (blank page with no sidebar "
 # still spinning. Raised before any field is filled; the poller retries it hourly
 # for the rest of the day, by when the session is over and V2 works. Same wording
 # rules as above.
-SESSION_NOT_PAYABLE_REASON = ("Appointment had no payment form yet (session in "
-                              "progress or not billed)")
+SESSION_NOT_PAYABLE_REASON = ("Appointment had no payment form yet (not billed yet: "
+                              "session in progress or late cancel)")
 
 # TA's payment form never became usable: absent, or drawn without its text (TA
 # sometimes paints the form's frame long before its contents). Raised before any
@@ -1513,21 +1523,15 @@ def click_appointment_by_date(page, date_str, name):
 
     if date_links:
         # Rows exist on the date but every one was rescheduled or plainly
-        # cancelled, so we know the session moved but not where to.
-        #
-        # Neither automatic path can finish this safely. The nearby-date scan
-        # only looks at dates BEFORE the payment, so a session moved to a LATER
-        # date is unfindable there. V1 doesn't use the date at all — it lets TA
-        # allocate to an outstanding charge, and per cb13f95 returns "Posted ✓"
-        # rather than a date because that allocation is unreliable, so a
-        # misallocation would leave no record of where the money went.
-        #
-        # FLAG stops both (post_payment short-circuits on it) and puts the
-        # payment on the morning report, where reconcile explains it in staff
-        # terms. A person can see where the appointment moved in two clicks.
+        # cancelled. The money is for an earlier session that's still open —
+        # Sam Clark, 10/09/2026: his 10/09 appointment was moved, and staff put
+        # the $35 on his 09/26 session. "No active appointment" is a no-date-of-
+        # service marker, so the V2 retry posts it to the client's open balance,
+        # oldest charge first (and a client who owes nothing gets a credit TA
+        # applies to the next charge, which the report lists for a check).
         raise Exception(
-            f"FLAG: every appointment on {ta_date} for {name} is rescheduled or cancelled "
-            f"— needs manual review"
+            f"No active appointment on {ta_date} for {name}: every one that day was "
+            f"rescheduled or cancelled"
         )
 
     # --- Step 2: No exact match — scan for nearby dates (up to 60 days prior) ---
@@ -1689,6 +1693,7 @@ def click_accept_payment(page, name, same_day=False):
                 # Today's session with no Accept Payment hasn't got its charge yet
                 # (in progress, or not billed). Never "no charge to take": that
                 # reroutes today's money to an older session's balance.
+                diag_screenshot(page, f"payment_{name.replace(' ', '_')}_no_payment_form")
                 raise Exception(SESSION_NOT_PAYABLE_REASON)
             raise Exception(
                 f"NO_ACCEPT_PAYMENT: the appointment matched for {name} offers no "
@@ -1830,6 +1835,7 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     # Only after the full wait: right after Accept Payment the appointment page,
     # Start Billing and all, can still be on screen while the form loads.
     if appointment and seen("Start Billing", exact=True):
+        diag_screenshot(page, "no_payment_form")
         raise Exception(SESSION_NOT_PAYABLE_REASON)
     raise Exception(PAYMENT_FORM_NOT_READY_REASON)
 
@@ -2162,7 +2168,7 @@ def post_payment_to_balance(page, name, amount, dry_run=False, profile_url=None,
 
 
 def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
-                    allow_balance=True):
+                    allow_balance=True, session_fallback=False):
     """V2 flow: Clients > Appointments > Accept Payment.
 
     When no appointment can take the payment — none on or near the transaction
@@ -2188,6 +2194,13 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
     navigate_to_appointments(page)
     ensure_date_filters(page)
 
+    def to_balance(why):
+        print(f"  {why}")
+        ok, bal_note, due_now = post_payment_to_balance(
+            page, name, amount, dry_run, profile_url=profile_url, date=date)
+        notes = [n for n in (name_note, bal_note) if n]
+        return ok, ("; ".join(notes) if notes else None), due_now, "V2-balance"
+
     try:
         date_note = click_appointment_by_date(page, date, name)
         # Only TODAY's session, matched on the payment date, can be "not payable
@@ -2196,16 +2209,16 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
         same_day = date_note is None and _is_today(date)
         balance_note, balance_amount = click_accept_payment(page, name, same_day=same_day)
     except Exception as e:
+        if session_fallback and str(e) == SESSION_NOT_PAYABLE_REASON:
+            return to_balance("Today's session never became payable — applying it to "
+                              "the open balance...")
         if "FLAG" in str(e) or not _is_no_appointment_error(e):
             raise
         if not allow_balance:
             raise
         print(f"  {e}")
-        print("  No date of service for this payment — applying it to the open balance...")
-        ok, bal_note, due_now = post_payment_to_balance(
-            page, name, amount, dry_run, profile_url=profile_url, date=date)
-        notes = [n for n in (name_note, bal_note) if n]
-        return ok, ("; ".join(notes) if notes else None), due_now, "V2-balance"
+        return to_balance("No date of service for this payment — applying it to the "
+                          "open balance...")
 
     screenshot(page, f"payment_{name.replace(' ', '_')}_01_form")
 
@@ -2213,7 +2226,14 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
     notes = [n for n in (name_note, date_note, balance_note) if n]
     note = "; ".join(notes) if notes else None
 
-    fill_payment_form(page, amount, appointment=same_day)
+    try:
+        fill_payment_form(page, amount, appointment=same_day)
+    except Exception as e:
+        # Nothing has been typed when this is raised (see _require_payment_form).
+        if session_fallback and str(e) == SESSION_NOT_PAYABLE_REASON:
+            return to_balance("Today's session never became payable — applying it to "
+                              "the open balance...")
+        raise
     screenshot(page, f"payment_{name.replace(' ', '_')}_02_filled")
 
     # Past this point Continue/Save have been clicked and the money may already
@@ -2488,7 +2508,7 @@ def _is_balance_method(method):
 
 
 def post_payment(page, name, date, amount, dry_run=False, account=None,
-                 hold_for_session=False):
+                 hold_for_session=False, session_fallback=False):
     """
     Post a payment with retry and fallback logic:
     1. Try V2 (Clients > Appointments > Accept Payment). When no appointment can
@@ -2508,6 +2528,9 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
     miss. V1 (the billing-autocomplete fallback) remains name-based.
     `hold_for_session`: a poller retry of a payment waiting on today's session —
     no open-balance fallback and no V1; if V2 can't post it, it waits again.
+    `session_fallback`: the LAST such retry of the day. If today's session still
+    isn't payable, post to the open balance instead of waiting (oldest charge
+    first; with nothing open TA keeps it as a credit for the next charge).
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
     reset_app_render_state()
@@ -2518,7 +2541,8 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
     v2_error = None
     try:
         ok, note, balance_amount, method = post_payment_v2(
-            page, name, date, amount, dry_run, account=account, allow_balance=False)
+            page, name, date, amount, dry_run, account=account, allow_balance=False,
+            session_fallback=session_fallback)
         if not ok:
             raise Exception("V2 returned ok=False")
         posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
@@ -2547,7 +2571,8 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
         # fallback would put today's money on an older session.
         ok, note, balance_amount, method = post_payment_v2(
             page, name, date, amount, dry_run, account=account,
-            allow_balance=not hold_for_session and v2_error != SESSION_NOT_PAYABLE_REASON)
+            allow_balance=not hold_for_session and v2_error != SESSION_NOT_PAYABLE_REASON,
+            session_fallback=session_fallback)
         if not ok:
             raise Exception("V2-retry returned ok=False")
         posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None

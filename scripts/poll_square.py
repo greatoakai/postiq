@@ -107,6 +107,10 @@ RETRY_MAX_ATTEMPTS_SESSION = 8
 # Under the hour: runs fire on :00/:30 and stamp the failure or attempt minutes
 # into a run, so a full 60 would keep missing the next hourly run.
 RETRY_SPACING_SESSION = timedelta(minutes=50)
+# The day's last session-wait retry — its final attempt, or any from this hour on —
+# stops waiting and posts to the open balance (see bot_v2.post_payment). Aunicka
+# Tumbleson, 10/09/2026: a late cancel billed after the bot's last try at 9 PM.
+SESSION_FALLBACK_HOUR = 22
 CLEARED_PATH = bot.DATA_DIR / "manual_cleared.json"
 LOCK_PATH = bot.DATA_DIR / "poll_square.lock"
 # Written by reconcile (REPORT_STAMP_FILENAME there): started_at before the morning report reads
@@ -473,6 +477,12 @@ def _session_wait_active(e, now=None):
     today; after that it's an ordinary failure again."""
     now = now or datetime.now(timezone.utc)
     return _awaiting_session(e) and e.get("date") == now.astimezone().strftime("%m/%d/%Y")
+
+
+def _last_session_try(attempt, now=None):
+    """Is this the day's last chance for a payment waiting on its session?"""
+    local = (now or datetime.now(timezone.utc)).astimezone()
+    return attempt >= RETRY_MAX_ATTEMPTS_SESSION or local.hour >= SESSION_FALLBACK_HOUR
 
 
 def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
@@ -1075,6 +1085,8 @@ def post_new_payments(to_post, posted_ids, on_result=None):
                     kwargs = {"account": item.get("account")}
                     if item.get("hold_for_session"):
                         kwargs["hold_for_session"] = True
+                    if item.get("session_fallback"):
+                        kwargs["session_fallback"] = True
                     success, method, error, note, *extra = bot.post_payment(
                         page, item["name"], item["date"], item["amount"], **kwargs)
                     # (..., posted_date, v2_error, balance_amount): TA's "Due From
@@ -1400,7 +1412,8 @@ def main():
                         # A same-day session wait isn't on any report (see
                         # RETRY_MAX_ATTEMPTS_SESSION), so there's no report to race.
                         "retry_failed_at": None if session_wait else row.get("failed_at"),
-                        "hold_for_session": session_wait})
+                        "hold_for_session": session_wait,
+                        "session_fallback": session_wait and _last_session_try(attempt)})
         limit = RETRY_MAX_ATTEMPTS_SESSION if session_wait else RETRY_MAX_ATTEMPTS
         log(f"  RETRY {name} ${amount} on {date} — earlier failure could not have reached "
             f"TA's payment form (attempt {attempt} of {limit})")

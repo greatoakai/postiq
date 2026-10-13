@@ -376,8 +376,9 @@ def explain(status, reason, name):
     # appointment with no payment form. That, not the miss, is what staff act on.
     if "appointment had no payment form yet" in (reason or "").lower():
         return ("The appointment didn't offer a payment form yet — usually the session was "
-                "in progress when the client paid. The bot retries these during the day they "
-                "were paid, but this one still hadn't posted.",
+                "in progress, or a late cancel not yet billed, when the client paid. The bot "
+                "retries these during the day and then posts them to the open balance, but "
+                "this one still hadn't posted.",
                 "Check the ledger as usual, then post it with Accept Payment on that appointment.")
     if "no appointment found" in r:
         return ("The client is in TA, but had no appointment on the date of the payment.",
