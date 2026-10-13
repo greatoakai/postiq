@@ -103,7 +103,7 @@ RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
 # day it was paid.
 # The morning report covers yesterday and earlier, never today, so a same-day
 # retry can't race staff working the report.
-RETRY_MAX_ATTEMPTS_SESSION = 16           # hourly from failure: enough to reach SESSION_FALLBACK_HOUR
+RETRY_MAX_ATTEMPTS_SESSION = 24           # hourly within one day: never runs out before SESSION_FALLBACK_HOUR
 # Under the hour: runs fire on :00/:30 and stamp the failure or attempt minutes
 # into a run, so a full 60 would keep missing the next hourly run.
 RETRY_SPACING_SESSION = timedelta(minutes=50)
@@ -485,14 +485,12 @@ def _session_wait_active(e, now=None):
 def _last_session_try(attempt, now=None):
     """Is this the day's last chance for a payment waiting on its session?
 
-    Mainly the late-evening runs: a morning prepayment for a 5 PM session must not
-    give up mid-afternoon. Running out of attempts only counts once the working
-    day is over (a payment that failed before dawn).
+    The late-evening runs only: a morning prepayment for a 5 PM session must not
+    give up mid-afternoon. Hourly retries are bounded by the day, so the attempt
+    budget (RETRY_MAX_ATTEMPTS_SESSION) can't run out before then.
     """
     local = (now or datetime.now(timezone.utc)).astimezone()
-    if local.hour >= SESSION_FALLBACK_HOUR:
-        return True
-    return attempt >= RETRY_MAX_ATTEMPTS_SESSION and local.hour >= 18
+    return local.hour >= SESSION_FALLBACK_HOUR
 
 
 def _retryable_row(e, posted_ids, cleared, cutoff, now=None):

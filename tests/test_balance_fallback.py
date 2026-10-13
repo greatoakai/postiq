@@ -111,7 +111,7 @@ class SessionFallbackTest(unittest.TestCase):
 
     def test_also_when_the_form_check_finds_it(self):
         bot.click_accept_payment = lambda page, name, same_day=False: (None, None)
-        bot.fill_payment_form = lambda page, amount, appointment=False: self._unpayable()
+        bot.fill_payment_form = lambda page, amount, appointment=False, label="": self._unpayable()
         ok, note, due, method = bot.post_payment_v2(self._P(), "Brittni Baker", "10/09/2026",
                                                     "5.00", session_fallback=True)
         self.assertEqual((ok, method, self.balance), (True, "V2-balance", ["5.00"]))
@@ -141,15 +141,17 @@ class PostPaymentPassThroughTest(unittest.TestCase):
                          session_fallback=True)
         self.assertEqual(seen, [False, True], "a slow first page gets a plain retry first")
 
-    def test_a_broken_fallback_reports_its_real_error(self):
-        errs = [bot.SESSION_NOT_PAYABLE_REASON, "Could not open the client's Billing tab"]
-        def v2(*a, **k):
-            raise Exception(errs.pop(0))
-        bot.post_payment_v2 = v2
-        ok, status, error, *_ = bot.post_payment(None, "Pat", "10/09/2026", "5.00",
-                                                 hold_for_session=True, session_fallback=True)
-        self.assertEqual(status, "FAILED")
-        self.assertIn("Billing tab", error)
+    def test_any_failure_on_a_held_try_keeps_it_waiting(self):
+        for errs in (["No appointment found on 10/13/2026 for Pat", bot.PAYMENT_FORM_NOT_READY_REASON],
+                     [bot.SESSION_NOT_PAYABLE_REASON, "Could not open the client's Billing tab"]):
+            seq = list(errs)
+            def v2(*a, **k):
+                raise Exception(seq.pop(0))
+            bot.post_payment_v2 = v2
+            ok, status, error, *_ = bot.post_payment(None, "Pat", "10/13/2026", "5.00",
+                                                     hold_for_session=True, session_fallback=True)
+            self.assertEqual(status, "FAILED")
+            self.assertTrue(ps._reason_is_only_retryable(error), "must stay in the hourly retries")
 
 
 class LastSessionTryTest(unittest.TestCase):
@@ -157,12 +159,15 @@ class LastSessionTryTest(unittest.TestCase):
         local = datetime.now().astimezone().replace(hour=hour, minute=0)
         return local.astimezone(timezone.utc)
 
-    def test_late_evening_or_out_of_attempts_after_hours(self):
+    def test_late_evening_only(self):
         self.assertTrue(ps._last_session_try(3, self._at(ps.SESSION_FALLBACK_HOUR)))
         self.assertFalse(ps._last_session_try(3, self._at(14)))
-        self.assertFalse(ps._last_session_try(ps.RETRY_MAX_ATTEMPTS_SESSION, self._at(14)),
+        self.assertFalse(ps._last_session_try(15, self._at(16)),
                          "a morning prepayment for a 5 PM session must not give up at 4 PM")
-        self.assertTrue(ps._last_session_try(ps.RETRY_MAX_ATTEMPTS_SESSION, self._at(19)))
+
+    def test_attempts_last_the_whole_day(self):
+        # hourly from a 00:30 failure, the 22:00 run is attempt ~21
+        self.assertGreater(ps.RETRY_MAX_ATTEMPTS_SESSION, 22)
 
     def test_legacy_wording_still_recognised(self):
         legacy = f"V2: {bot.SESSION_NOT_PAYABLE_LEGACY}"

@@ -1808,7 +1808,7 @@ def _visible(page, text, exact=False):
     return page.locator(f"{sel} >> visible=true")
 
 
-def _require_payment_form(page, timeout_ms=10000, appointment=False):
+def _require_payment_form(page, timeout_ms=10000, appointment=False, label="payment"):
     """Raise unless TA's payment form is on screen and drawn.
 
     The form's signature is its "Payment Amount" heading together with the
@@ -1836,12 +1836,12 @@ def _require_payment_form(page, timeout_ms=10000, appointment=False):
     # Only after the full wait: right after Accept Payment the appointment page,
     # Start Billing and all, can still be on screen while the form loads.
     if appointment and seen("Start Billing", exact=True):
-        diag_screenshot(page, "no_payment_form")
+        diag_screenshot(page, f"{label}_no_payment_form")
         raise Exception(SESSION_NOT_PAYABLE_REASON)
     raise Exception(PAYMENT_FORM_NOT_READY_REASON)
 
 
-def fill_payment_form(page, amount, appointment=False):
+def fill_payment_form(page, amount, appointment=False, label="payment"):
     """Fill in the payment form fields.
 
     Uses label/placeholder-anchored selectors for the Payment Amount and
@@ -1850,7 +1850,7 @@ def fill_payment_form(page, amount, appointment=False):
     miss, and logs when the fallback fires.
     """
     print(f"  Entering amount: ${amount}")
-    _require_payment_form(page, appointment=appointment)
+    _require_payment_form(page, appointment=appointment, label=label)
 
     payment_input = _resolve_payment_amount_input(page)
     if payment_input is None:
@@ -2239,7 +2239,8 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
     note = "; ".join(notes) if notes else None
 
     try:
-        fill_payment_form(page, amount, appointment=same_day)
+        fill_payment_form(page, amount, appointment=same_day,
+                          label=f"payment_{name.replace(' ', '_')}")
     except Exception as e:
         # Nothing has been typed when this is raised (see _require_payment_form).
         fallback = unpayable_session_fallback(e)
@@ -2614,20 +2615,14 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
     # submitted anything — a save that went dark returned FLAGGED above.
     # `hold_for_session`: the poller already knows this payment is waiting on today's
     # session, so a retry that only met a half-drawn page is the same situation.
-    pre_form = (SESSION_NOT_PAYABLE_REASON, PAYMENT_FORM_NOT_READY_REASON, APP_NOT_RENDERING_REASON)
-    if session_fallback and v2_retry_error not in pre_form:
-        # The day's last try, and the second V2 try — which carries the open-balance
-        # fallback — broke for some other reason. Report that, not "not billed yet",
-        # and keep V1 away from today's money.
-        return False, "FAILED", combined_v2_error, None, None, None, None
-    if (SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error)
-            or (hold_for_session and all(e in pre_form for e in (v2_error, v2_retry_error)))):
+    # A payment the poller already knows is waiting on today's session keeps
+    # waiting whatever stopped this try (a slow page, or on a last try the open-
+    # balance post itself): any reason it records other than this one would take
+    # it out of the hourly retries, including the late-evening fallback. What
+    # actually happened is in the run log above.
+    if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error) or hold_for_session:
         print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
         return False, "FAILED", f"V2: {SESSION_NOT_PAYABLE_REASON}", None, None, None, None
-    if hold_for_session:
-        # Something else broke (on a last try, possibly the open-balance post
-        # itself). Report it as it is, and still keep V1 away from today's money.
-        return False, "FAILED", combined_v2_error, None, None, None, None
 
     print(f"  Falling back to V1...")
 
@@ -3068,9 +3063,10 @@ def _classify_issue(reason):
                 "the payment isn't already there.")
     if "appointment had no payment form yet" in r:
         return ("Appointment not payable yet",
-                "The appointment offered no payment form — usually because the session "
-                "was in progress when the client paid. The bot usually retries these "
-                "that day; if it's still here, post it via Accept Payment on the appointment.")
+                "The appointment offered no payment form — the session was in progress, "
+                "or a late cancel not yet billed, when the client paid. The bot retries "
+                "these hourly that day and from 10 PM posts them to the open balance; if "
+                "it's still here, post it via Accept Payment on the appointment.")
     if "payment form never became usable" in r:
         return ("TA payment form didn't load",
                 "TA's payment form never finished loading, so nothing was entered or "
