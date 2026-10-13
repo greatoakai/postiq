@@ -103,7 +103,7 @@ RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
 # day it was paid.
 # The morning report covers yesterday and earlier, never today, so a same-day
 # retry can't race staff working the report.
-RETRY_MAX_ATTEMPTS_SESSION = 8
+RETRY_MAX_ATTEMPTS_SESSION = 16           # hourly from failure: enough to reach SESSION_FALLBACK_HOUR
 # Under the hour: runs fire on :00/:30 and stamp the failure or attempt minutes
 # into a run, so a full 60 would keep missing the next hourly run.
 RETRY_SPACING_SESSION = timedelta(minutes=50)
@@ -128,6 +128,7 @@ REPORT_RUN_GRACE = timedelta(hours=1)
 # The rest are raised before any field is touched — see SESSION_NOT_PAYABLE_REASON,
 # PAYMENT_FORM_NOT_READY_REASON and V1_BEFORE_FORM_REASON in bot_v2.
 RETRYABLE_REASONS = (bot.APP_NOT_RENDERING_REASON, bot.SESSION_NOT_PAYABLE_REASON,
+                     bot.SESSION_NOT_PAYABLE_LEGACY,
                      bot.PAYMENT_FORM_NOT_READY_REASON, bot.V1_BEFORE_FORM_REASON)
 
 # The leg labels post_payment chains reasons with ("V2: ...; V2-retry: ...; V1: ...").
@@ -469,7 +470,9 @@ def _awaiting_session(e):
     Sticky: a later attempt that only meets a half-drawn form mustn't demote it
     back to an ordinary failure with two attempts and a three-hour window.
     """
-    return bool(e.get("awaiting_session")) or bot.SESSION_NOT_PAYABLE_REASON in (e.get("reason") or "")
+    reason = e.get("reason") or ""
+    return bool(e.get("awaiting_session")) or any(
+        r in reason for r in (bot.SESSION_NOT_PAYABLE_REASON, bot.SESSION_NOT_PAYABLE_LEGACY))
 
 
 def _session_wait_active(e, now=None):
@@ -480,9 +483,16 @@ def _session_wait_active(e, now=None):
 
 
 def _last_session_try(attempt, now=None):
-    """Is this the day's last chance for a payment waiting on its session?"""
+    """Is this the day's last chance for a payment waiting on its session?
+
+    Mainly the late-evening runs: a morning prepayment for a 5 PM session must not
+    give up mid-afternoon. Running out of attempts only counts once the working
+    day is over (a payment that failed before dawn).
+    """
     local = (now or datetime.now(timezone.utc)).astimezone()
-    return attempt >= RETRY_MAX_ATTEMPTS_SESSION or local.hour >= SESSION_FALLBACK_HOUR
+    if local.hour >= SESSION_FALLBACK_HOUR:
+        return True
+    return attempt >= RETRY_MAX_ATTEMPTS_SESSION and local.hour >= 18
 
 
 def _retryable_row(e, posted_ids, cleared, cutoff, now=None):

@@ -396,6 +396,9 @@ APP_NOT_RENDERING_REASON = ("TA app not rendering (blank page with no sidebar "
 # rules as above.
 SESSION_NOT_PAYABLE_REASON = ("Appointment had no payment form yet (not billed yet: "
                               "session in progress or late cancel)")
+# The wording before 10/13/2026: ledger rows written with it must still be recognised.
+SESSION_NOT_PAYABLE_LEGACY = ("Appointment had no payment form yet (session in "
+                              "progress or not billed)")
 
 # TA's payment form never became usable: absent, or drawn without its text (TA
 # sometimes paints the form's frame long before its contents). Raised before any
@@ -1473,10 +1476,8 @@ def click_appointment_by_date(page, date_str, name):
     Resolution order:
       1. Exact date match on the transaction date, among rows that are valid
          posting targets. If rows exist on the date but none is a valid target
-         (all rescheduled or cancelled), FLAG for manual review — we know the
-         session moved but not where to, and neither the nearby-date scan (past
-         dates only) nor V1 (allocates by outstanding charge, not by date) can
-         settle that without risking a misallocation.
+         (all rescheduled or cancelled), raise "no active appointment" so the
+         V2 retry posts to the client's open balance, oldest charge first.
       2. If no rows at all on the date, scan visible appointment links within
          APPT_MATCH_LOOKBACK_DAYS prior, keep only valid posting targets
          (_appt_target_eligible — Active / chargeable cancellation, never a
@@ -2194,12 +2195,23 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
     navigate_to_appointments(page)
     ensure_date_filters(page)
 
-    def to_balance(why):
+    def to_balance(why, extra_note=None):
         print(f"  {why}")
         ok, bal_note, due_now = post_payment_to_balance(
             page, name, amount, dry_run, profile_url=profile_url, date=date)
-        notes = [n for n in (name_note, bal_note) if n]
+        notes = [n for n in (name_note, extra_note, bal_note) if n]
         return ok, ("; ".join(notes) if notes else None), due_now, "V2-balance"
+
+    def unpayable_session_fallback(e):
+        """The day's last try and today's session still isn't payable: post to the
+        open balance, and say so — if the session is billed later, staff may want
+        to move the payment onto it."""
+        if not (session_fallback and str(e) == SESSION_NOT_PAYABLE_REASON):
+            return None
+        return to_balance(
+            "Today's session never became payable — applying it to the open balance...",
+            f"Today's ({date}) appointment still wasn't billed at the end of the day, so this "
+            f"went to the open balance — if that session is billed later, move it there")
 
     try:
         date_note = click_appointment_by_date(page, date, name)
@@ -2209,9 +2221,9 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
         same_day = date_note is None and _is_today(date)
         balance_note, balance_amount = click_accept_payment(page, name, same_day=same_day)
     except Exception as e:
-        if session_fallback and str(e) == SESSION_NOT_PAYABLE_REASON:
-            return to_balance("Today's session never became payable — applying it to "
-                              "the open balance...")
+        fallback = unpayable_session_fallback(e)
+        if fallback:
+            return fallback
         if "FLAG" in str(e) or not _is_no_appointment_error(e):
             raise
         if not allow_balance:
@@ -2230,9 +2242,9 @@ def post_payment_v2(page, name, date, amount, dry_run=False, account=None,
         fill_payment_form(page, amount, appointment=same_day)
     except Exception as e:
         # Nothing has been typed when this is raised (see _require_payment_form).
-        if session_fallback and str(e) == SESSION_NOT_PAYABLE_REASON:
-            return to_balance("Today's session never became payable — applying it to "
-                              "the open balance...")
+        fallback = unpayable_session_fallback(e)
+        if fallback:
+            return fallback
         raise
     screenshot(page, f"payment_{name.replace(' ', '_')}_02_filled")
 
@@ -2529,7 +2541,8 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
     `hold_for_session`: a poller retry of a payment waiting on today's session —
     no open-balance fallback and no V1; if V2 can't post it, it waits again.
     `session_fallback`: the LAST such retry of the day. If today's session still
-    isn't payable, post to the open balance instead of waiting (oldest charge
+    isn't payable on the second V2 try (the first may just be a slow page), post
+    to the open balance instead of waiting (oldest charge
     first; with nothing open TA keeps it as a credit for the next charge).
     """
     print(f"\n--- Payment: {name} — ${amount} on {date} ---")
@@ -2541,8 +2554,7 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
     v2_error = None
     try:
         ok, note, balance_amount, method = post_payment_v2(
-            page, name, date, amount, dry_run, account=account, allow_balance=False,
-            session_fallback=session_fallback)
+            page, name, date, amount, dry_run, account=account, allow_balance=False)
         if not ok:
             raise Exception("V2 returned ok=False")
         posted = BALANCE_POSTED_LABEL if _is_balance_method(method) else None
@@ -2602,9 +2614,20 @@ def post_payment(page, name, date, amount, dry_run=False, account=None,
     # submitted anything — a save that went dark returned FLAGGED above.
     # `hold_for_session`: the poller already knows this payment is waiting on today's
     # session, so a retry that only met a half-drawn page is the same situation.
-    if SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error) or hold_for_session:
+    pre_form = (SESSION_NOT_PAYABLE_REASON, PAYMENT_FORM_NOT_READY_REASON, APP_NOT_RENDERING_REASON)
+    if session_fallback and v2_retry_error not in pre_form:
+        # The day's last try, and the second V2 try — which carries the open-balance
+        # fallback — broke for some other reason. Report that, not "not billed yet",
+        # and keep V1 away from today's money.
+        return False, "FAILED", combined_v2_error, None, None, None, None
+    if (SESSION_NOT_PAYABLE_REASON in (v2_error, v2_retry_error)
+            or (hold_for_session and all(e in pre_form for e in (v2_error, v2_retry_error)))):
         print("  Today's session isn't payable yet — leaving it for a later retry, not V1.")
         return False, "FAILED", f"V2: {SESSION_NOT_PAYABLE_REASON}", None, None, None, None
+    if hold_for_session:
+        # Something else broke (on a last try, possibly the open-balance post
+        # itself). Report it as it is, and still keep V1 away from today's money.
+        return False, "FAILED", combined_v2_error, None, None, None, None
 
     print(f"  Falling back to V1...")
 

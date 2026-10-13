@@ -385,8 +385,8 @@ def explain(status, reason, name):
                 "Post the payment to the correct appointment, or to the client's open balance "
                 "if there isn't one for that day.")
     if "rescheduled or cancelled" in r:
-        return ("Every appointment the client had that day was rescheduled or cancelled, so the "
-                "bot couldn't tell which session the payment belongs to.",
+        return ("Every appointment the client had that day was rescheduled or cancelled. The "
+                "bot tries those on the client's open balance, but this one didn't post.",
                 "Find where the appointment moved to and post the payment there — or to the "
                 "client's open balance if the session didn't happen.")
     # Checked below may-have-posted, never above it. The wording stops short of
