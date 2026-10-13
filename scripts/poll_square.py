@@ -98,15 +98,19 @@ OVERLAP_MIN = 5                            # re-scan window for eventual consist
 RETRY_WINDOW_MIN = 180                     # only failures this recent
 RETRY_MAX_ATTEMPTS = 2                     # per payment, then leave it for a person
 RETRY_MAX_PER_RUN = 5                      # never let a backlog stall a run
-# A payment whose appointment offered no form yet (session in progress, or not
-# billed) waits on the session: keep trying, at most hourly, for the rest of the
-# day it was paid.
+# A payment whose appointment offered no form yet (session in progress, or a late
+# cancel not billed) waits on the session: retried at most hourly on the day it was
+# paid, and from SESSION_FALLBACK_HOUR posted to the open balance instead.
 # The morning report covers yesterday and earlier, never today, so a same-day
 # retry can't race staff working the report.
-RETRY_MAX_ATTEMPTS_SESSION = 8
+RETRY_MAX_ATTEMPTS_SESSION = 24           # hourly within one day: never runs out before SESSION_FALLBACK_HOUR
 # Under the hour: runs fire on :00/:30 and stamp the failure or attempt minutes
 # into a run, so a full 60 would keep missing the next hourly run.
 RETRY_SPACING_SESSION = timedelta(minutes=50)
+# Session-wait retries from this hour on stop waiting and post to the open balance
+# (see bot_v2.post_payment). Aunicka
+# Tumbleson, 10/09/2026: a late cancel billed after the bot's last try at 9 PM.
+SESSION_FALLBACK_HOUR = 22
 CLEARED_PATH = bot.DATA_DIR / "manual_cleared.json"
 LOCK_PATH = bot.DATA_DIR / "poll_square.lock"
 # Written by reconcile (REPORT_STAMP_FILENAME there): started_at before the morning report reads
@@ -124,6 +128,7 @@ REPORT_RUN_GRACE = timedelta(hours=1)
 # The rest are raised before any field is touched — see SESSION_NOT_PAYABLE_REASON,
 # PAYMENT_FORM_NOT_READY_REASON and V1_BEFORE_FORM_REASON in bot_v2.
 RETRYABLE_REASONS = (bot.APP_NOT_RENDERING_REASON, bot.SESSION_NOT_PAYABLE_REASON,
+                     bot.SESSION_NOT_PAYABLE_LEGACY,
                      bot.PAYMENT_FORM_NOT_READY_REASON, bot.V1_BEFORE_FORM_REASON)
 
 # The leg labels post_payment chains reasons with ("V2: ...; V2-retry: ...; V1: ...").
@@ -465,7 +470,9 @@ def _awaiting_session(e):
     Sticky: a later attempt that only meets a half-drawn form mustn't demote it
     back to an ordinary failure with two attempts and a three-hour window.
     """
-    return bool(e.get("awaiting_session")) or bot.SESSION_NOT_PAYABLE_REASON in (e.get("reason") or "")
+    reason = e.get("reason") or ""
+    return bool(e.get("awaiting_session")) or any(
+        r in reason for r in (bot.SESSION_NOT_PAYABLE_REASON, bot.SESSION_NOT_PAYABLE_LEGACY))
 
 
 def _session_wait_active(e, now=None):
@@ -473,6 +480,17 @@ def _session_wait_active(e, now=None):
     today; after that it's an ordinary failure again."""
     now = now or datetime.now(timezone.utc)
     return _awaiting_session(e) and e.get("date") == now.astimezone().strftime("%m/%d/%Y")
+
+
+def _last_session_try(attempt=None, now=None):
+    """Is this the day's last chance for a payment waiting on its session?
+
+    The late-evening runs only: a morning prepayment for a 5 PM session must not
+    give up mid-afternoon. `attempt` is unused: hourly retries are bounded by the
+    day, so RETRY_MAX_ATTEMPTS_SESSION can't run out before then.
+    """
+    local = (now or datetime.now(timezone.utc)).astimezone()
+    return local.hour >= SESSION_FALLBACK_HOUR
 
 
 def _retryable_row(e, posted_ids, cleared, cutoff, now=None):
@@ -546,9 +564,14 @@ def retry_candidates(posted_ids):
             failed_at = _retryable_row(e, posted_ids, cleared, cutoff, now=now)
             if failed_at:
                 out.append((failed_at, e))
-    # Ordinary failures first: they have a three-hour window, while a payment
-    # waiting on its session has all day and must not crowd them out of the run's slots.
-    out.sort(key=lambda pair: (_session_wait_active(pair[1], now), pair[0]))
+    # Ordinary failures before session waits — those have all day — except in the
+    # evening, when a session wait's fallback can only happen in these few runs.
+    evening = _last_session_try(0, now)
+
+    def rank(pair):
+        waiting = _session_wait_active(pair[1], now)
+        return (0 if waiting and evening else 2 if waiting else 1, pair[0])
+    out.sort(key=rank)
     return [e for _stamp, e in out[:RETRY_MAX_PER_RUN]]
 
 
@@ -1075,6 +1098,8 @@ def post_new_payments(to_post, posted_ids, on_result=None):
                     kwargs = {"account": item.get("account")}
                     if item.get("hold_for_session"):
                         kwargs["hold_for_session"] = True
+                    if item.get("session_fallback"):
+                        kwargs["session_fallback"] = True
                     success, method, error, note, *extra = bot.post_payment(
                         page, item["name"], item["date"], item["amount"], **kwargs)
                     # (..., posted_date, v2_error, balance_amount): TA's "Due From
@@ -1400,7 +1425,8 @@ def main():
                         # A same-day session wait isn't on any report (see
                         # RETRY_MAX_ATTEMPTS_SESSION), so there's no report to race.
                         "retry_failed_at": None if session_wait else row.get("failed_at"),
-                        "hold_for_session": session_wait})
+                        "hold_for_session": session_wait,
+                        "session_fallback": session_wait and _last_session_try(attempt)})
         limit = RETRY_MAX_ATTEMPTS_SESSION if session_wait else RETRY_MAX_ATTEMPTS
         log(f"  RETRY {name} ${amount} on {date} — earlier failure could not have reached "
             f"TA's payment form (attempt {attempt} of {limit})")
